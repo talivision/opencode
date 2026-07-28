@@ -202,6 +202,8 @@ export class RunFooter implements FooterApi {
   private setSubagent: (next: FooterSubagentState) => void
   private queuedPrompts: Accessor<FooterQueuedPrompt[]>
   private setQueuedPrompts: Setter<FooterQueuedPrompt[]>
+  private promptReplacement: Accessor<RunPrompt | undefined>
+  private setPromptReplacement: Setter<RunPrompt | undefined>
   private promptRoute: FooterPromptRoute = { type: "composer" }
   private subagentMenuRows = SUBAGENT_ROWS
   private autocomplete = false
@@ -243,6 +245,7 @@ export class RunFooter implements FooterApi {
       model: options.modelLabel,
       duration: "",
       usage: "",
+      goal: "",
       first: options.first,
       interrupt: 0,
       exit: 0,
@@ -288,6 +291,9 @@ export class RunFooter implements FooterApi {
     const [queuedPrompts, setQueuedPrompts] = createSignal<FooterQueuedPrompt[]>([])
     this.queuedPrompts = queuedPrompts
     this.setQueuedPrompts = setQueuedPrompts
+    const [promptReplacement, setPromptReplacement] = createSignal<RunPrompt | undefined>()
+    this.promptReplacement = promptReplacement
+    this.setPromptReplacement = setPromptReplacement
     this.base = Math.max(1, renderer.footerHeight - TEXTAREA_MIN_ROWS)
     this.scrollback = this.createScrollback(options.wrote ?? false)
 
@@ -309,6 +315,7 @@ export class RunFooter implements FooterApi {
               view: footer.view,
               subagent: footer.subagent,
               queuedPrompts: footer.queuedPrompts,
+              promptReplacement: footer.promptReplacement,
               findFiles: options.findFiles,
               agents: footer.agents,
               resources: footer.resources,
@@ -446,6 +453,15 @@ export class RunFooter implements FooterApi {
       return
     }
 
+    if (next.type === "prompt.replace") {
+      if (this.isGone) {
+        return
+      }
+
+      this.setPromptReplacement(next.prompt)
+      return
+    }
+
     const patch = eventPatch(next)
     if (patch) {
       if (typeof patch.status === "string") {
@@ -490,6 +506,7 @@ export class RunFooter implements FooterApi {
       model: typeof next.model === "string" ? next.model : prev.model,
       duration: typeof next.duration === "string" ? next.duration : prev.duration,
       usage: typeof next.usage === "string" ? next.usage : prev.usage,
+      goal: typeof next.goal === "string" ? next.goal : prev.goal,
       first: typeof next.first === "boolean" ? next.first : prev.first,
       interrupt:
         typeof next.interrupt === "number" && Number.isFinite(next.interrupt)

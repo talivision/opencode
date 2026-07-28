@@ -2543,6 +2543,37 @@ export type NotFoundError = {
   }
 }
 
+export type SessionGoal = {
+  sessionID: string
+  objective: string
+  status: "active" | "paused" | "complete" | "blocked"
+  tokenBudget?: number
+  tokensUsed: number
+  turns: number
+  blocker?: {
+    reason: string
+    count: number
+    turn: number
+  }
+  pauseReason?: "user" | "budget"
+  review?: {
+    status: "pending" | "running" | "accepted" | "rejected" | "error"
+    attempt: number
+    requestedAt: number
+    updatedAt: number
+    evidence?: string
+    reason?: string
+    reviewerSessionID?: string
+  }
+  time: {
+    created: number
+    updated: number
+    running?: number
+    elapsed: number
+    completed?: number
+  }
+}
+
 export type TextPartInput = {
   id?: string
   type: "text"
@@ -9982,6 +10013,156 @@ export type SessionAbortResponses = {
 }
 
 export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]
+
+export type SessionGoalClearData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/goal"
+}
+
+export type SessionGoalClearErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionGoalClearError = SessionGoalClearErrors[keyof SessionGoalClearErrors]
+
+export type SessionGoalClearResponses = {
+  /**
+   * Goal cleared
+   */
+  200: boolean
+}
+
+export type SessionGoalClearResponse = SessionGoalClearResponses[keyof SessionGoalClearResponses]
+
+export type SessionGoalGetData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/goal"
+}
+
+export type SessionGoalGetErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionGoalGetError = SessionGoalGetErrors[keyof SessionGoalGetErrors]
+
+export type SessionGoalGetResponses = {
+  /**
+   * Current long-running goal
+   */
+  200: SessionGoal
+}
+
+export type SessionGoalGetResponse = SessionGoalGetResponses[keyof SessionGoalGetResponses]
+
+export type SessionGoalActionData = {
+  body?:
+    | {
+        action: "edit"
+        objective: string
+        tokenBudget?: number
+      }
+    | {
+        action: "pause"
+      }
+    | {
+        action: "resume"
+      }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/goal"
+}
+
+export type SessionGoalActionErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionGoalActionError = SessionGoalActionErrors[keyof SessionGoalActionErrors]
+
+export type SessionGoalActionResponses = {
+  /**
+   * Goal updated
+   */
+  200: SessionGoal
+}
+
+export type SessionGoalActionResponse = SessionGoalActionResponses[keyof SessionGoalActionResponses]
+
+export type SessionGoalSetData = {
+  body?: {
+    objective: string
+    tokenBudget?: number
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/goal"
+}
+
+export type SessionGoalSetErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionGoalSetError = SessionGoalSetErrors[keyof SessionGoalSetErrors]
+
+export type SessionGoalSetResponses = {
+  /**
+   * Goal created
+   */
+  200: SessionGoal
+}
+
+export type SessionGoalSetResponse = SessionGoalSetResponses[keyof SessionGoalSetResponses]
 
 export type SessionInitData = {
   body?: {

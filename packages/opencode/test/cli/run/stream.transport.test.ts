@@ -2053,12 +2053,24 @@ describe("run stream transport", () => {
         includeFiles: false,
       })
 
+      await transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "continue goal", parts: [], hidden: true },
+        files: [file],
+        includeFiles: false,
+      })
+
       expect(seen).toEqual([
         expect.objectContaining({
           parts: [file, { type: "text", text: "hello" }],
         }),
         expect.objectContaining({
           parts: [{ type: "text", text: "again" }],
+        }),
+        expect.objectContaining({
+          parts: [{ type: "text", text: "continue goal", synthetic: true }],
         }),
       ])
     } finally {

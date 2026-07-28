@@ -31,6 +31,7 @@ export function promptCopy(prompt: RunPrompt): RunPrompt {
     parts: structuredClone(prompt.parts),
     ...(prompt.mode ? { mode: prompt.mode } : {}),
     ...(prompt.command ? { command: prompt.command } : {}),
+    ...(prompt.hidden ? { hidden: true } : {}),
   }
 }
 
