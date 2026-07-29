@@ -259,6 +259,7 @@ function makeHttpNoLLMServer(input?: PromptLayerInput) {
 
 const it = testEffect(makeHttp())
 const reviewerTimeout = testEffect(makeHttp({ goalReviewTimeoutMs: 100 }))
+const reviewerPaced = testEffect(makeHttp({ goalReviewTimeoutMs: 400 }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -1038,6 +1039,153 @@ reviewerTimeout.instance("a hanging reviewer times out, remains inspectable, and
       .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "goal-review")
     expect(reviewPart?.state.status).toBe("error")
     expect(reviewPart?.state.status === "error" ? reviewPart.state.error : "").toContain("without activity")
+  }),
+)
+
+reviewerPaced.instance(
+  "a reviewer that keeps streaming is never killed by the inactivity watchdog and reports live progress",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const goals = yield* SessionGoal.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Paced goal reviewer",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "start the paced goal" }],
+      })
+      yield* goals.set({ sessionID: session.id, objective: "verify a slow but continuously active reviewer" })
+      yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+      // Streams for ~6x the inactivity window, but never stops producing output.
+      // Text deltas are broadcast as part deltas and only land in the part row at
+      // text-end, so a poll-only watchdog sees this reviewer as idle and kills it.
+      yield* llm.textChunksFrom(
+        (hit) => {
+          const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+          return [
+            "Reading the repository state\n",
+            "Comparing against every explicit requirement\n",
+            "Re-running the authoritative check\n",
+            "Confirming there is no remaining work\n",
+            "Writing up the decisive evidence\n",
+            `VERDICT: MET ${nonce} continuously active reviewer verified the objective`,
+          ]
+        },
+        { pace: 120, usage: { input: 12_000, output: 58 } },
+      )
+
+      // Safety net so a regression fails an assertion instead of hanging the loop.
+      yield* llm.text("Follow-up worker turn.")
+      yield* llm.textFrom((hit) => {
+        const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+        return `VERDICT: MET ${nonce} second attempt`
+      })
+
+      yield* prompt.loop({ sessionID: session.id })
+      const goal = yield* goals.get(session.id)
+      expect(goal?.review?.status).toBe("accepted")
+      expect(goal?.status).toBe("complete")
+      // A killed reviewer would force a second attempt.
+      expect(goal?.review?.attempt).toBe(1)
+      expect(goal?.review?.reason).toContain("continuously active reviewer")
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const reviewPart = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "goal-review")
+      expect(reviewPart?.state.status).toBe("completed")
+      expect(reviewPart?.state.status === "completed" ? reviewPart.state.metadata : {}).toMatchObject({
+        verdict: "accepted",
+        tokens: 58,
+      })
+    }),
+)
+
+it.instance("goal accounting counts only generated worker and reviewer tokens", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal token accounting",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the accounting goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "say lima once and return control" })
+    yield* llm.text("Lima", { usage: { input: 9_000, output: 4 } })
+    yield* llm.textFrom(
+      (hit) => {
+        const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+        return `VERDICT: MET ${nonce} lima was spoken once and control returned`
+      },
+      { usage: { input: 12_000, output: 58 } },
+    )
+
+    yield* prompt.loop({ sessionID: session.id })
+    const goal = yield* goals.get(session.id)
+    // 4 generated worker tokens + 58 generated reviewer tokens. The 9,000 and
+    // 12,000 prompt/context tokens must never be counted against the goal.
+    expect(goal?.tokensUsed).toBe(62)
+    expect(goal?.status).toBe("complete")
+
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const reviewPart = messages
+      .flatMap((message) => message.parts)
+      .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "goal-review")
+    expect(reviewPart?.state.status === "completed" ? reviewPart.state.metadata.tokens : 0).toBe(58)
+  }),
+)
+
+it.instance("worker model context never advertises the hidden reviewer agent or the goal-review tool", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal reviewer isolation",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the isolation goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "keep the reviewer out of worker context" })
+    yield* llm.text("First increment.")
+    yield* llm.textFrom((hit) => {
+      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+      return `VERDICT: NOT_MET ${nonce} keep going`
+    })
+    yield* llm.text("Second increment.")
+    yield* llm.textFrom((hit) => {
+      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+      return `VERDICT: MET ${nonce} verified`
+    })
+
+    yield* prompt.loop({ sessionID: session.id })
+    const inputs = yield* llm.inputs
+    // inputs[2] is the worker turn that runs after the first review was rejected.
+    const worker = JSON.stringify(inputs[2])
+    expect(worker).toContain("<active-goal>")
+    expect(worker).not.toContain("goal-reviewer")
+    expect(worker).not.toContain("goal-review")
   }),
 )
 

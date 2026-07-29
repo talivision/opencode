@@ -36,6 +36,8 @@ type Sse = {
   type: "sse"
   head: unknown[]
   tail: unknown[]
+  /** Milliseconds to sleep between tail chunks, to emulate a slowly streaming model. */
+  pace?: number
   wait?: PromiseLike<unknown>
   hang?: boolean
   error?: unknown
@@ -129,8 +131,10 @@ function toolArgsLine(value: string) {
   })
 }
 
-function bytes(input: Iterable<unknown>) {
-  return Stream.fromIterable([...input].map(line)).pipe(Stream.encodeText)
+function bytes(input: Iterable<unknown>, pace?: number) {
+  const base = Stream.fromIterable([...input].map(line))
+  const paced = pace ? base.pipe(Stream.tap(() => Effect.sleep(`${pace} millis`))) : base
+  return paced.pipe(Stream.encodeText)
 }
 
 function responseCreated(model: string) {
@@ -417,7 +421,7 @@ function modelFrom(body: unknown) {
 
 function send(item: Sse) {
   const head = bytes(item.head)
-  const tail = bytes([...item.tail, ...(item.hang || item.error ? [] : [done])])
+  const tail = bytes([...item.tail, ...(item.hang || item.error ? [] : [done])], item.pace)
   const empty = Stream.fromIterable<Uint8Array>([])
   const wait = item.wait
   const body: Stream.Stream<Uint8Array, unknown> = wait
@@ -455,6 +459,7 @@ export class Reply {
   #usage: Usage | undefined
   #finish: string | undefined
   #wait: PromiseLike<unknown> | undefined
+  #pace: number | undefined
   #hang = false
   #error: unknown
   #reset = false
@@ -482,6 +487,12 @@ export class Reply {
 
   wait(value: PromiseLike<unknown>) {
     this.#wait = value
+    return this
+  }
+
+  /** Emit each queued chunk `value` milliseconds apart. */
+  pace(value: number) {
+    this.#pace = value
     return this
   }
 
@@ -553,6 +564,7 @@ export class Reply {
       type: "sse",
       head: this.#head,
       tail: this.#finish ? [...this.#tail, finishLine(this.#finish, this.#usage)] : this.#tail,
+      pace: this.#pace,
       wait: this.#wait,
       hang: this.#hang,
       error: this.#error,
@@ -577,6 +589,7 @@ export function raw(input: {
   chunks?: unknown[]
   head?: unknown[]
   tail?: unknown[]
+  pace?: number
   wait?: PromiseLike<unknown>
   hang?: boolean
   error?: unknown
@@ -586,6 +599,7 @@ export function raw(input: {
     type: "sse",
     head: input.head ?? input.chunks ?? [],
     tail: input.tail ?? [],
+    pace: input.pace,
     wait: input.wait,
     hang: input.hang,
     error: input.error,
@@ -618,6 +632,10 @@ namespace TestLLMServer {
     readonly toolMatch: (match: Match, name: string, input: unknown) => Effect.Effect<void>
     readonly text: (value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
     readonly textFrom: (make: (hit: Hit) => string, opts?: { usage?: Usage }) => Effect.Effect<void>
+    readonly textChunksFrom: (
+      make: (hit: Hit) => string[],
+      opts?: { usage?: Usage; pace?: number },
+    ) => Effect.Effect<void>
     readonly tool: (name: string, input: unknown) => Effect.Effect<void>
     readonly toolHang: (name: string, input: unknown) => Effect.Effect<void>
     readonly reason: (value: string, opts?: { text?: string; usage?: Usage }) => Effect.Effect<void>
@@ -740,6 +758,23 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
               item: (hit) => {
                 const out = reply().text(make(hit))
                 if (opts?.usage) out.usage(opts.usage)
+                return out.stop().item()
+              },
+            },
+          ]
+        }),
+        textChunksFrom: Effect.fn("TestLLMServer.textChunksFrom")(function* (
+          make: (hit: Hit) => string[],
+          opts?: { usage?: Usage; pace?: number },
+        ) {
+          list = [
+            ...list,
+            {
+              item: (hit) => {
+                let out = reply()
+                for (const chunk of make(hit)) out = out.text(chunk)
+                if (opts?.usage) out.usage(opts.usage)
+                if (opts?.pace) out.pace(opts.pace)
                 return out.stop().item()
               },
             },

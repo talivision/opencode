@@ -116,6 +116,17 @@ function goalReviewVerdict(text: string, nonce: string) {
   }
 }
 
+function goalReviewActivity(value: string) {
+  const text = value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1)
+  if (!text) return
+  if (text.startsWith("VERDICT:")) return "Forming final verdict"
+  return text.slice(0, 160)
+}
+
 function goalReviewProgress(messages: SessionV1.WithParts[]) {
   const parts = messages.flatMap((message) => (message.info.role === "assistant" ? message.parts : []))
   const fingerprint = JSON.stringify(parts)
@@ -123,19 +134,12 @@ function goalReviewProgress(messages: SessionV1.WithParts[]) {
     (part): part is SessionV1.TextPart | SessionV1.ReasoningPart | SessionV1.ToolPart =>
       part.type === "text" || part.type === "reasoning" || part.type === "tool",
   )
-  if (!last) return { fingerprint }
+  if (!last) return { fingerprint, tool: false }
   if (last.type === "tool") {
     const title = last.state.status === "running" || last.state.status === "completed" ? last.state.title : undefined
-    return { fingerprint, activity: `${last.tool}${title ? `: ${title}` : ""}` }
+    return { fingerprint, tool: true, activity: `${last.tool}${title ? `: ${title}` : ""}` }
   }
-  const text = (last.type === "text" ? last.text : last.text)
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .at(-1)
-  if (!text) return { fingerprint }
-  if (text.startsWith("VERDICT:")) return { fingerprint, activity: "Forming final verdict" }
-  return { fingerprint, activity: text.slice(0, 160) }
+  return { fingerprint, tool: false, activity: goalReviewActivity(last.text) }
 }
 
 function goalReviewTranscript(messages: SessionV1.WithParts[]) {
@@ -1331,26 +1335,54 @@ const layer = Layer.effect(
       const watchdog = Effect.gen(function* () {
         let fingerprint = ""
         let lastActivityAt = yield* Clock.currentTimeMillis
+        let published: string | undefined
+        // Streaming text is broadcast as part deltas and is only flushed to the
+        // part row at text-end, so polling persisted messages cannot see a
+        // reviewer that is actively generating. Follow the live delta stream too,
+        // otherwise a busy reviewer looks idle and the inactivity watchdog kills
+        // it while its progress never reaches the parent transcript.
+        const buffers = new Map<string, string>()
+        let streamed: string | undefined
+        yield* events
+          .subscribe(MessageV2.Event.PartDelta)
+          .pipe(
+            Stream.runForEach((event) =>
+              Effect.gen(function* () {
+                if (event.data.sessionID !== child.id) return
+                if (event.data.field !== "text") return
+                const next = (buffers.get(event.data.partID) ?? "") + event.data.delta
+                buffers.set(event.data.partID, next)
+                streamed = goalReviewActivity(next)
+                lastActivityAt = yield* Clock.currentTimeMillis
+              }),
+            ),
+            Effect.forkChild,
+          )
         const interval = Math.max(10, Math.min(250, Math.floor(flags.goalReviewTimeoutMs / 4)))
         while (true) {
           yield* Effect.sleep(`${interval} millis`)
           const now = yield* Clock.currentTimeMillis
-          const progress = goalReviewProgress(yield* sessions.messages({ sessionID: child.id }).pipe(Effect.orDie))
+          // A removed or unreadable child must never take down the goal loop.
+          const progress = goalReviewProgress(
+            yield* sessions.messages({ sessionID: child.id }).pipe(Effect.orElseSucceed(() => [])),
+          )
           if (progress.fingerprint !== fingerprint) {
             fingerprint = progress.fingerprint
             lastActivityAt = now
-            if (progress.activity && reviewPart.state.status === "running") {
-              reviewPart = yield* sessions.updatePart({
-                ...reviewPart,
-                state: {
-                  ...reviewPart.state,
-                  metadata: {
-                    ...reviewPart.state.metadata,
-                    activity: progress.activity,
-                  },
+          }
+          const activity = progress.tool ? progress.activity : (streamed ?? progress.activity)
+          if (activity && activity !== published && reviewPart.state.status === "running") {
+            published = activity
+            reviewPart = yield* sessions.updatePart({
+              ...reviewPart,
+              state: {
+                ...reviewPart.state,
+                metadata: {
+                  ...reviewPart.state.metadata,
+                  activity,
                 },
-              })
-            }
+              },
+            })
           }
           if (now - reviewStartedAt >= flags.goalReviewMaxMs) {
             return {
