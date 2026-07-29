@@ -138,33 +138,6 @@ function goalReviewProgress(messages: SessionV1.WithParts[]) {
   return { fingerprint, activity: text.slice(0, 160) }
 }
 
-function goalReviewTranscript(messages: SessionV1.WithParts[]) {
-  const transcript = messages
-    .flatMap((message) => {
-      const role = message.info.role === "assistant" ? "ASSISTANT" : "USER"
-      const parts = message.parts.flatMap((part) => {
-        if (part.type === "text") return [part.text]
-        if (part.type !== "tool" || part.tool === "goal-review") return []
-        const state = part.state
-        const result =
-          state.status === "completed"
-            ? state.output
-            : state.status === "error"
-              ? state.error
-              : state.status === "running"
-                ? state.title
-                : state.status
-        return [`[tool ${part.tool} ${state.status}] input=${JSON.stringify(state.input)} result=${result}`]
-      })
-      if (!parts.length) return []
-      return [`${role}:\n${parts.join("\n")}`]
-    })
-    .join("\n\n")
-  const limit = 60_000
-  if (transcript.length <= limit) return transcript
-  return `[Earlier transcript omitted for length]\n${transcript.slice(-limit)}`
-}
-
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -1171,11 +1144,7 @@ const layer = Layer.effect(
       return true
     })
 
-    const reviewGoal = Effect.fnUntraced(function* (
-      sessionID: SessionID,
-      lastUser: SessionV1.User,
-      automatic: boolean,
-    ) {
+    const reviewGoal = Effect.fnUntraced(function* (sessionID: SessionID, lastUser: SessionV1.User) {
       let current = yield* goal.get(sessionID)
       if (current?.review?.status === "running") {
         const orphan = current.review.reviewerSessionID
@@ -1215,16 +1184,6 @@ const layer = Layer.effect(
             })
             .pipe(Effect.ignore)
         }
-      }
-      // Claude's Stop hook evaluates on EVERY stop attempt, not only when the
-      // model volunteers that it is done. If the turn is ending with an active
-      // goal and no review pending, request one implicitly so the model cannot
-      // decide whether verification happens.
-      if (automatic && current?.status === "active" && current?.review?.status !== "pending") {
-        current = yield* goal.requestReview({
-          sessionID,
-          evidence: "The assistant ended its latest turn while this goal remained active.",
-        })
       }
       if (current?.review?.status !== "pending") return
       const reviewer = yield* agents.get("goal-reviewer")
@@ -1278,7 +1237,6 @@ const layer = Layer.effect(
         },
       })
       const nonce = randomUUID().slice(0, 12)
-      const transcript = goalReviewTranscript(yield* sessions.messages({ sessionID }).pipe(Effect.orDie))
       const review = Effect.exit(
         prompt({
           sessionID: child.id,
@@ -1317,10 +1275,6 @@ const layer = Layer.effect(
                 "<worker-claimed-evidence>",
                 current.review.evidence ?? "The worker supplied no explicit verification evidence.",
                 "</worker-claimed-evidence>",
-                "",
-                "<parent-session-transcript>",
-                transcript || "No textual parent-session transcript was available.",
-                "</parent-session-transcript>",
                 "",
                 "Inspect the working directory and current system state yourself. Reject completion if any explicit requirement is missing, only partially implemented, or not directly verified.",
               ].join("\n"),
@@ -1539,7 +1493,7 @@ const layer = Layer.effect(
               })
             }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
-            yield* reviewGoal(sessionID, lastUser, true)
+            yield* reviewGoal(sessionID, lastUser)
             if (yield* continueGoal(sessionID, lastUser)) {
               step = 0
               continue
@@ -1757,7 +1711,7 @@ const layer = Layer.effect(
               sessionID,
               tokens: Math.max(0, handle.message.tokens.output + handle.message.tokens.reasoning),
             })
-            yield* reviewGoal(sessionID, lastUser, outcome === "break")
+            yield* reviewGoal(sessionID, lastUser)
           }
           if (outcome === "break") {
             if (yield* continueGoal(sessionID, lastUser)) {

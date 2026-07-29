@@ -801,7 +801,7 @@ it.instance("static loop consumes queued replies across turns", () =>
   }),
 )
 
-it.instance("active goals are independently reviewed after every provider turn until accepted", () =>
+it.instance("active goals continue across provider turns until the goal tool completes them", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -820,11 +820,6 @@ it.instance("active goals are independently reviewed after every provider turn u
     })
     yield* goals.set({ sessionID: session.id, objective: "continue once, then finish" })
     yield* llm.text("First increment complete.", { usage: { input: 20, output: 5 } })
-    yield* llm.textFrom((hit) => {
-      const input = JSON.stringify(hit.body)
-      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(input)?.[1]
-      return `VERDICT: NOT_MET ${nonce} another increment is still required`
-    })
     yield* llm.tool("goal", { status: "complete" })
     yield* llm.textFrom(
       (hit) => {
@@ -838,41 +833,44 @@ it.instance("active goals are independently reviewed after every provider turn u
     const result = yield* prompt.loop({ sessionID: session.id })
     const goal = yield* goals.get(session.id)
     const messages = yield* sessions.messages({ sessionID: session.id })
-    expect(yield* llm.calls).toBe(5)
+    const synthetic = messages.find(
+      (message) =>
+        message.info.role === "user" &&
+        message.parts.some(
+          (part) =>
+            part.type === "text" && part.synthetic && part.text.includes("Continue working toward the active goal"),
+        ),
+    )
+
+    expect(yield* llm.calls).toBe(4)
     expect(goal?.status).toBe("complete")
     expect(goal?.review?.status).toBe("accepted")
     expect(goal?.turns).toBe(2)
     // Goal accounting mirrors Claude: generated worker + reviewer tokens, never prompt/cache context.
     expect(goal?.tokensUsed).toBe(63)
+    expect(synthetic).toBeDefined()
     expect(result.info.role).toBe("assistant")
     const reviewParts = messages.flatMap((message) =>
       message.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "goal-review"),
     )
-    expect(reviewParts).toHaveLength(2)
-    expect(reviewParts[0]?.state.status === "completed" ? reviewParts[0].state.metadata.verdict : "error").toBe(
-      "rejected",
-    )
-    expect(reviewParts[1]?.state.status).toBe("completed")
-    expect(reviewParts[1]?.state.status === "completed" ? reviewParts[1].state.metadata : {}).toMatchObject({
+    expect(reviewParts).toHaveLength(1)
+    expect(reviewParts[0]?.state.status).toBe("completed")
+    expect(reviewParts[0]?.state.status === "completed" ? reviewParts[0].state.metadata : {}).toMatchObject({
       verdict: "accepted",
       tokens: 58,
     })
-    expect(reviewParts[1]?.state.status === "completed" ? reviewParts[1].state.output : "").toContain(
+    expect(reviewParts[0]?.state.status === "completed" ? reviewParts[0].state.output : "").toContain(
       "objective verified",
     )
 
     const inputs = yield* llm.inputs
     expect(JSON.stringify(inputs[0])).toContain("<active-goal>")
     expect(JSON.stringify(inputs[0])).toContain("continue once, then finish")
-    expect(JSON.stringify(inputs[1])).toContain("<parent-session-transcript>")
-    expect(JSON.stringify(inputs[1])).toContain("First increment complete.")
 
     const reviewers = yield* sessions.children(session.id)
-    expect(reviewers).toHaveLength(2)
-    expect(reviewers.every((reviewer) => reviewer.metadata?.goalReviewer)).toBe(true)
-    expect(reviewers.map((reviewer) => reviewer.title)).toEqual(
-      expect.arrayContaining([expect.stringContaining("rejected"), expect.stringContaining("accepted")]),
-    )
+    expect(reviewers).toHaveLength(1)
+    expect(reviewers[0]?.metadata?.goalReviewer).toBe(true)
+    expect(reviewers[0]?.title).toContain("accepted")
   }),
 )
 
@@ -1014,16 +1012,16 @@ reviewerTimeout.instance("a hanging reviewer times out, remains inspectable, and
       sessionID: session.id,
       objective:
         "Speak the word lima and return control. The reviewer should force continued lima turns without hanging.",
-      tokenBudget: 1,
     })
     yield* llm.tool("goal", { status: "complete", reason: "lima was spoken" })
     yield* llm.hang
-    yield* llm.text("Worker resumed after the reviewer timeout.", { usage: { input: 10, output: 1 } })
+    yield* llm.tool("goal", { status: "blocked", reason: "reviewer timeout requires intervention" })
+    yield* llm.tool("goal", { status: "blocked", reason: "reviewer timeout requires intervention" })
+    yield* llm.tool("goal", { status: "blocked", reason: "reviewer timeout requires intervention" })
 
     yield* prompt.loop({ sessionID: session.id })
     const goal = yield* goals.get(session.id)
-    expect(goal?.status).toBe("paused")
-    expect(goal?.pauseReason).toBe("budget")
+    expect(goal?.status).toBe("blocked")
     expect(goal?.review?.status).toBe("error")
     expect(goal?.review?.reason).toContain("timed out")
 
