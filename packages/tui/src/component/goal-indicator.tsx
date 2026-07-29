@@ -1,4 +1,4 @@
-import { createMemo, onCleanup, onMount, Show } from "solid-js"
+import { createMemo, createSignal, onCleanup, onMount, Show } from "solid-js"
 import { useGoal, goalDuration } from "../context/goal"
 import { useTheme } from "../context/theme"
 import { useDialog } from "../ui/dialog"
@@ -10,8 +10,16 @@ export function GoalIndicator(props: { sessionID: string }) {
   const goal = goals.get(props.sessionID)
   const { theme } = useTheme()
   const dialog = useDialog()
+  const [now, setNow] = createSignal(Date.now())
 
-  const paused = createMemo(() => (goal()?.pauseReason === "budget" ? " (token budget reached)" : ""))
+  const elapsed = createMemo(() => {
+    const current = goal()
+    if (!current) return 0
+    return (
+      current.time.elapsed +
+      (current.status === "active" && current.time.running ? Math.max(0, now() - current.time.running) : 0)
+    )
+  })
 
   const review = createMemo(() => {
     const status = goal()?.review?.status
@@ -23,7 +31,10 @@ export function GoalIndicator(props: { sessionID: string }) {
 
   onMount(() => {
     void goals.refresh(props.sessionID)
-    const timer = setInterval(() => void goals.refresh(props.sessionID), 1000)
+    const timer = setInterval(() => {
+      setNow(Date.now())
+      void goals.refresh(props.sessionID)
+    }, 1000)
     onCleanup(() => clearInterval(timer))
   })
 
@@ -49,8 +60,7 @@ export function GoalIndicator(props: { sessionID: string }) {
             }
             wrapMode="word"
           >
-            ◎ Goal {current().status}
-            {paused()} · {goalDuration(current().time.elapsed)} · {Locale.number(current().turns)} turn
+            ◎ Goal {current().status} · {goalDuration(elapsed())} · {Locale.number(current().turns)} turn
             {current().turns === 1 ? "" : "s"} · {Locale.number(current().tokensUsed)} tokens{review()}
             <span style={{ fg: theme.textMuted }}> · /goal</span>
           </text>

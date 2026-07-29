@@ -190,9 +190,7 @@ it.instance(
       expect(reviewer).toBeDefined()
       expect(reviewer?.native).toBe(true)
       expect(reviewer?.hidden).toBe(true)
-      // "primary" + hidden matches compaction/title/summary and keeps the reviewer
-      // out of the task tool's subagent catalogue shipped inside worker prompts.
-      expect(reviewer?.mode).toBe("primary")
+      expect(reviewer?.mode).toBe("subagent")
       expect(evalPerm(reviewer, "read")).toBe("allow")
       expect(evalPerm(reviewer, "grep")).toBe("allow")
       expect(evalPerm(reviewer, "bash")).toBe("deny")

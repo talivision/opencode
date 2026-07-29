@@ -151,7 +151,7 @@ const layer = Layer.effect(
               }),
               user,
             ),
-            mode: "primary",
+            mode: "subagent",
             native: true,
           },
           plan: {
@@ -316,18 +316,15 @@ const layer = Layer.effect(
           item.permission = Permission.merge(item.permission, Permission.fromConfig(value.permission ?? {}))
         }
 
-        // The reviewer is an internal agent driven only by the goal loop. Keep it
-        // "primary" + hidden like compaction/title/summary so it never leaks into
-        // the task tool's subagent catalogue that ships inside worker prompts.
         const reviewer = agents["goal-reviewer"] ?? {
           name: "goal-reviewer",
-          mode: "primary" as const,
+          mode: "subagent" as const,
           options: {},
           permission: defaults,
         }
         agents["goal-reviewer"] = reviewer
         reviewer.name = "goal-reviewer"
-        reviewer.mode = "primary"
+        reviewer.mode = "subagent"
         reviewer.native = true
         reviewer.hidden = true
         reviewer.prompt = PROMPT_GOAL_REVIEWER
