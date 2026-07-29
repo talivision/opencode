@@ -16,17 +16,11 @@ export function DialogGoal(props: { sessionID: string }) {
   const dialog = useDialog()
   const route = useRoute()
   const toast = useToast()
-  const [now, setNow] = createSignal(Date.now())
   const [busy, setBusy] = createSignal(false)
 
-  const elapsed = createMemo(() => {
-    const current = goal()
-    if (!current) return 0
-    return (
-      current.time.elapsed +
-      (current.status === "active" && current.time.running ? Math.max(0, now() - current.time.running) : 0)
-    )
-  })
+  // time.elapsed already includes the currently running segment, so re-adding
+  // now - time.running here would report double the real elapsed time.
+  const elapsed = createMemo(() => goal()?.time.elapsed ?? 0)
 
   const run = async (input: string) => {
     if (busy()) return
@@ -91,7 +85,7 @@ export function DialogGoal(props: { sessionID: string }) {
   onMount(() => {
     dialog.setSize("large")
     void goals.refresh(props.sessionID)
-    const timer = setInterval(() => setNow(Date.now()), 1000)
+    const timer = setInterval(() => void goals.refresh(props.sessionID), 1000)
     onCleanup(() => clearInterval(timer))
   })
 
@@ -141,6 +135,9 @@ export function DialogGoal(props: { sessionID: string }) {
             </text>
             <Show when={current().tokenBudget !== undefined}>
               <text fg={theme.textMuted}>Token budget: {Locale.number(current().tokenBudget!)}</text>
+            </Show>
+            <Show when={current().pauseReason === "budget"}>
+              <text fg={theme.warning}>Paused because the token budget was reached.</text>
             </Show>
             <Show when={current().blocker}>
               {(blocker) => (
