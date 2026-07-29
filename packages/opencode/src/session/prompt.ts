@@ -56,6 +56,8 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { SessionGoal } from "./goal"
+import { randomUUID } from "node:crypto"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -99,6 +101,21 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+function goalReviewVerdict(text: string, nonce: string) {
+  const last = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1)
+  if (!last) return
+  const match = new RegExp(`^VERDICT:\\s+(MET|NOT_MET)\\s+${nonce}\\b[ \\t]*(.*)$`).exec(last)
+  if (!match) return
+  return {
+    accepted: match[1] === "MET",
+    reason: match[2]?.trim() || (match[1] === "MET" ? "All goal requirements verified." : "Goal requirements unmet."),
+  }
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -140,6 +157,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const goal = yield* SessionGoal.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -1078,6 +1096,202 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    const continueGoal = Effect.fnUntraced(function* (sessionID: SessionID, lastUser: SessionV1.User) {
+      const current = yield* goal.get(sessionID)
+      if (current?.status !== "active") return false
+      yield* createUserMessage({
+        sessionID,
+        agent: lastUser.agent,
+        model: {
+          providerID: lastUser.model.providerID,
+          modelID: lastUser.model.modelID,
+        },
+        variant: lastUser.model.variant,
+        parts: [
+          {
+            type: "text",
+            text: [
+              "Continue working toward the active goal.",
+              "Re-read the active-goal context, inspect current state, and make the next meaningful increment of progress.",
+              "Do not stop merely to report partial progress. Use the goal tool only when its completion or blocking rules are satisfied.",
+            ].join(" "),
+            synthetic: true,
+          },
+        ],
+      }).pipe(Effect.orDie)
+      return true
+    })
+
+    const reviewGoal = Effect.fnUntraced(function* (sessionID: SessionID, lastUser: SessionV1.User) {
+      let current = yield* goal.get(sessionID)
+      if (current?.review?.status === "running") {
+        const orphan = current.review.reviewerSessionID
+        current = yield* goal.recoverReview(sessionID)
+        if (orphan) {
+          yield* state.cancel(orphan)
+          yield* sessions
+            .setTitle({
+              sessionID: orphan,
+              title: `Goal review #${current?.review?.attempt ?? 1} — interrupted`,
+            })
+            .pipe(Effect.ignore)
+        }
+      }
+      if (current?.review?.status !== "pending") return
+      const reviewer = yield* agents.get("goal-reviewer")
+      if (!reviewer) {
+        yield* Effect.logError("goal reviewer agent is unavailable", { "session.id": sessionID })
+        return
+      }
+
+      const child = yield* sessions.create({
+        parentID: sessionID,
+        title: `Goal review #${current.review.attempt} — running: ${current.objective.slice(0, 50)}`,
+        agent: reviewer.name,
+        model: {
+          id: lastUser.model.modelID,
+          providerID: lastUser.model.providerID,
+          variant: lastUser.model.variant,
+        },
+        metadata: {
+          goalReviewer: true,
+          goalReviewAttempt: current.review.attempt,
+        },
+        permission: reviewer.permission,
+      })
+      const started = yield* goal.beginReview(sessionID, child.id)
+      if (started?.review?.status !== "running") {
+        yield* sessions.remove(child.id).pipe(Effect.ignore)
+        return
+      }
+
+      const nonce = randomUUID().slice(0, 12)
+      const result = yield* Effect.exit(
+        prompt({
+          sessionID: child.id,
+          model: {
+            providerID: lastUser.model.providerID,
+            modelID: lastUser.model.modelID,
+          },
+          variant: lastUser.model.variant,
+          agent: reviewer.name,
+          tools: {
+            bash: false,
+            edit: false,
+            write: false,
+            patch: false,
+            apply_patch: false,
+            task: false,
+            goal: false,
+            question: false,
+            todowrite: false,
+          },
+          system: [
+            `The verdict nonce for this review is ${nonce}.`,
+            `Your final non-empty line must be exactly "VERDICT: MET ${nonce} <reason>" or "VERDICT: NOT_MET ${nonce} <reason>".`,
+            "Never accept a verdict without independently checking authoritative current state.",
+          ].join("\n"),
+          parts: [
+            {
+              type: "text",
+              text: [
+                "Review this completion request.",
+                "",
+                "<goal-objective>",
+                current.objective,
+                "</goal-objective>",
+                "",
+                "<worker-claimed-evidence>",
+                current.review.evidence ?? "The worker supplied no explicit verification evidence.",
+                "</worker-claimed-evidence>",
+                "",
+                "Inspect the working directory and current system state yourself. Reject completion if any explicit requirement is missing, only partially implemented, or not directly verified.",
+              ].join("\n"),
+            },
+          ],
+        }),
+      ).pipe(
+        Effect.map((exit) => ({ type: "exit" as const, exit })),
+        Effect.timeoutOrElse({
+          duration: flags.goalReviewTimeoutMs,
+          orElse: () => Effect.succeed({ type: "timeout" as const }),
+        }),
+      )
+
+      if (result.type === "timeout") {
+        const seconds = Math.ceil(flags.goalReviewTimeoutMs / 1000)
+        yield* state.cancel(child.id)
+        yield* goal.finishReview({
+          sessionID,
+          reviewerSessionID: child.id,
+          accepted: false,
+          error: true,
+          reason: `Independent reviewer timed out after ${seconds}s; completion remains unverified and work will continue.`,
+          tokens: 0,
+        })
+        yield* sessions
+          .setTitle({
+            sessionID: child.id,
+            title: `Goal review #${current.review.attempt} — timed out`,
+          })
+          .pipe(Effect.ignore)
+        return
+      }
+
+      if (Exit.isFailure(result.exit)) {
+        yield* goal.finishReview({
+          sessionID,
+          reviewerSessionID: child.id,
+          accepted: false,
+          error: true,
+          reason: "Independent reviewer failed to produce a verdict; completion remains unverified.",
+          tokens: 0,
+        })
+        yield* sessions
+          .setTitle({
+            sessionID: child.id,
+            title: `Goal review #${current.review.attempt} — error`,
+          })
+          .pipe(Effect.ignore)
+        return
+      }
+
+      const output = result.exit.value.parts
+        .filter((part): part is SessionV1.TextPart => part.type === "text")
+        .map((part) => part.text)
+        .join("\n")
+      const verdict = goalReviewVerdict(output, nonce)
+      const tokens =
+        result.exit.value.info.role === "assistant"
+          ? Math.max(
+              0,
+              result.exit.value.info.tokens.input +
+                result.exit.value.info.tokens.output +
+                result.exit.value.info.tokens.reasoning +
+                result.exit.value.info.tokens.cache.read +
+                result.exit.value.info.tokens.cache.write,
+            )
+          : 0
+      yield* goal.finishReview({
+        sessionID,
+        reviewerSessionID: child.id,
+        accepted: verdict?.accepted ?? false,
+        error: !verdict,
+        reason:
+          verdict?.reason ??
+          "Independent reviewer returned no valid nonce-bound verdict; completion remains unverified.",
+        tokens,
+      })
+      yield* sessions
+        .setTitle({
+          sessionID: child.id,
+          title: `Goal review #${current.review.attempt} — ${
+            verdict ? (verdict.accepted ? "accepted" : "rejected") : "invalid verdict"
+          }`,
+        })
+        .pipe(Effect.ignore)
+    })
+
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
@@ -1126,6 +1340,11 @@ const layer = Layer.effect(
               })
             }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+            yield* reviewGoal(sessionID, lastUser)
+            if (yield* continueGoal(sessionID, lastUser)) {
+              step = 0
+              continue
+            }
             break
           }
 
@@ -1218,6 +1437,7 @@ const layer = Layer.effect(
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
+          const goalTurn = (yield* goal.get(sessionID))?.status === "active"
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
@@ -1254,18 +1474,20 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, modelMsgs, goalContext] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
               MessageV2.toModelMessagesEffect(msgs, model),
+              goal.context(sessionID),
             ])
             const system = [
               ...env,
               ...instructions,
               ...(mcpInstructions ? [mcpInstructions] : []),
               ...(skills ? [skills] : []),
+              ...(goalContext ? [goalContext] : []),
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
@@ -1331,7 +1553,23 @@ const layer = Layer.effect(
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
-          if (outcome === "break") break
+          if (goalTurn) {
+            yield* goal.recordTurn({
+              sessionID,
+              tokens: Math.max(
+                0,
+                handle.message.tokens.input + handle.message.tokens.output + handle.message.tokens.reasoning,
+              ),
+            })
+            yield* reviewGoal(sessionID, lastUser)
+          }
+          if (outcome === "break") {
+            if (yield* continueGoal(sessionID, lastUser)) {
+              step = 0
+              continue
+            }
+            break
+          }
           continue
         }
 
@@ -1625,6 +1863,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    SessionGoal.node,
   ],
 })
 

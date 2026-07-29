@@ -1225,7 +1225,11 @@ function createLayer(input: StreamInput) {
             variant: next.variant,
             parts: [
               ...(next.includeFiles ? next.files : []),
-              { type: "text" as const, text: next.prompt.text },
+              {
+                type: "text" as const,
+                text: next.prompt.text,
+                ...(next.prompt.hidden ? { synthetic: true } : {}),
+              },
               ...next.prompt.parts,
             ],
           }

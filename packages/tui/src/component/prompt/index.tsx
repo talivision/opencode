@@ -57,6 +57,8 @@ import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
+import { parseGoalCommand, useGoal } from "../../context/goal"
+import { DialogGoal } from "../dialog-goal"
 
 registerOpencodeSpinner()
 
@@ -153,6 +155,7 @@ export function Prompt(props: PromptProps) {
   const terminalEnvironment = useTuiTerminalEnvironment()
   const clipboard = useClipboard()
   const sdk = useSDK()
+  const goals = useGoal()
   const editor = useEditorContext()
   const route = useRoute()
   const project = useProject()
@@ -1054,6 +1057,7 @@ export function Prompt(props: PromptProps) {
             },
           ]
         : []
+    const goalInput = store.mode === "normal" ? parseGoalCommand(inputText) : undefined
 
     if (store.mode === "shell") {
       move.startSubmit()
@@ -1067,6 +1071,33 @@ export function Prompt(props: PromptProps) {
         command: inputText,
       })
       setStore("mode", "normal")
+    } else if (goalInput !== undefined) {
+      move.startSubmit()
+      await goals
+        .execute(sessionID, goalInput)
+        .then((result) => {
+          if (result.action === "show" || result.action === "edit") {
+            dialog.replace(() => <DialogGoal sessionID={sessionID} />)
+            return
+          }
+          toast.show({
+            title: "Goal",
+            message:
+              result.action === "cleared"
+                ? "Goal cleared"
+                : result.goal
+                  ? `Goal ${result.goal.status}`
+                  : "Goal updated",
+            variant: "success",
+          })
+        })
+        .catch((error) => {
+          toast.show({
+            title: "Goal command failed",
+            message: errorMessage(error),
+            variant: "error",
+          })
+        })
     } else if (
       inputText.startsWith("/") &&
       sync.data.command.some((x) => x.name === inputText.split("\n")[0].split(" ")[0].slice(1))

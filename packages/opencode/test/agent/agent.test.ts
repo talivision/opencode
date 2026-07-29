@@ -55,6 +55,7 @@ it.instance("returns default native agents when no config", () =>
     expect(names).toContain("compaction")
     expect(names).toContain("title")
     expect(names).toContain("summary")
+    expect(names).toContain("goal-reviewer")
   }),
 )
 
@@ -179,6 +180,41 @@ it.instance("compaction agent denies all permissions", () =>
     expect(evalPerm(compaction, "edit")).toBe("deny")
     expect(evalPerm(compaction, "read")).toBe("deny")
   }),
+)
+
+it.instance(
+  "goal reviewer remains hidden and read-only even when config tries to weaken it",
+  () =>
+    Effect.gen(function* () {
+      const reviewer = yield* load((svc) => svc.get("goal-reviewer"))
+      expect(reviewer).toBeDefined()
+      expect(reviewer?.native).toBe(true)
+      expect(reviewer?.hidden).toBe(true)
+      expect(reviewer?.mode).toBe("subagent")
+      expect(evalPerm(reviewer, "read")).toBe("allow")
+      expect(evalPerm(reviewer, "grep")).toBe("allow")
+      expect(evalPerm(reviewer, "bash")).toBe("deny")
+      expect(evalPerm(reviewer, "edit")).toBe("deny")
+      expect(evalPerm(reviewer, "write")).toBe("deny")
+      expect(evalPerm(reviewer, "task")).toBe("deny")
+      expect(evalPerm(reviewer, "goal")).toBe("deny")
+    }),
+  {
+    config: {
+      agent: {
+        "goal-reviewer": {
+          disable: true,
+          hidden: false,
+          permission: {
+            edit: "allow",
+            write: "allow",
+            task: "allow",
+            goal: "allow",
+          },
+        },
+      },
+    },
+  },
 )
 
 it.instance(

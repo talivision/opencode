@@ -12,6 +12,7 @@ import { ProviderTransform } from "@/provider/transform"
 import PROMPT_GENERATE from "./generate.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
+import PROMPT_GOAL_REVIEWER from "./prompt/goal-reviewer.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import { Permission } from "@/permission"
@@ -150,7 +151,7 @@ const layer = Layer.effect(
               }),
               user,
             ),
-            mode: "primary",
+            mode: "subagent",
             native: true,
           },
           plan: {
@@ -262,6 +263,28 @@ const layer = Layer.effect(
             ),
             prompt: PROMPT_SUMMARY,
           },
+          "goal-reviewer": {
+            name: "goal-reviewer",
+            description: "Independent read-only verifier for long-running goal completion.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            prompt: PROMPT_GOAL_REVIEWER,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                "*": "deny",
+                grep: "allow",
+                glob: "allow",
+                list: "allow",
+                read: "allow",
+                webfetch: "allow",
+                websearch: "allow",
+                external_directory: readonlyExternalDirectory,
+              }),
+            ),
+          },
         }
 
         for (const [key, value] of Object.entries(cfg.agent ?? {})) {
@@ -292,6 +315,32 @@ const layer = Layer.effect(
           item.options = mergeDeep(item.options, value.options ?? {})
           item.permission = Permission.merge(item.permission, Permission.fromConfig(value.permission ?? {}))
         }
+
+        const reviewer = agents["goal-reviewer"] ?? {
+          name: "goal-reviewer",
+          mode: "subagent" as const,
+          options: {},
+          permission: defaults,
+        }
+        agents["goal-reviewer"] = reviewer
+        reviewer.name = "goal-reviewer"
+        reviewer.mode = "subagent"
+        reviewer.native = true
+        reviewer.hidden = true
+        reviewer.prompt = PROMPT_GOAL_REVIEWER
+        reviewer.permission = Permission.merge(
+          reviewer.permission,
+          Permission.fromConfig({
+            "*": "deny",
+            grep: "allow",
+            glob: "allow",
+            list: "allow",
+            read: "allow",
+            webfetch: "allow",
+            websearch: "allow",
+            external_directory: readonlyExternalDirectory,
+          }),
+        )
 
         // Ensure Truncate.GLOB is allowed unless explicitly configured
         for (const name in agents) {

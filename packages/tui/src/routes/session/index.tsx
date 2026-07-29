@@ -82,6 +82,9 @@ import { getRevertDiffFiles } from "../../util/revert-diff"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
+import { useGoal } from "../../context/goal"
+import { DialogGoal } from "../../component/dialog-goal"
+import { GoalIndicator } from "../../component/goal-indicator"
 
 addDefaultParsers(parsers.parsers)
 
@@ -274,6 +277,8 @@ export function Session() {
   const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
   const toast = useToast()
   const sdk = useSDK()
+  const goals = useGoal()
+  const goal = goals.get(route.sessionID)
   const editor = useEditorContext()
 
   createEffect(() => {
@@ -421,6 +426,56 @@ export function Session() {
   }
 
   const local = useLocal()
+  let startedGoalUpdate = 0
+
+  createEffect(
+    on(
+      () => route.sessionID,
+      (sessionID) => {
+        startedGoalUpdate = 0
+        void goals.refresh(sessionID)
+      },
+      { defer: false },
+    ),
+  )
+
+  createEffect(() => {
+    const current = goal()
+    if (!current || current.status !== "active") return
+    if (current.time.updated <= startedGoalUpdate) return
+    const status = sync.data.session_status[route.sessionID]
+    if (status && status.type !== "idle") return
+    const agent = local.agent.current()
+    const model = local.model.current()
+    if (!agent || !model) return
+
+    startedGoalUpdate = current.time.updated
+    void sdk.client.session
+      .prompt(
+        {
+          sessionID: route.sessionID,
+          ...model,
+          agent: agent.name,
+          model,
+          parts: [
+            {
+              type: "text",
+              text: "Continue working toward the active goal.",
+              synthetic: true,
+            },
+          ],
+        },
+        { throwOnError: true },
+      )
+      .catch((error) => {
+        startedGoalUpdate = 0
+        toast.show({
+          title: "Failed to continue goal",
+          message: errorMessage(error),
+          variant: "error",
+        })
+      })
+  })
 
   function enterChild(sessionID: string) {
     navigate({
@@ -456,6 +511,18 @@ export function Session() {
   }
 
   const sessionCommandList = createMemo(() => [
+    {
+      title: goal() ? "View goal" : "Set goal",
+      value: "session.goal",
+      suggested: route.type === "session",
+      category: "Session",
+      slash: {
+        name: "goal",
+      },
+      run: () => {
+        dialog.replace(() => <DialogGoal sessionID={route.sessionID} />)
+      },
+    },
     {
       title: session()?.share?.url ? "Copy share link" : "Share session",
       value: "session.share",
@@ -1296,6 +1363,7 @@ export function Session() {
                   <SubagentFooter />
                 </Show>
                 <Show when={visible()}>
+                  <GoalIndicator sessionID={route.sessionID} />
                   <pluginRuntime.Slot
                     name="session_prompt"
                     mode="replace"
