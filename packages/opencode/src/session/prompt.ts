@@ -42,7 +42,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Clock, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -114,28 +114,6 @@ function goalReviewVerdict(text: string, nonce: string) {
     accepted: match[1] === "MET",
     reason: match[2]?.trim() || (match[1] === "MET" ? "All goal requirements verified." : "Goal requirements unmet."),
   }
-}
-
-function goalReviewProgress(messages: SessionV1.WithParts[]) {
-  const parts = messages.flatMap((message) => (message.info.role === "assistant" ? message.parts : []))
-  const fingerprint = JSON.stringify(parts)
-  const last = parts.findLast(
-    (part): part is SessionV1.TextPart | SessionV1.ReasoningPart | SessionV1.ToolPart =>
-      part.type === "text" || part.type === "reasoning" || part.type === "tool",
-  )
-  if (!last) return { fingerprint }
-  if (last.type === "tool") {
-    const title = last.state.status === "running" || last.state.status === "completed" ? last.state.title : undefined
-    return { fingerprint, activity: `${last.tool}${title ? `: ${title}` : ""}` }
-  }
-  const text = (last.type === "text" ? last.text : last.text)
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .at(-1)
-  if (!text) return { fingerprint }
-  if (text.startsWith("VERDICT:")) return { fingerprint, activity: "Forming final verdict" }
-  return { fingerprint, activity: text.slice(0, 160) }
 }
 
 export interface Interface {
@@ -1151,32 +1129,6 @@ const layer = Layer.effect(
         current = yield* goal.recoverReview(sessionID)
         if (orphan) {
           yield* state.cancel(orphan)
-          const messages = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
-          const reviewPart = messages
-            .flatMap((message) => message.parts)
-            .findLast(
-              (part): part is SessionV1.ToolPart =>
-                part.type === "tool" &&
-                part.tool === "goal-review" &&
-                part.state.status === "running" &&
-                part.state.metadata?.reviewerSessionID === orphan,
-            )
-          if (reviewPart?.state.status === "running") {
-            yield* sessions.updatePart({
-              ...reviewPart,
-              state: {
-                status: "error",
-                input: reviewPart.state.input,
-                error: "Independent review was interrupted and will be retried.",
-                metadata: {
-                  ...reviewPart.state.metadata,
-                  verdict: "error",
-                  tokens: 0,
-                },
-                time: { start: reviewPart.state.time.start, end: Date.now() },
-              },
-            })
-          }
           yield* sessions
             .setTitle({
               sessionID: orphan,
@@ -1213,31 +1165,8 @@ const layer = Layer.effect(
         return
       }
 
-      const parent = yield* lastAssistant(sessionID)
-      const reviewStartedAt = Date.now()
-      let reviewPart: SessionV1.ToolPart = yield* sessions.updatePart({
-        id: PartID.ascending(),
-        messageID: parent.info.id,
-        sessionID,
-        type: "tool",
-        callID: ulid(),
-        tool: "goal-review",
-        state: {
-          status: "running",
-          input: {
-            attempt: current.review.attempt,
-            reviewerSessionID: child.id,
-          },
-          title: `Independent review #${current.review.attempt}`,
-          metadata: {
-            reviewerSessionID: child.id,
-            activity: "Reviewer started",
-          },
-          time: { start: reviewStartedAt },
-        },
-      })
       const nonce = randomUUID().slice(0, 12)
-      const review = Effect.exit(
+      const result = yield* Effect.exit(
         prompt({
           sessionID: child.id,
           model: {
@@ -1281,71 +1210,24 @@ const layer = Layer.effect(
             },
           ],
         }),
-      ).pipe(Effect.map((exit) => ({ type: "exit" as const, exit })))
-      const watchdog = Effect.gen(function* () {
-        let fingerprint = ""
-        let lastActivityAt = yield* Clock.currentTimeMillis
-        const interval = Math.max(10, Math.min(250, Math.floor(flags.goalReviewTimeoutMs / 4)))
-        while (true) {
-          yield* Effect.sleep(`${interval} millis`)
-          const now = yield* Clock.currentTimeMillis
-          const progress = goalReviewProgress(yield* sessions.messages({ sessionID: child.id }).pipe(Effect.orDie))
-          if (progress.fingerprint !== fingerprint) {
-            fingerprint = progress.fingerprint
-            lastActivityAt = now
-            if (progress.activity && reviewPart.state.status === "running") {
-              reviewPart = yield* sessions.updatePart({
-                ...reviewPart,
-                state: {
-                  ...reviewPart.state,
-                  metadata: {
-                    ...reviewPart.state.metadata,
-                    activity: progress.activity,
-                  },
-                },
-              })
-            }
-          }
-          if (now - reviewStartedAt >= flags.goalReviewMaxMs) {
-            return {
-              type: "timeout" as const,
-              reason: `Independent reviewer timed out at the ${Math.ceil(flags.goalReviewMaxMs / 60_000)} minute safety limit`,
-            }
-          }
-          if (now - lastActivityAt >= flags.goalReviewTimeoutMs) {
-            return {
-              type: "timeout" as const,
-              reason: `Independent reviewer timed out after ${Math.ceil(flags.goalReviewTimeoutMs / 1000)}s without activity`,
-            }
-          }
-        }
-      })
-      const result = yield* Effect.raceFirst(review, watchdog)
+      ).pipe(
+        Effect.map((exit) => ({ type: "exit" as const, exit })),
+        Effect.timeoutOrElse({
+          duration: flags.goalReviewTimeoutMs,
+          orElse: () => Effect.succeed({ type: "timeout" as const }),
+        }),
+      )
 
       if (result.type === "timeout") {
-        const reason = `${result.reason}; completion remains unverified and work will continue.`
+        const seconds = Math.ceil(flags.goalReviewTimeoutMs / 1000)
         yield* state.cancel(child.id)
         yield* goal.finishReview({
           sessionID,
           reviewerSessionID: child.id,
           accepted: false,
           error: true,
-          reason,
+          reason: `Independent reviewer timed out after ${seconds}s; completion remains unverified and work will continue.`,
           tokens: 0,
-        })
-        reviewPart = yield* sessions.updatePart({
-          ...reviewPart,
-          state: {
-            status: "error",
-            input: reviewPart.state.input,
-            error: reason,
-            metadata: {
-              reviewerSessionID: child.id,
-              verdict: "error",
-              tokens: 0,
-            },
-            time: { start: reviewStartedAt, end: Date.now() },
-          },
         })
         yield* sessions
           .setTitle({
@@ -1357,28 +1239,13 @@ const layer = Layer.effect(
       }
 
       if (Exit.isFailure(result.exit)) {
-        const reason = "Independent reviewer failed to produce a verdict; completion remains unverified."
         yield* goal.finishReview({
           sessionID,
           reviewerSessionID: child.id,
           accepted: false,
           error: true,
-          reason,
+          reason: "Independent reviewer failed to produce a verdict; completion remains unverified.",
           tokens: 0,
-        })
-        reviewPart = yield* sessions.updatePart({
-          ...reviewPart,
-          state: {
-            status: "error",
-            input: reviewPart.state.input,
-            error: reason,
-            metadata: {
-              reviewerSessionID: child.id,
-              verdict: "error",
-              tokens: 0,
-            },
-            time: { start: reviewStartedAt, end: Date.now() },
-          },
         })
         yield* sessions
           .setTitle({
@@ -1396,44 +1263,24 @@ const layer = Layer.effect(
       const verdict = goalReviewVerdict(output, nonce)
       const tokens =
         result.exit.value.info.role === "assistant"
-          ? Math.max(0, result.exit.value.info.tokens.output + result.exit.value.info.tokens.reasoning)
+          ? Math.max(
+              0,
+              result.exit.value.info.tokens.input +
+                result.exit.value.info.tokens.output +
+                result.exit.value.info.tokens.reasoning +
+                result.exit.value.info.tokens.cache.read +
+                result.exit.value.info.tokens.cache.write,
+            )
           : 0
-      const reason =
-        verdict?.reason ?? "Independent reviewer returned no valid nonce-bound verdict; completion remains unverified."
       yield* goal.finishReview({
         sessionID,
         reviewerSessionID: child.id,
         accepted: verdict?.accepted ?? false,
         error: !verdict,
-        reason,
+        reason:
+          verdict?.reason ??
+          "Independent reviewer returned no valid nonce-bound verdict; completion remains unverified.",
         tokens,
-      })
-      reviewPart = yield* sessions.updatePart({
-        ...reviewPart,
-        state: verdict
-          ? {
-              status: "completed",
-              input: reviewPart.state.input,
-              title: `Independent review #${current.review.attempt} ${verdict.accepted ? "accepted" : "not yet met"}`,
-              output: reason,
-              metadata: {
-                reviewerSessionID: child.id,
-                verdict: verdict.accepted ? "accepted" : "rejected",
-                tokens,
-              },
-              time: { start: reviewStartedAt, end: Date.now() },
-            }
-          : {
-              status: "error",
-              input: reviewPart.state.input,
-              error: reason,
-              metadata: {
-                reviewerSessionID: child.id,
-                verdict: "error",
-                tokens,
-              },
-              time: { start: reviewStartedAt, end: Date.now() },
-            },
       })
       yield* sessions
         .setTitle({
@@ -1709,7 +1556,10 @@ const layer = Layer.effect(
           if (goalTurn) {
             yield* goal.recordTurn({
               sessionID,
-              tokens: Math.max(0, handle.message.tokens.output + handle.message.tokens.reasoning),
+              tokens: Math.max(
+                0,
+                handle.message.tokens.input + handle.message.tokens.output + handle.message.tokens.reasoning,
+              ),
             })
             yield* reviewGoal(sessionID, lastUser)
           }

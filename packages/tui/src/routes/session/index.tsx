@@ -1773,7 +1773,6 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
 
   // Hide tool if showDetails is false and tool completed successfully
   const shouldHide = createMemo(() => {
-    if (props.part.tool === "goal-review") return false
     if (ctx.showDetails()) return false
     if (props.part.state.status !== "completed") return false
     return true
@@ -1842,69 +1841,11 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
         <Match when={display() === "skill"}>
           <Skill {...toolprops} />
         </Match>
-        <Match when={display() === "goal-review"}>
-          <GoalReview part={props.part} />
-        </Match>
         <Match when={true}>
           <GenericTool {...toolprops} />
         </Match>
       </Switch>
     </Show>
-  )
-}
-
-function GoalReview(props: { part: ToolPart }) {
-  const { theme } = useTheme()
-  const { navigate } = useRoute()
-  const state = createMemo(() => props.part.state)
-  const metadata = createMemo(() => {
-    const current = state()
-    if (current.status === "pending") return {}
-    return current.metadata ?? {}
-  })
-  const attempt = createMemo(() => numberValue(state().input.attempt) ?? 1)
-  const sessionID = createMemo(() => stringValue(metadata().reviewerSessionID))
-  const verdict = createMemo(() => stringValue(metadata().verdict))
-  const tokens = createMemo(() => numberValue(metadata().tokens))
-  const activity = createMemo(() => stringValue(metadata().activity))
-  const reason = createMemo(() => {
-    const current = state()
-    if (current.status === "completed") return current.output
-    if (current.status === "error") return current.error
-    return activity()
-  })
-  const running = createMemo(() => state().status === "running")
-  const accepted = createMemo(() => verdict() === "accepted")
-  const rejected = createMemo(() => verdict() === "rejected")
-  const label = createMemo(() => {
-    if (running()) return `Independent review #${attempt()}: ${reason() ?? "running"}`
-    if (accepted()) return `Goal achieved — ${reason()}`
-    if (rejected()) return `Goal not yet met… continuing — ${reason()}`
-    return `Independent review could not finish — ${reason()}`
-  })
-
-  return (
-    <InlineTool
-      icon={accepted() ? "✔" : rejected() ? "◯" : running() ? "◎" : "✕"}
-      iconColor={accepted() ? theme.success : rejected() ? theme.warning : running() ? theme.primary : theme.error}
-      color={running() ? theme.text : theme.textMuted}
-      complete={!running()}
-      pending="Independent reviewer running"
-      spinner={running()}
-      part={props.part}
-      onClick={() => {
-        const reviewer = sessionID()
-        if (reviewer) navigate({ type: "session", sessionID: reviewer })
-      }}
-    >
-      {label()}
-      <Show when={tokens() !== undefined}>
-        <span style={{ fg: theme.textMuted }}> · {Locale.number(tokens()!)} tokens</span>
-      </Show>
-      <Show when={sessionID()}>
-        <span style={{ fg: theme.textMuted }}> · view reviewer</span>
-      </Show>
-    </InlineTool>
   )
 }
 
@@ -2769,7 +2710,6 @@ const toolDisplays = new Set([
   "question",
   "skill",
   "execute",
-  "goal-review",
 ])
 
 export function toolDisplay(tool: string) {
