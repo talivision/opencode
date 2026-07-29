@@ -73,11 +73,6 @@ function footer() {
         fn(next)
       }
     },
-    submitPrompt(prompt: RunPrompt) {
-      for (const fn of [...prompts]) {
-        fn(prompt)
-      }
-    },
     removeQueued(messageID: string) {
       for (const fn of [...queuedRemoves]) fn(messageID)
     },
@@ -482,68 +477,5 @@ describe("run runtime queue", () => {
 
     ui.submit("one")
     await expect(task).rejects.toThrow("boom")
-  })
-
-  test("runs goal controls out of band while a turn is active", async () => {
-    const ui = footer()
-    let release!: () => void
-    const active = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const controls: string[] = []
-
-    const task = runPromptQueue({
-      footer: ui.api,
-      isControl: (prompt) => prompt.command?.name === "goal",
-      control: async (prompt) => {
-        controls.push(prompt.command!.arguments)
-        return { handled: true }
-      },
-      run: async () => {
-        await active
-      },
-    })
-
-    ui.submit("keep working")
-    await Promise.resolve()
-    ui.submitPrompt({
-      text: "/goal pause",
-      parts: [],
-      command: { name: "goal", arguments: "pause" },
-    })
-    await Promise.resolve()
-    await Promise.resolve()
-
-    expect(controls).toEqual(["pause"])
-    release()
-    ui.api.close()
-    await task
-  })
-
-  test("starts a hidden continuation after activating an idle goal", async () => {
-    const ui = footer()
-    const seen: RunPrompt[] = []
-    const continuation = { text: "continue goal", parts: [], hidden: true } satisfies RunPrompt
-
-    const task = runPromptQueue({
-      footer: ui.api,
-      isControl: (prompt) => prompt.command?.name === "goal",
-      control: async () => ({ handled: true, start: true }),
-      continuation,
-      run: async (prompt) => {
-        seen.push(prompt)
-        ui.api.close()
-      },
-    })
-
-    ui.submitPrompt({
-      text: "/goal verify everything",
-      parts: [],
-      command: { name: "goal", arguments: "verify everything" },
-    })
-    await task
-
-    expect(seen).toEqual([{ ...continuation, messageID: expect.any(String) }])
-    expect(ui.commits.map((item) => item.text)).toEqual(["/goal verify everything"])
   })
 })

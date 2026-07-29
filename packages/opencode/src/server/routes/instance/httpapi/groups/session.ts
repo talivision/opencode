@@ -25,7 +25,6 @@ import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { SessionGoal } from "@/session/goal"
 
 const root = "/session"
 export const ListQuery = Schema.Struct({
@@ -75,19 +74,6 @@ export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput
 export const PermissionResponsePayload = Schema.Struct({
   response: PermissionV1.Reply,
 })
-export const GoalSetPayload = Schema.Struct({
-  objective: Schema.String,
-  tokenBudget: Schema.optional(Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0))),
-})
-export const GoalActionPayload = Schema.Union([
-  Schema.Struct({
-    action: Schema.Literal("edit"),
-    objective: Schema.String,
-    tokenBudget: Schema.optional(Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0))),
-  }),
-  Schema.Struct({ action: Schema.Literal("pause") }),
-  Schema.Struct({ action: Schema.Literal("resume") }),
-])
 
 export const SessionPaths = {
   list: root,
@@ -103,7 +89,6 @@ export const SessionPaths = {
   update: `${root}/:sessionID`,
   fork: `${root}/:sessionID/fork`,
   abort: `${root}/:sessionID/abort`,
-  goal: `${root}/:sessionID/goal`,
   share: `${root}/:sessionID/share`,
   init: `${root}/:sessionID/init`,
   summarize: `${root}/:sessionID/summarize`,
@@ -275,56 +260,6 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.abort",
             summary: "Abort session",
             description: "Abort an active session and stop any ongoing AI processing or command execution.",
-          }),
-        ),
-        HttpApiEndpoint.get("goalGet", SessionPaths.goal, {
-          params: { sessionID: SessionID },
-          query: WorkspaceRoutingQuery,
-          success: described(Schema.NullOr(SessionGoal.Info), "Current long-running goal"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "session.goal.get",
-            summary: "Get session goal",
-            description: "Retrieve the durable long-running goal and its lifecycle, usage, and timing state.",
-          }),
-        ),
-        HttpApiEndpoint.put("goalSet", SessionPaths.goal, {
-          params: { sessionID: SessionID },
-          query: WorkspaceRoutingQuery,
-          payload: GoalSetPayload,
-          success: described(SessionGoal.Info, "Goal created"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "session.goal.set",
-            summary: "Set session goal",
-            description: "Create or replace a durable long-running goal and activate autonomous pursuit.",
-          }),
-        ),
-        HttpApiEndpoint.patch("goalAction", SessionPaths.goal, {
-          params: { sessionID: SessionID },
-          query: WorkspaceRoutingQuery,
-          payload: GoalActionPayload,
-          success: described(Schema.NullOr(SessionGoal.Info), "Goal updated"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "session.goal.action",
-            summary: "Update session goal",
-            description: "Edit, pause, or resume the current long-running goal.",
-          }),
-        ),
-        HttpApiEndpoint.delete("goalClear", SessionPaths.goal, {
-          params: { sessionID: SessionID },
-          query: WorkspaceRoutingQuery,
-          success: described(Schema.Boolean, "Goal cleared"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "session.goal.clear",
-            summary: "Clear session goal",
-            description: "Stop autonomous pursuit and remove durable goal state while preserving transcript history.",
           }),
         ),
         HttpApiEndpoint.post("init", SessionPaths.init, {

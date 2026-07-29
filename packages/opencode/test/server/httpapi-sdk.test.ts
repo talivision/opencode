@@ -378,56 +378,6 @@ describe("HttpApi SDK", () => {
       }),
   )
 
-  httpapiInstance(
-    "manages the complete session goal lifecycle through the generated SDK",
-    { serverPath: "raw", git: false },
-    ({ sdk }) =>
-      Effect.gen(function* () {
-        const created = yield* call(() => sdk.session.create({ title: "goal lifecycle" }))
-        const sessionID = created.data!.id
-
-        const empty = yield* call(() => sdk.session.goal.get({ sessionID }))
-        expect(empty.response.status).toBe(200)
-        expect(empty.data).toBeNull()
-
-        const set = yield* call(() =>
-          sdk.session.goal.set({ sessionID, objective: "verify the feature", tokenBudget: 5_000 }),
-        )
-        expect(set.response.status).toBe(200)
-        expect(set.data).toMatchObject({
-          sessionID,
-          objective: "verify the feature",
-          status: "active",
-          tokenBudget: 5_000,
-          tokensUsed: 0,
-          turns: 0,
-        })
-
-        const paused = yield* call(() => sdk.session.goal.action({ sessionID, body: { action: "pause" } }))
-        expect(paused.data).toMatchObject({ status: "paused", pauseReason: "user" })
-
-        const resumed = yield* call(() => sdk.session.goal.action({ sessionID, body: { action: "resume" } }))
-        expect(resumed.data).toMatchObject({ status: "active" })
-
-        const edited = yield* call(() =>
-          sdk.session.goal.action({
-            sessionID,
-            body: { action: "edit", objective: "verify every lifecycle action", tokenBudget: 6_000 },
-          }),
-        )
-        expect(edited.data).toMatchObject({
-          objective: "verify every lifecycle action",
-          status: "active",
-          tokenBudget: 6_000,
-        })
-
-        const cleared = yield* call(() => sdk.session.goal.clear({ sessionID }))
-        expect(cleared.data).toBe(true)
-        expect((yield* call(() => sdk.session.goal.get({ sessionID }))).data).toBeNull()
-        yield* expectStatus(() => sdk.session.goal.set({ sessionID, objective: "   " }), 400)
-      }),
-  )
-
   httpapi(
     "routes configured SDK directory and workspace for v2 location GETs",
     withProject("raw", { setup: writeStandardFiles }, ({ directory }) =>

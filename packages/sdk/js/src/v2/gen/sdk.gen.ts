@@ -193,14 +193,6 @@ import type {
   SessionForkResponses,
   SessionGetErrors,
   SessionGetResponses,
-  SessionGoalActionErrors,
-  SessionGoalActionResponses,
-  SessionGoalClearErrors,
-  SessionGoalClearResponses,
-  SessionGoalGetErrors,
-  SessionGoalGetResponses,
-  SessionGoalSetErrors,
-  SessionGoalSetResponses,
   SessionInitErrors,
   SessionInitResponses,
   SessionListErrors,
@@ -3369,163 +3361,6 @@ export class Provider extends HeyApiClient {
   }
 }
 
-export class Goal extends HeyApiClient {
-  /**
-   * Clear session goal
-   *
-   * Stop autonomous pursuit and remove durable goal state while preserving transcript history.
-   */
-  public clear<ThrowOnError extends boolean = false>(
-    parameters: {
-      sessionID: string
-      directory?: string
-      workspace?: string
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "path", key: "sessionID" },
-            { in: "query", key: "directory" },
-            { in: "query", key: "workspace" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).delete<SessionGoalClearResponses, SessionGoalClearErrors, ThrowOnError>({
-      url: "/session/{sessionID}/goal",
-      ...options,
-      ...params,
-    })
-  }
-
-  /**
-   * Get session goal
-   *
-   * Retrieve the durable long-running goal and its lifecycle, usage, and timing state.
-   */
-  public get<ThrowOnError extends boolean = false>(
-    parameters: {
-      sessionID: string
-      directory?: string
-      workspace?: string
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "path", key: "sessionID" },
-            { in: "query", key: "directory" },
-            { in: "query", key: "workspace" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).get<SessionGoalGetResponses, SessionGoalGetErrors, ThrowOnError>({
-      url: "/session/{sessionID}/goal",
-      ...options,
-      ...params,
-    })
-  }
-
-  /**
-   * Update session goal
-   *
-   * Edit, pause, or resume the current long-running goal.
-   */
-  public action<ThrowOnError extends boolean = false>(
-    parameters: {
-      sessionID: string
-      directory?: string
-      workspace?: string
-      body?:
-        | {
-            action: "edit"
-            objective: string
-            tokenBudget?: number
-          }
-        | {
-            action: "pause"
-          }
-        | {
-            action: "resume"
-          }
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "path", key: "sessionID" },
-            { in: "query", key: "directory" },
-            { in: "query", key: "workspace" },
-            { key: "body", map: "body" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).patch<SessionGoalActionResponses, SessionGoalActionErrors, ThrowOnError>({
-      url: "/session/{sessionID}/goal",
-      ...options,
-      ...params,
-      headers: {
-        "Content-Type": "application/json",
-        ...options?.headers,
-        ...params.headers,
-      },
-    })
-  }
-
-  /**
-   * Set session goal
-   *
-   * Create or replace a durable long-running goal and activate autonomous pursuit.
-   */
-  public set<ThrowOnError extends boolean = false>(
-    parameters: {
-      sessionID: string
-      directory?: string
-      workspace?: string
-      objective?: string
-      tokenBudget?: number
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "path", key: "sessionID" },
-            { in: "query", key: "directory" },
-            { in: "query", key: "workspace" },
-            { in: "body", key: "objective" },
-            { in: "body", key: "tokenBudget" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).put<SessionGoalSetResponses, SessionGoalSetErrors, ThrowOnError>({
-      url: "/session/{sessionID}/goal",
-      ...options,
-      ...params,
-      headers: {
-        "Content-Type": "application/json",
-        ...options?.headers,
-        ...params.headers,
-      },
-    })
-  }
-}
-
 export class Session2 extends HeyApiClient {
   /**
    * List sessions
@@ -4491,11 +4326,6 @@ export class Session2 extends HeyApiClient {
       ...options,
       ...params,
     })
-  }
-
-  private _goal?: Goal
-  get goal(): Goal {
-    return (this._goal ??= new Goal({ client: this.client }))
   }
 }
 

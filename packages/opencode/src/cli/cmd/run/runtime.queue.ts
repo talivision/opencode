@@ -26,13 +26,9 @@ type Deferred<T = void> = {
 export type QueueInput = {
   footer: FooterApi
   initialInput?: string
-  initialPrompt?: RunPrompt
   trace?: Trace
   onSend?: (prompt: RunPrompt) => void
   onNewSession?: () => void | Promise<void>
-  isControl?: (prompt: RunPrompt) => boolean
-  control?: (prompt: RunPrompt) => Promise<{ handled: boolean; start?: boolean }>
-  continuation?: RunPrompt
   run: (prompt: RunPrompt, signal: AbortSignal) => Promise<void>
 }
 
@@ -69,7 +65,6 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
     closed: input.footer.isClosed,
   }
   let draining: Promise<void> | undefined
-  let controls: Promise<void> = Promise.resolve()
 
   const emit = (next: FooterEvent, row: Record<string, unknown>) => {
     input.trace?.write("ui.patch", row)
@@ -197,7 +192,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
               break
             }
 
-            if (sent.mode !== "shell" && !sent.hidden) {
+            if (sent.mode !== "shell") {
               const commit = {
                 kind: "user",
                 text: sent.text,
@@ -208,7 +203,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
               input.trace?.write("ui.commit", commit)
               input.footer.append(commit)
             }
-            if (!sent.hidden) input.onSend?.(sent)
+            input.onSend?.(sent)
 
             if (state.closed) {
               break
@@ -270,42 +265,6 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
     })()
   }
 
-  const runControl = (prompt: RunPrompt) => {
-    const wasActive = !!state.active
-    const sent = {
-      ...prompt,
-      messageID: prompt.messageID ?? MessageID.ascending(),
-    }
-    controls = controls.then(async () => {
-      if (state.closed || !input.control) return
-      if (!sent.hidden) {
-        const commit = {
-          kind: "user",
-          text: sent.text,
-          phase: "start",
-          source: "system",
-          messageID: sent.messageID,
-        } as const
-        input.trace?.write("ui.commit", commit)
-        input.footer.append(commit)
-        input.onSend?.(sent)
-      }
-
-      try {
-        const result = await input.control(sent)
-        if (result.start && !wasActive && input.continuation) submit(input.continuation)
-      } catch (error) {
-        input.footer.append({
-          kind: "error",
-          text: error instanceof Error ? error.message : String(error),
-          phase: "start",
-          source: "system",
-          messageID: sent.messageID,
-        })
-      }
-    })
-  }
-
   const submit = (prompt: RunPrompt) => {
     if (!prompt.text.trim() || state.closed) {
       return
@@ -313,12 +272,6 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
 
     if (prompt.mode !== "shell" && isExitCommand(prompt.text)) {
       input.footer.close()
-      return
-    }
-
-    if (input.isControl?.(prompt)) {
-      emit({ type: "first", first: false }, { first: false })
-      runControl(prompt)
       return
     }
 
@@ -380,14 +333,10 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
       return
     }
 
-    if (input.initialInput) {
-      submit({
-        text: input.initialInput,
-        parts: [],
-      })
-    } else if (input.initialPrompt) {
-      submit(input.initialPrompt)
-    }
+    submit({
+      text: input.initialInput ?? "",
+      parts: [],
+    })
     finish()
     await done.promise
   } finally {
@@ -396,6 +345,5 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
     offRemoveQueued()
     close()
     await draining?.catch(() => {})
-    await controls.catch(() => {})
   }
 }

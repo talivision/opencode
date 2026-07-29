@@ -1147,19 +1147,6 @@ test("direct footer shows full usage metadata when room is available", async () 
   }
 })
 
-test("direct footer keeps durable goal status beside usage metadata", async () => {
-  const app = await renderFooter({
-    state: { usage: "12.4K (6%)", goal: "Goal paused · 18s" },
-  })
-
-  try {
-    await app.renderOnce()
-    expect(app.captureCharFrame()).toContain("12.4K (6%) · Goal paused · 18s")
-  } finally {
-    app.cleanup()
-  }
-})
-
 test("direct footer mode label keeps left padding without a status pill", async () => {
   const app = await renderFooter()
 

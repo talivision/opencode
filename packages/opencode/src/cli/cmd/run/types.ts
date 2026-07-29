@@ -40,7 +40,6 @@ export type RunPrompt = {
     name: string
     arguments: string
   }
-  hidden?: boolean
 }
 
 export type FooterQueuedPrompt = {
@@ -88,7 +87,6 @@ export type FooterState = {
   model: string
   duration: string
   usage: string
-  goal?: string
   first: boolean
   interrupt: number
   exit: number
@@ -280,10 +278,6 @@ export type FooterEvent =
   | {
       type: "stream.subagent"
       state: FooterSubagentState
-    }
-  | {
-      type: "prompt.replace"
-      prompt: RunPrompt
     }
 
 export type PermissionReply = Parameters<OpencodeClient["permission"]["reply"]>[0]

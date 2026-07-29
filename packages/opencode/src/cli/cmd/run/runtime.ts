@@ -16,7 +16,6 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { MessageID } from "@/session/schema"
 import { createRunDemo } from "./demo"
-import { createGoalController, GOAL_COMMAND, GOAL_CONTINUATION } from "./goal"
 import { resolveModelInfo, resolveRunTuiConfig, resolveSessionInfo } from "./runtime.boot"
 import { createRuntimeLifecycle } from "./runtime.lifecycle"
 import { trace } from "./trace"
@@ -365,11 +364,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
     },
   })
   const footer = shell.footer
-  const goal = createGoalController({
-    sdk: ctx.sdk,
-    footer,
-    sessionID: () => state.sessionID,
-  })
   const rememberLocal = (commit: StreamCommit, after?: LocalReplayAnchor) => {
     state.localRows = [...state.localRows, { commit, after }].slice(-LOCAL_REPLAY_ROW_LIMIT)
   }
@@ -401,7 +395,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
       type: "catalog",
       agents,
       resources,
-      commands: [GOAL_COMMAND, ...commands.filter((item) => item.name !== GOAL_COMMAND.name)],
+      commands,
     })
   }
 
@@ -548,17 +542,9 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
 
     const mod = await import("./runtime.queue")
     const createSession = input.createSession
-    const initialGoal = state.sessionID ? await goal.refresh().catch(() => undefined) : undefined
     await mod.runPromptQueue({
       footer,
       initialInput: input.initialInput,
-      initialPrompt: !input.initialInput && initialGoal?.status === "active" ? GOAL_CONTINUATION : undefined,
-      isControl: (prompt) => prompt.command?.name === GOAL_COMMAND.name,
-      control: async (prompt) => {
-        await ensureSession()
-        return goal.execute(prompt)
-      },
-      continuation: GOAL_CONTINUATION,
       trace: log,
       onSend: (prompt) => {
         state.shown = true
@@ -593,7 +579,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
               state.agent = created.agent ?? state.agent
               state.history = []
               state.localRows = []
-              goal.reset()
               includeFiles = true
               state.demo = input.demo
                 ? createRunDemo({
@@ -697,8 +682,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
           } as const
           rememberLocal(commit, outputAnchor)
           footer.append(commit)
-        } finally {
-          await goal.refresh(true).catch(() => {})
         }
       },
     })

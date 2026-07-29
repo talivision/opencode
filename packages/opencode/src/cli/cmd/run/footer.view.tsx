@@ -86,7 +86,6 @@ type RunFooterViewProps = {
   view?: () => FooterView
   subagent?: () => FooterSubagentState
   queuedPrompts?: () => FooterQueuedPrompt[]
-  promptReplacement?: () => RunPrompt | undefined
   theme: () => RunTheme
   diffStyle?: RunDiffStyle
   tuiConfig: RunTuiConfig
@@ -245,7 +244,6 @@ export function RunFooterView(props: RunFooterViewProps) {
   const exiting = createMemo(() => props.state().exit > 0)
   const queue = createMemo(() => props.state().queue)
   const usage = createMemo(() => props.state().usage)
-  const goal = createMemo(() => props.state().goal ?? "")
   const interruptLabel = createMemo(() => {
     if (!interrupt()) {
       return
@@ -419,11 +417,11 @@ export function RunFooterView(props: RunFooterViewProps) {
     return shell() ? "Shell mode" : ""
   })
   const activityMeta = createMemo(() => {
-    if (!responsive().statusline.showActivityMeta) {
+    if (!responsive().statusline.showActivityMeta || usage().length === 0) {
       return ""
     }
 
-    return [usage(), goal()].filter(Boolean).join(" · ")
+    return usage()
   })
   const modelStatus = createMemo(() => {
     const current = props.currentModel()
@@ -493,12 +491,6 @@ export function RunFooterView(props: RunFooterViewProps) {
 
   createEffect(() => {
     props.onRequestExit?.(composer.requestExit)
-  })
-
-  createEffect(() => {
-    const next = props.promptReplacement?.()
-    if (!next) return
-    queueMicrotask(() => composer.replacePrompt(next))
   })
 
   onCleanup(() => {

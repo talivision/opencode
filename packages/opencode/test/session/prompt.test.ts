@@ -35,7 +35,6 @@ import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
-import { SessionGoal } from "../../src/session/goal"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -171,7 +170,6 @@ const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLL
 
 const promptRoot = LayerNode.group([
   SessionPrompt.node,
-  SessionGoal.node,
   Session.node,
   SessionProjector.node,
   MessageV2.node,
@@ -210,23 +208,12 @@ const promptRoot = LayerNode.group([
   RuntimeFlags.node,
 ])
 
-type PromptLayerInput = {
-  mcpInstructions?: MCP.ServerInstructions[]
-  processor?: "blocking"
-  goalReviewTimeoutMs?: number
-}
-
-function makePrompt(input?: PromptLayerInput) {
+function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [
-      RuntimeFlags.node,
-      input?.goalReviewTimeoutMs
-        ? RuntimeFlags.layer({ experimentalEventSystem: true, goalReviewTimeoutMs: input.goalReviewTimeoutMs })
-        : runtimeFlags,
-    ],
+    [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -234,18 +221,13 @@ function makePrompt(input?: PromptLayerInput) {
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: PromptLayerInput) {
+function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [
-      RuntimeFlags.node,
-      input?.goalReviewTimeoutMs
-        ? RuntimeFlags.layer({ experimentalEventSystem: true, goalReviewTimeoutMs: input.goalReviewTimeoutMs })
-        : runtimeFlags,
-    ],
+    [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -253,12 +235,11 @@ function makeHttp(input?: PromptLayerInput) {
   return LayerNode.compile(root, replacements)
 }
 
-function makeHttpNoLLMServer(input?: PromptLayerInput) {
+function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
   return makePrompt(input)
 }
 
 const it = testEffect(makeHttp())
-const reviewerTimeout = testEffect(makeHttp({ goalReviewTimeoutMs: 100 }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -798,214 +779,6 @@ it.instance("static loop consumes queued replies across turns", () =>
 
     expect(yield* llm.hits).toHaveLength(2)
     expect(yield* llm.pending).toBe(0)
-  }),
-)
-
-it.instance("active goals continue across provider turns until the goal tool completes them", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const goals = yield* SessionGoal.Service
-    const sessions = yield* Session.Service
-    const session = yield* sessions.create({
-      title: "Goal continuation",
-      permission: [{ permission: "*", pattern: "*", action: "allow" }],
-    })
-
-    yield* prompt.prompt({
-      sessionID: session.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "start the durable goal" }],
-    })
-    yield* goals.set({ sessionID: session.id, objective: "continue once, then finish" })
-    yield* llm.text("First increment complete.", { usage: { input: 20, output: 5 } })
-    yield* llm.tool("goal", { status: "complete" })
-    yield* llm.textFrom((hit) => {
-      const input = JSON.stringify(hit.body)
-      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(input)?.[1]
-      return `Independent checks passed.\nVERDICT: MET ${nonce} objective verified`
-    })
-
-    const result = yield* prompt.loop({ sessionID: session.id })
-    const goal = yield* goals.get(session.id)
-    const messages = yield* sessions.messages({ sessionID: session.id })
-    const synthetic = messages.find(
-      (message) =>
-        message.info.role === "user" &&
-        message.parts.some(
-          (part) =>
-            part.type === "text" && part.synthetic && part.text.includes("Continue working toward the active goal"),
-        ),
-    )
-
-    expect(yield* llm.calls).toBe(4)
-    expect(goal?.status).toBe("complete")
-    expect(goal?.review?.status).toBe("accepted")
-    expect(goal?.turns).toBe(2)
-    expect(goal?.tokensUsed).toBeGreaterThanOrEqual(25)
-    expect(synthetic).toBeDefined()
-    expect(result.info.role).toBe("assistant")
-
-    const inputs = yield* llm.inputs
-    expect(JSON.stringify(inputs[0])).toContain("<active-goal>")
-    expect(JSON.stringify(inputs[0])).toContain("continue once, then finish")
-
-    const reviewers = yield* sessions.children(session.id)
-    expect(reviewers).toHaveLength(1)
-    expect(reviewers[0]?.metadata?.goalReviewer).toBe(true)
-    expect(reviewers[0]?.title).toContain("accepted")
-  }),
-)
-
-it.instance("a rejected completion review keeps the goal active until a later review accepts it", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const goals = yield* SessionGoal.Service
-    const sessions = yield* Session.Service
-    const session = yield* sessions.create({
-      title: "Goal review rejection",
-      permission: [{ permission: "*", pattern: "*", action: "allow" }],
-    })
-
-    yield* prompt.prompt({
-      sessionID: session.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "verify the goal before accepting completion" }],
-    })
-    yield* goals.set({ sessionID: session.id, objective: "produce authoritative verification evidence" })
-    yield* llm.tool("goal", { status: "complete", reason: "unverified worker claim" })
-    yield* llm.textFrom((hit) => {
-      const input = JSON.stringify(hit.body)
-      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(input)?.[1]
-      return `VERDICT: NOT_MET ${nonce} authoritative evidence is missing`
-    })
-    yield* llm.tool("goal", { status: "complete", reason: "authoritative evidence gathered" })
-    yield* llm.textFrom((hit) => {
-      const input = JSON.stringify(hit.body)
-      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(input)?.[1]
-      return `VERDICT: MET ${nonce} authoritative evidence was independently verified`
-    })
-
-    yield* prompt.loop({ sessionID: session.id })
-    const goal = yield* goals.get(session.id)
-    expect(goal?.status).toBe("complete")
-    expect(goal?.review?.status).toBe("accepted")
-    expect(goal?.review?.attempt).toBe(2)
-
-    const inputs = yield* llm.inputs
-    expect(JSON.stringify(inputs)).toContain("authoritative evidence is missing")
-
-    const reviewers = yield* sessions.children(session.id)
-    expect(reviewers).toHaveLength(2)
-    expect(reviewers.map((reviewer) => reviewer.title)).toEqual(
-      expect.arrayContaining([expect.stringContaining("rejected"), expect.stringContaining("accepted")]),
-    )
-  }),
-)
-
-it.instance("an interrupted running review is recovered and independently retried", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const goals = yield* SessionGoal.Service
-    const sessions = yield* Session.Service
-    const status = yield* SessionStatus.Service
-    const run = yield* SessionRunState.Service
-    const session = yield* sessions.create({
-      title: "Interrupted goal review",
-      permission: [{ permission: "*", pattern: "*", action: "allow" }],
-    })
-
-    yield* prompt.prompt({
-      sessionID: session.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "resume after a process interruption" }],
-    })
-    yield* goals.set({ sessionID: session.id, objective: "recover the interrupted independent review" })
-    yield* goals.requestReview({ sessionID: session.id, evidence: "verified before interruption" })
-    const orphan = yield* sessions.create({
-      parentID: session.id,
-      title: "[goal-reviewer] interrupted",
-      metadata: { goalReviewer: true },
-    })
-    yield* goals.beginReview(session.id, orphan.id)
-    const orphanFiber = yield* run.ensureRunning(orphan.id, Effect.interrupt, Effect.never).pipe(Effect.forkChild)
-    yield* pollWithTimeout(
-      run.assertNotBusy(orphan.id).pipe(
-        Effect.exit,
-        Effect.map((exit) => (Exit.isFailure(exit) ? true : undefined)),
-      ),
-      "interrupted reviewer never became busy",
-    )
-
-    yield* llm.text("Worker turn after restart.")
-    yield* llm.textFrom((hit) => {
-      const input = JSON.stringify(hit.body)
-      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(input)?.[1]
-      return `VERDICT: MET ${nonce} recovered review verified the objective`
-    })
-
-    yield* prompt.loop({ sessionID: session.id })
-    const goal = yield* goals.get(session.id)
-    expect(goal?.status).toBe("complete")
-    expect(goal?.review?.status).toBe("accepted")
-    expect(goal?.review?.attempt).toBe(1)
-    const preserved = yield* sessions.get(orphan.id)
-    expect(preserved.title).toContain("interrupted")
-    expect((yield* status.get(orphan.id)).type).toBe("idle")
-    yield* run.assertNotBusy(orphan.id)
-    expect(Exit.isFailure(yield* Fiber.await(orphanFiber))).toBe(true)
-    const reviewers = yield* sessions.children(session.id)
-    expect(reviewers).toHaveLength(2)
-    expect(reviewers.some((reviewer) => reviewer.title.includes("accepted"))).toBe(true)
-  }),
-)
-
-reviewerTimeout.instance("a hanging reviewer times out, remains inspectable, and returns control", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const goals = yield* SessionGoal.Service
-    const sessions = yield* Session.Service
-    const status = yield* SessionStatus.Service
-    const run = yield* SessionRunState.Service
-    const session = yield* sessions.create({
-      title: "Goal reviewer watchdog",
-      permission: [{ permission: "*", pattern: "*", action: "allow" }],
-    })
-
-    yield* prompt.prompt({
-      sessionID: session.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "start the lima goal" }],
-    })
-    yield* goals.set({
-      sessionID: session.id,
-      objective:
-        "Speak the word lima and return control. The reviewer should force continued lima turns without hanging.",
-    })
-    yield* llm.tool("goal", { status: "complete", reason: "lima was spoken" })
-    yield* llm.hang
-    yield* llm.tool("goal", { status: "blocked", reason: "reviewer timeout requires intervention" })
-    yield* llm.tool("goal", { status: "blocked", reason: "reviewer timeout requires intervention" })
-    yield* llm.tool("goal", { status: "blocked", reason: "reviewer timeout requires intervention" })
-
-    yield* prompt.loop({ sessionID: session.id })
-    const goal = yield* goals.get(session.id)
-    expect(goal?.status).toBe("blocked")
-    expect(goal?.review?.status).toBe("error")
-    expect(goal?.review?.reason).toContain("timed out")
-
-    const reviewers = yield* sessions.children(session.id)
-    expect(reviewers).toHaveLength(1)
-    expect(reviewers[0]?.title).toContain("timed out")
-    expect((yield* status.get(reviewers[0]!.id)).type).toBe("idle")
-    yield* run.assertNotBusy(reviewers[0]!.id)
   }),
 )
 

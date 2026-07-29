@@ -15,7 +15,7 @@ type Flow =
   | { type: "tool-args"; text: string }
   | { type: "usage"; usage: Usage }
 
-export type Hit = {
+type Hit = {
   url: URL
   body: Record<string, unknown>
 }
@@ -23,7 +23,7 @@ export type Hit = {
 type Match = (hit: Hit) => boolean
 
 type Queue = {
-  item: Item | ((hit: Hit) => Item)
+  item: Item
   match?: Match
 }
 
@@ -617,7 +617,6 @@ namespace TestLLMServer {
     readonly textMatch: (match: Match, value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
     readonly toolMatch: (match: Match, name: string, input: unknown) => Effect.Effect<void>
     readonly text: (value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
-    readonly textFrom: (make: (hit: Hit) => string, opts?: { usage?: Usage }) => Effect.Effect<void>
     readonly tool: (name: string, input: unknown) => Effect.Effect<void>
     readonly toolHang: (name: string, input: unknown) => Effect.Effect<void>
     readonly reason: (value: string, opts?: { text?: string; usage?: Usage }) => Effect.Effect<void>
@@ -667,7 +666,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         if (index === -1) return
         const first = list[index]
         list = [...list.slice(0, index), ...list.slice(index + 1)]
-        return typeof first.item === "function" ? first.item(hit) : first.item
+        return first.item
       }
 
       const handle = Effect.fn("TestLLMServer.handle")(function* (mode: "chat" | "responses") {
@@ -732,18 +731,6 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
           const out = reply().text(value)
           if (opts?.usage) out.usage(opts.usage)
           queue(out.stop().item())
-        }),
-        textFrom: Effect.fn("TestLLMServer.textFrom")(function* (make: (hit: Hit) => string, opts?: { usage?: Usage }) {
-          list = [
-            ...list,
-            {
-              item: (hit) => {
-                const out = reply().text(make(hit))
-                if (opts?.usage) out.usage(opts.usage)
-                return out.stop().item()
-              },
-            },
-          ]
         }),
         tool: Effect.fn("TestLLMServer.tool")(function* (name: string, input: unknown) {
           queue(reply().tool(name, input).item())

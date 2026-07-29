@@ -29,7 +29,6 @@ import { ProviderAuth } from "@/provider/auth"
 import { Provider } from "@/provider/provider"
 import { Question } from "@/question"
 import { SessionCompaction } from "@/session/compaction"
-import { SessionGoal } from "@/session/goal"
 import { Instruction } from "@/session/instruction"
 import { LLM } from "@/session/llm"
 import { SessionProcessor } from "@/session/processor"
@@ -236,7 +235,6 @@ const app = LayerNode.group([
   Session.node,
   SessionProjector.node,
   SessionStatus.node,
-  SessionGoal.node,
   BackgroundJob.node,
   RuntimeFlags.node,
   EventV2Bridge.node,
