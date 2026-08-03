@@ -756,6 +756,41 @@ You can control context compaction behavior through the `compaction` option.
 
 ---
 
+### Goal review
+
+When a goal is active, an independent reviewer agent verifies completion before
+the goal can be marked met. You can control how long that reviewer is allowed to
+run through the `goal.review` option.
+
+```json title="opencode.json"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "goal": {
+    "review": {
+      "timeout": 120000,
+      "max_duration": 1800000
+    }
+  }
+}
+```
+
+- `timeout` - Milliseconds the reviewer may go without any activity before it is
+  cancelled (default: `120000`). This is an inactivity timer, not a wall clock:
+  it resets on streamed text, reasoning, and tool calls, so it only fires on a
+  reviewer that has genuinely stalled.
+- `max_duration` - Maximum total milliseconds a single review may run, regardless
+  of activity (default: `1800000`). This is the backstop against a reviewer that
+  stays busy but never converges.
+
+Raise both if you run long-lived goals against large working trees or slow
+models. A review that hits either limit is recorded as unverified and the goal
+continues working — a timed-out review can never accept a goal as met.
+
+The environment variables `OPENCODE_GOAL_REVIEW_TIMEOUT_MS` and
+`OPENCODE_GOAL_REVIEW_MAX_MS` override these for a single run.
+
+---
+
 ### Watcher
 
 You can configure file watcher ignore patterns through the `watcher` option.

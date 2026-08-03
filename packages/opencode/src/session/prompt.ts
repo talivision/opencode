@@ -1259,6 +1259,19 @@ const layer = Layer.effect(
       }
 
       const parent = yield* lastAssistant(sessionID)
+      // Env var wins over config so a one-off run can override a checked-in
+      // value. Both are generous by default: goal mode runs unattended, and a
+      // reviewer inspecting a large working tree is a normal slow path, not a
+      // stall. See goalReviewTimeoutMs/goalReviewMaxMs in runtime-flags.
+      const reviewConfig = (yield* config.get()).goal?.review
+      const reviewTimeoutMs = flags.goalReviewTimeoutMs ?? reviewConfig?.timeout ?? 120_000
+      const reviewMaxMs = flags.goalReviewMaxMs ?? reviewConfig?.max_duration ?? 1_800_000
+      // Both limits are configurable, so the reason has to describe whatever the
+      // operator actually set: a sub-minute cap must not report "1 minute".
+      const reviewMaxLabel =
+        reviewMaxMs < 60_000
+          ? `${Math.ceil(reviewMaxMs / 1000)} second`
+          : `${Math.round(reviewMaxMs / 60_000)} minute`
       const reviewStartedAt = Date.now()
       let reviewPart: SessionV1.ToolPart = yield* sessions.updatePart({
         id: PartID.ascending(),
@@ -1358,7 +1371,7 @@ const layer = Layer.effect(
             ),
             Effect.forkChild,
           )
-        const interval = Math.max(10, Math.min(250, Math.floor(flags.goalReviewTimeoutMs / 4)))
+        const interval = Math.max(10, Math.min(250, Math.floor(reviewTimeoutMs / 4)))
         while (true) {
           yield* Effect.sleep(`${interval} millis`)
           const now = yield* Clock.currentTimeMillis
@@ -1384,16 +1397,16 @@ const layer = Layer.effect(
               },
             })
           }
-          if (now - reviewStartedAt >= flags.goalReviewMaxMs) {
+          if (now - reviewStartedAt >= reviewMaxMs) {
             return {
               type: "timeout" as const,
-              reason: `Independent reviewer timed out at the ${Math.ceil(flags.goalReviewMaxMs / 60_000)} minute safety limit`,
+              reason: `Independent reviewer timed out at the ${reviewMaxLabel} safety limit`,
             }
           }
-          if (now - lastActivityAt >= flags.goalReviewTimeoutMs) {
+          if (now - lastActivityAt >= reviewTimeoutMs) {
             return {
               type: "timeout" as const,
-              reason: `Independent reviewer timed out after ${Math.ceil(flags.goalReviewTimeoutMs / 1000)}s without activity`,
+              reason: `Independent reviewer timed out after ${Math.ceil(reviewTimeoutMs / 1000)}s without activity`,
             }
           }
         }

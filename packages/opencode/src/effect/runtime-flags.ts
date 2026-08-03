@@ -51,8 +51,10 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   experimentalIconDiscovery: enabledByExperimental("OPENCODE_EXPERIMENTAL_ICON_DISCOVERY"),
   outputTokenMax: positiveInteger("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"),
   bashDefaultTimeoutMs: positiveInteger("OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"),
-  goalReviewTimeoutMs: positiveInteger("OPENCODE_GOAL_REVIEW_TIMEOUT_MS").pipe(Config.map((value) => value ?? 60_000)),
-  goalReviewMaxMs: positiveInteger("OPENCODE_GOAL_REVIEW_MAX_MS").pipe(Config.map((value) => value ?? 600_000)),
+  // Left undefined when unset so the goal review site can fall back to config
+  // before applying its defaults; the env var wins when present.
+  goalReviewTimeoutMs: positiveInteger("OPENCODE_GOAL_REVIEW_TIMEOUT_MS"),
+  goalReviewMaxMs: positiveInteger("OPENCODE_GOAL_REVIEW_MAX_MS"),
   experimentalNativeLlm: bool("OPENCODE_EXPERIMENTAL_NATIVE_LLM"),
   experimentalWebSockets: bool("OPENCODE_EXPERIMENTAL_WEBSOCKETS"),
   client: Config.string("OPENCODE_CLIENT").pipe(Config.withDefault("cli")),

@@ -166,6 +166,25 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
+  goal: Schema.optional(
+    Schema.Struct({
+      review: Schema.optional(
+        Schema.Struct({
+          timeout: Schema.optional(PositiveInt).annotate({
+            description:
+              "Milliseconds the independent goal reviewer may go without any activity before it is cancelled. Resets on streamed text, reasoning, and tool calls, so it only fires on a genuinely stalled reviewer (default: 120000)",
+          }),
+          max_duration: Schema.optional(PositiveInt).annotate({
+            description:
+              "Maximum total milliseconds a single goal review may run before it is cancelled, regardless of activity (default: 1800000)",
+          }),
+        }),
+      ).annotate({
+        description:
+          "Limits for the independent reviewer that verifies goal completion. A review that hits either limit is recorded as unverified and the goal continues; it can never accept a goal as met.",
+      }),
+    }),
+  ).annotate({ description: "Goal mode settings" }),
   experimental: Schema.optional(
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),

@@ -214,6 +214,16 @@ type PromptLayerInput = {
   mcpInstructions?: MCP.ServerInstructions[]
   processor?: "blocking"
   goalReviewTimeoutMs?: number
+  goalReviewMaxMs?: number
+}
+
+function flagsFor(input?: PromptLayerInput) {
+  if (!input?.goalReviewTimeoutMs && !input?.goalReviewMaxMs) return runtimeFlags
+  return RuntimeFlags.layer({
+    experimentalEventSystem: true,
+    ...(input.goalReviewTimeoutMs ? { goalReviewTimeoutMs: input.goalReviewTimeoutMs } : {}),
+    ...(input.goalReviewMaxMs ? { goalReviewMaxMs: input.goalReviewMaxMs } : {}),
+  })
 }
 
 function makePrompt(input?: PromptLayerInput) {
@@ -221,12 +231,7 @@ function makePrompt(input?: PromptLayerInput) {
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [
-      RuntimeFlags.node,
-      input?.goalReviewTimeoutMs
-        ? RuntimeFlags.layer({ experimentalEventSystem: true, goalReviewTimeoutMs: input.goalReviewTimeoutMs })
-        : runtimeFlags,
-    ],
+    [RuntimeFlags.node, flagsFor(input)],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -240,12 +245,7 @@ function makeHttp(input?: PromptLayerInput) {
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [
-      RuntimeFlags.node,
-      input?.goalReviewTimeoutMs
-        ? RuntimeFlags.layer({ experimentalEventSystem: true, goalReviewTimeoutMs: input.goalReviewTimeoutMs })
-        : runtimeFlags,
-    ],
+    [RuntimeFlags.node, flagsFor(input)],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -260,6 +260,8 @@ function makeHttpNoLLMServer(input?: PromptLayerInput) {
 const it = testEffect(makeHttp())
 const reviewerTimeout = testEffect(makeHttp({ goalReviewTimeoutMs: 100 }))
 const reviewerPaced = testEffect(makeHttp({ goalReviewTimeoutMs: 400 }))
+// Generous inactivity window, tiny hard cap: only the total-duration limit can fire.
+const reviewerHardCap = testEffect(makeHttp({ goalReviewTimeoutMs: 60_000, goalReviewMaxMs: 900 }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -305,6 +307,12 @@ const cfg = {
       },
     },
   },
+}
+
+// providerCfg plus goal review limits, for exercising the config fallback and
+// its precedence against OPENCODE_GOAL_REVIEW_* (modelled by RuntimeFlags).
+function goalReviewCfg(review: { timeout?: number; max_duration?: number }) {
+  return (url: string) => ({ ...providerCfg(url), goal: { review } })
 }
 
 function providerCfg(url: string) {
@@ -1039,6 +1047,114 @@ reviewerTimeout.instance("a hanging reviewer times out, remains inspectable, and
       .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "goal-review")
     expect(reviewPart?.state.status).toBe("error")
     expect(reviewPart?.state.status === "error" ? reviewPart.state.error : "").toContain("without activity")
+  }),
+)
+
+it.instance("goal review limits fall back to config when the env override is unset", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(goalReviewCfg({ timeout: 100 }))
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal reviewer config timeout",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the configured goal" }],
+    })
+    yield* goals.set({
+      sessionID: session.id,
+      objective: "verify that a config-supplied inactivity limit is honoured",
+      tokenBudget: 1,
+    })
+    yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    yield* llm.hang
+    yield* llm.text("Worker resumed after the reviewer timeout.", { usage: { input: 10, output: 1 } })
+
+    yield* prompt.loop({ sessionID: session.id })
+    const goal = yield* goals.get(session.id)
+    // Without the config fallback this reviewer would hang until the 120s default.
+    expect(goal?.review?.status).toBe("error")
+    expect(goal?.review?.reason).toContain("without activity")
+  }),
+)
+
+reviewerTimeout.instance("the goal review env override wins over config", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(goalReviewCfg({ timeout: 3_600_000, max_duration: 3_600_000 }))
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal reviewer env precedence",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the overridden goal" }],
+    })
+    yield* goals.set({
+      sessionID: session.id,
+      objective: "verify that the env override beats a permissive config",
+      tokenBudget: 1,
+    })
+    yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    yield* llm.hang
+    yield* llm.text("Worker resumed after the reviewer timeout.", { usage: { input: 10, output: 1 } })
+
+    yield* prompt.loop({ sessionID: session.id })
+    const goal = yield* goals.get(session.id)
+    // The 100ms flag must win; the hour-long config value would stall the suite.
+    expect(goal?.review?.status).toBe("error")
+    expect(goal?.review?.reason).toContain("without activity")
+  }),
+)
+
+reviewerHardCap.instance("a reviewer that stays busy is stopped by the total-duration safety limit", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal reviewer hard cap",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the endless goal" }],
+    })
+    yield* goals.set({
+      sessionID: session.id,
+      objective: "verify that a busy but non-converging reviewer is capped",
+      tokenBudget: 1,
+    })
+    yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    // Never emits a verdict, but never goes quiet either, so the inactivity
+    // watchdog keeps being reset and only the hard cap can stop it.
+    yield* llm.textChunksFrom(() => Array.from({ length: 200 }, (_, index) => `still working ${index}\n`), {
+      pace: 30,
+      usage: { input: 12_000, output: 200 },
+    })
+    yield* llm.text("Worker resumed after the reviewer hit the cap.", { usage: { input: 10, output: 1 } })
+
+    yield* prompt.loop({ sessionID: session.id })
+    const goal = yield* goals.get(session.id)
+    expect(goal?.review?.status).toBe("error")
+    // Sub-minute caps must report seconds, not a rounded-up "1 minute".
+    expect(goal?.review?.reason).toContain("1 second safety limit")
+    expect(goal?.review?.reason).not.toContain("without activity")
   }),
 )
 
