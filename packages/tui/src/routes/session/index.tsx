@@ -85,6 +85,7 @@ import { LocationProvider } from "../../context/location"
 import { useGoal } from "../../context/goal"
 import { DialogGoal } from "../../component/dialog-goal"
 import { GoalIndicator } from "../../component/goal-indicator"
+import { DialogSelect, type DialogSelectOption } from "../../ui/dialog-select"
 
 addDefaultParsers(parsers.parsers)
 
@@ -217,15 +218,18 @@ export function Session() {
   const foregroundTasks = createMemo(() =>
     sync.data.capabilities.experimentalBackgroundSubagents
       ? messages().flatMap((message) =>
-          (sync.data.part[message.id] ?? []).filter(
-            (part): part is ToolPart =>
-              part.type === "tool" &&
-              part.tool === "task" &&
-              part.state.status === "running" &&
-              part.state.metadata?.background !== true,
-          ),
+          (sync.data.part[message.id] ?? []).filter((part): part is ToolPart => {
+            if (part.type !== "tool" || part.tool !== "task") return false
+            if (part.state.status === "running" && part.state.metadata?.background !== true) return true
+            if (part.state.status === "pending" || part.state.metadata?.background !== true) return false
+            const childID = stringValue(part.state.metadata.sessionId)
+            return !!childID && sync.data.session_status[childID]?.type === "busy"
+          }),
         )
       : [],
+  )
+  const canBackgroundTasks = createMemo(() =>
+    foregroundTasks().some((part) => part.state.status === "running" && part.state.metadata?.background !== true),
   )
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
@@ -235,7 +239,9 @@ export function Session() {
     if (session()?.parentID) return []
     return children().flatMap((x) => sync.data.question[x.id] ?? [])
   })
-  const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
+  const visible = createMemo(
+    () => session()?.metadata?.goalReviewer !== true && permissions().length === 0 && questions().length === 0,
+  )
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
 
   const pending = createMemo(() => {
@@ -1083,11 +1089,20 @@ export function Session() {
       },
     },
     {
+      title: "View running tasks",
+      value: "session.tasks",
+      category: "Session",
+      enabled: foregroundTasks().length > 0,
+      run: () => {
+        dialog.replace(() => <DialogRunningTasks tasks={foregroundTasks()} />)
+      },
+    },
+    {
       title: "Background subagents",
       value: "session.background",
       category: "Session",
       hidden: true,
-      enabled: foregroundTasks().length > 0,
+      enabled: canBackgroundTasks(),
       run: () => {
         void sdk.client.experimental.session.background({
           sessionID: route.sessionID,
@@ -1178,7 +1193,7 @@ export function Session() {
 
   useBindings(() => ({
     mode: OPENCODE_BASE_MODE,
-    enabled: foregroundTasks().length > 0,
+    enabled: canBackgroundTasks(),
     priority: 1,
     bindings: tuiConfig.keybinds.get("session.background"),
   }))
@@ -1364,6 +1379,13 @@ export function Session() {
                 </Show>
                 <Show when={visible()}>
                   <GoalIndicator sessionID={route.sessionID} />
+                  <Show when={session()?.parentID && sync.data.session_status[route.sessionID]?.type === "busy"}>
+                    <box paddingLeft={1} paddingRight={1} backgroundColor={theme.backgroundPanel}>
+                      <text fg={theme.textMuted}>
+                        Agent is running — your message will be delivered at its next step.
+                      </text>
+                    </box>
+                  </Show>
                   <pluginRuntime.Slot
                     name="session_prompt"
                     mode="replace"
@@ -1415,6 +1437,42 @@ export function Session() {
   )
 }
 
+function DialogRunningTasks(props: { tasks: ToolPart[] }) {
+  const sync = useSync()
+  const route = useRoute()
+  const dialog = useDialog()
+  const theme = useTheme().theme
+  const options = createMemo<DialogSelectOption<string>[]>(() =>
+    props.tasks
+      .flatMap((part) => {
+        if (part.state.status === "pending") return []
+        const sessionID = stringValue(part.state.metadata?.sessionId)
+        if (!sessionID) return []
+        const busy = sync.data.session_status[sessionID]?.type === "busy"
+        return [
+          {
+            title: sync.session.get(sessionID)?.title ?? stringValue(part.state.input.description) ?? "Subagent",
+            value: sessionID,
+            description: busy ? "busy" : "idle",
+            gutter: busy ? () => <Spinner /> : () => <text fg={theme.success}>✓</text>,
+          },
+        ]
+      })
+      .filter((option, index, all) => all.findIndex((item) => item.value === option.value) === index),
+  )
+
+  return (
+    <DialogSelect
+      title="Running tasks"
+      options={options()}
+      onSelect={(option) => {
+        route.navigate({ type: "session", sessionID: option.value })
+        dialog.clear()
+      }}
+    />
+  )
+}
+
 function UserMessage(props: {
   message: UserMessage
   parts: Part[]
@@ -1424,7 +1482,12 @@ function UserMessage(props: {
 }) {
   const ctx = use()
   const local = useLocal()
+  const route = useRoute()
+  const notification = createMemo(() =>
+    props.parts.find((part): part is TextPart => part.type === "text" && part.metadata?.taskNotification === true),
+  )
   const text = createMemo(() => {
+    if (notification()) return ""
     const texts = props.parts
       .map((x) => {
         if (x.type === "text" && !x.synthetic) {
@@ -1438,7 +1501,7 @@ function UserMessage(props: {
   const files = createMemo(() => props.parts.flatMap((x) => (x.type === "file" ? [x] : [])))
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
-  const queued = createMemo(() => props.pending && props.message.id > props.pending)
+  const queued = createMemo(() => !notification() && props.pending && props.message.id > props.pending)
   const color = createMemo(() => local.agent.color(props.message.agent))
   const queuedFg = createMemo(() => selectedForeground(theme, color()))
   const metadataVisible = createMemo(() => queued() || ctx.showTimestamps())
@@ -1447,6 +1510,25 @@ function UserMessage(props: {
 
   return (
     <>
+      <Show when={notification()}>
+        <box
+          id={props.message.id}
+          ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+          marginTop={props.index === 0 ? 0 : 1}
+          paddingLeft={3}
+          flexShrink={0}
+        >
+          <text
+            fg={theme.textMuted}
+            onMouseUp={() => {
+              const sessionID = stringValue(notification()?.metadata?.taskSessionID)
+              if (sessionID) route.navigate({ type: "session", sessionID })
+            }}
+          >
+            ⚑ Background task finished · <span style={{ fg: theme.text }}>view task</span>
+          </text>
+        </box>
+      </Show>
       <Show when={text()}>
         <box
           id={props.message.id}

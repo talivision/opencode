@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, mock } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer } from "effect"
+import { BackgroundJob } from "@/background/job"
 import { Session as SessionNs } from "@/session/session"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
 
-const it = testEffect(Layer.mergeAll(LayerNode.compile(SessionNs.node), httpApiLayer))
+const it = testEffect(
+  Layer.mergeAll(LayerNode.compile(LayerNode.group([SessionNs.node, BackgroundJob.node])), httpApiLayer),
+)
 
 afterEach(async () => {
   mock.restore()
@@ -85,6 +88,109 @@ describe("session action routes", () => {
 
         expect(res.status).toBe(200)
         expect(yield* res.json).toBe(true)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "goal reviewer sessions reject prompts",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const session = yield* Effect.acquireRelease(
+          SessionNs.use.create({ metadata: { goalReviewer: true } }),
+          (created) => SessionNs.use.remove(created.id).pipe(Effect.ignore),
+        )
+        const headers = { "Content-Type": "application/json" }
+        const message = "Goal reviewer sessions are read-only; their independence is what makes the review meaningful."
+        const requests = [
+          {
+            path: `/session/${session.id}/message`,
+            body: { noReply: true, parts: [{ type: "text", text: "follow-up" }] },
+          },
+          {
+            path: `/session/${session.id}/prompt_async`,
+            body: { noReply: true, parts: [{ type: "text", text: "follow-up" }] },
+          },
+          {
+            path: `/session/${session.id}/command`,
+            body: { command: "review", arguments: "" },
+          },
+        ]
+
+        yield* Effect.forEach(requests, (input) =>
+          Effect.gen(function* () {
+            const response = yield* requestInDirectory(input.path, test.directory, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(input.body),
+            })
+
+            expect(response.status).toBe(400)
+            expect(yield* response.json).toEqual({ _tag: "InvalidRequestError", message })
+          }),
+        )
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "lists live background jobs by parent session",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const parent = yield* Effect.acquireRelease(SessionNs.use.create({}), (created) =>
+          SessionNs.use.remove(created.id).pipe(Effect.ignore),
+        )
+        const child = yield* Effect.acquireRelease(SessionNs.use.create({ parentID: parent.id }), (created) =>
+          SessionNs.use.remove(created.id).pipe(Effect.ignore),
+        )
+        const jobs = yield* BackgroundJob.Service
+
+        const initial = yield* requestInDirectory("/experimental/background-job", test.directory)
+        expect(initial.status).toBe(200)
+        expect(yield* initial.json).toEqual([])
+
+        const job = yield* Effect.acquireRelease(
+          jobs.start({
+            id: child.id,
+            type: "task",
+            title: "background review",
+            metadata: {
+              sessionId: child.id,
+              parentSessionId: parent.id,
+            },
+            run: Effect.never,
+          }),
+          (created) => jobs.cancel(created.id).pipe(Effect.ignore),
+        )
+        const expected = [
+          {
+            id: job.id,
+            sessionID: child.id,
+            parentSessionID: parent.id,
+            status: "running",
+            title: "background review",
+          },
+        ]
+
+        const listed = yield* requestInDirectory("/experimental/background-job", test.directory)
+        expect(listed.status).toBe(200)
+        expect(yield* listed.json).toEqual(expected)
+
+        const filtered = yield* requestInDirectory(
+          `/experimental/background-job?parentSessionId=${parent.id}`,
+          test.directory,
+        )
+        expect(filtered.status).toBe(200)
+        expect(yield* filtered.json).toEqual(expected)
+
+        const excluded = yield* requestInDirectory(
+          `/experimental/background-job?parentSessionId=${child.id}`,
+          test.directory,
+        )
+        expect(excluded.status).toBe(200)
+        expect(yield* excluded.json).toEqual([])
       }),
     { git: true },
   )

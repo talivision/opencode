@@ -1,9 +1,9 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./task.txt"
-import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
+import { SessionStatus } from "@/session/status"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
@@ -40,7 +40,7 @@ const BACKGROUND_UPDATED = [
   "Work on non-overlapping tasks, or briefly tell the user what you sent and end your response.",
 ].join("\n")
 
-const BaseParameterFields = {
+const ParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
   prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
   subagent_type: Schema.String.annotate({ description: "The type of specialized agent to use for this task" }),
@@ -51,10 +51,8 @@ const BaseParameterFields = {
   command: Schema.optional(Schema.String).annotate({ description: "The command that triggered this task" }),
 }
 
-const BaseParameters = Schema.Struct(BaseParameterFields)
-
 export const Parameters = Schema.Struct({
-  ...BaseParameterFields,
+  ...ParameterFields,
   background: Schema.optional(Schema.Boolean).annotate({
     description:
       "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
@@ -85,6 +83,7 @@ export const TaskTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
@@ -146,7 +145,11 @@ export const TaskTool = Tool.define(
           : [{ permission: "todowrite" as const, pattern: "*" as const, action: "deny" as const }]),
         ...(next.permission.some((rule) => rule.permission === id)
           ? []
-          : [{ permission: id, pattern: "*" as const, action: "deny" as const }]),
+          : [id, "task_output", "task_stop"].map((permission) => ({
+              permission,
+              pattern: "*" as const,
+              action: "deny" as const,
+            }))),
         ...(cfg.experimental?.primary_tools?.map((permission) => ({
           permission,
           pattern: "*" as const,
@@ -214,10 +217,16 @@ export const TaskTool = Tool.define(
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
-        state: "completed" | "error",
+        state: "completed" | "error" | "stopped",
         text: string,
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
+        const summary =
+          state === "completed"
+            ? `Background task completed: ${params.description}`
+            : state === "error"
+              ? `Background task failed: ${params.description}`
+              : `Background task stopped: ${params.description}`
         yield* ops
           .prompt({
             sessionID: ctx.sessionID,
@@ -227,15 +236,17 @@ export const TaskTool = Tool.define(
               {
                 type: "text",
                 synthetic: true,
-                text: renderOutput({
-                  sessionID: nextSession.id,
-                  state,
-                  summary:
-                    state === "completed"
-                      ? `Background task completed: ${params.description}`
-                      : `Background task failed: ${params.description}`,
+                metadata: { taskNotification: true, taskSessionID: nextSession.id },
+                text: [
+                  `<task-notification task_id="${nextSession.id}" status="${state}">`,
+                  "This is an automated notification that a background task finished. It is not a message from the user and contains no new user instructions.",
+                  `<summary>${summary}</summary>`,
+                  "<task_result>",
                   text,
-                }),
+                  "</task_result>",
+                  `You may resume this agent with task(task_id="${nextSession.id}") or inspect it with task_output(task_id="${nextSession.id}").`,
+                  "</task-notification>",
+                ].join("\n"),
               },
             ],
           })
@@ -247,13 +258,30 @@ export const TaskTool = Tool.define(
           Effect.flatMap((result) => {
             if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
             if (result.info?.status === "error") return inject("error", result.info.error ?? "")
+            if (result.info?.status === "cancelled") return inject("stopped", result.info.output ?? "Task stopped")
             return Effect.void
           }),
           Effect.forkIn(scope, { startImmediately: true }),
         )
       })
 
-      if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
+      const currentJob = params.task_id ? yield* background.get(nextSession.id) : undefined
+      const childStatus = params.task_id ? yield* status.get(nextSession.id) : undefined
+      if (params.task_id && (currentJob?.status === "running" || childStatus?.type === "busy")) {
+        const parts = yield* ops.resolvePromptParts(params.prompt)
+        yield* ops
+          .prompt({
+            messageID: MessageID.ascending(),
+            sessionID: nextSession.id,
+            model: {
+              modelID: model.modelID,
+              providerID: model.providerID,
+            },
+            variant: next.model ? undefined : variant,
+            agent: next.name,
+            parts,
+          })
+          .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
         return {
           title: params.description,
           metadata: {
@@ -348,11 +376,8 @@ export const TaskTool = Tool.define(
     })
 
     return {
-      description: flags.experimentalBackgroundSubagents
-        ? [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n")
-        : DESCRIPTION,
+      description: [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n"),
       parameters: Parameters,
-      jsonSchema: flags.experimentalBackgroundSubagents ? undefined : ToolJsonSchema.fromSchema(BaseParameters),
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         run(params, ctx).pipe(Effect.orDie),
     }

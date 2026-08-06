@@ -150,7 +150,12 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("hides task background parameter unless experimental background subagents are enabled", () =>
+  // Background subagents are first-class now: the parameter is always
+  // advertised, and OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false is the
+  // kill switch rather than the gate. The task tool no longer swaps in a
+  // reduced schema, so jsonSchema is undefined and the Effect schema carries
+  // the parameter — see test/tool/task.test.ts for the disabled-path coverage.
+  it.instance("advertises the task background parameter by default", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agent = yield* Agent.Service
@@ -162,8 +167,8 @@ describe("tool.registry", () => {
         agent: build,
       })).find((tool) => tool.id === "task")
 
-      expect(task?.jsonSchema).toBeDefined()
-      expect((task?.jsonSchema?.properties as Record<string, unknown> | undefined)?.background).toBeUndefined()
+      expect(task).toBeDefined()
+      expect(task?.description).toContain("background")
     }),
   )
 

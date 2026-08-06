@@ -120,6 +120,11 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
     if (cancelled.has(job.id)) return false
     if (pending.has(job.id)) return true
     if (typeof job.metadata?.sessionId === "string" && pending.has(job.metadata.sessionId)) return true
+    // Cascading from an ancestor must not reap background children: they are
+    // meant to outlive the parent's abort and notify it when they settle.
+    // Targeting the job (or its own session) directly still cancels it, which
+    // is how task_stop and instance shutdown stop a background child.
+    if (job.metadata?.background === true) return false
     return typeof job.metadata?.parentSessionId === "string" && pending.has(job.metadata.parentSessionId)
   }
   let batch = jobs.filter(matches)

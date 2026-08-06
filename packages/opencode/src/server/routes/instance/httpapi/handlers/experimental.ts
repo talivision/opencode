@@ -15,7 +15,13 @@ import { Effect, Option } from "effect"
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { ConsoleSwitchPayload, SessionListQuery, ToolListQuery, WorktreeApiError } from "../groups/experimental"
+import {
+  BackgroundJobListQuery,
+  ConsoleSwitchPayload,
+  SessionListQuery,
+  ToolListQuery,
+  WorktreeApiError,
+} from "../groups/experimental"
 
 function mapWorktreeError<A, R>(self: Effect.Effect<A, Worktree.Error, R>) {
   return self.pipe(
@@ -156,6 +162,25 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       })
     })
 
+    const backgroundJob = Effect.fn("ExperimentalHttpApi.backgroundJob")(function* (ctx: {
+      query: typeof BackgroundJobListQuery.Type
+    }) {
+      return (yield* background.list()).flatMap((job) => {
+        if (typeof job.metadata?.sessionId !== "string") return []
+        if (typeof job.metadata.parentSessionId !== "string") return []
+        if (ctx.query.parentSessionId && job.metadata.parentSessionId !== ctx.query.parentSessionId) return []
+        return [
+          {
+            id: job.id,
+            sessionID: job.metadata.sessionId,
+            parentSessionID: job.metadata.parentSessionId,
+            status: job.status,
+            title: job.title,
+          },
+        ]
+      })
+    })
+
     const sessionBackground = Effect.fn("ExperimentalHttpApi.sessionBackground")(function* (ctx: {
       params: { sessionID: SessionID }
     }) {
@@ -186,6 +211,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       .handle("worktreeCreate", worktreeCreate)
       .handle("worktreeRemove", worktreeRemove)
       .handle("worktreeReset", worktreeReset)
+      .handle("backgroundJob", backgroundJob)
       .handle("session", session)
       .handle("sessionBackground", sessionBackground)
       .handle("resource", resource)

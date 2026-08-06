@@ -10,6 +10,7 @@ import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
+import { MAX_STEPS_PROMPT } from "@opencode-ai/core/session/runner/max-steps"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { Command } from "../../src/command"
@@ -2193,6 +2194,264 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     if (!Array.isArray(messages)) throw new Error("expected LLM messages")
     expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
   }),
+)
+
+// Mid-run injection
+
+it.instance("a user message injected mid-run is answered before the loop returns", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const gate = yield* Deferred.make<void>()
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Injection",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* llm.hold("first answer", deferredAsPromise(gate))
+    yield* llm.text("injected answer")
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "first" }],
+    })
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* waitForBusy(chat.id)
+
+    // Persisted straight into the session — nothing else will ever deliver it,
+    // so the running loop is the only thing that can answer it.
+    const injected = yield* user(chat.id, "injected question")
+    yield* Deferred.succeed(gate, void 0)
+
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(yield* llm.calls).toBe(2)
+    expect(yield* llm.pending).toBe(0)
+
+    const msgs = yield* sessions.messages({ sessionID: chat.id })
+    const assistants = msgs.filter((msg) => msg.info.role === "assistant")
+    expect(assistants).toHaveLength(2)
+    const last = assistants.at(-1)
+    if (!last || last.info.role !== "assistant") throw new Error("expected second assistant")
+    expect(last.info.parentID).toBe(injected.id)
+    expect(last.parts.some((part) => part.type === "text" && part.text === "injected answer")).toBe(true)
+
+    const inputs = yield* llm.inputs
+    const messages = inputs.at(-1)?.messages
+    if (!Array.isArray(messages)) throw new Error("expected LLM messages")
+    expect(messages.at(-1)).toEqual({ role: "user", content: "injected question" })
+  }),
+)
+
+it.instance("a user message injected while the final response streams is answered in the same run", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const gate = yield* Deferred.make<void>()
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Final step injection",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* llm.tool("glob", { pattern: "*" })
+    // The last queued response of the turn: the injection lands while it is
+    // still on the wire, after the loop already re-read the transcript.
+    yield* llm.hold("turn complete", deferredAsPromise(gate))
+    yield* llm.text("injected answer")
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "do the thing" }],
+    })
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* llm.wait(2)
+    const injected = yield* user(chat.id, "one more thing")
+    yield* Deferred.succeed(gate, void 0)
+
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isSuccess(exit)).toBe(true)
+    // The third request only happens if the loop refuses to return with an
+    // unanswered message.
+    expect(yield* llm.calls).toBe(3)
+    expect(yield* llm.pending).toBe(0)
+
+    const msgs = yield* sessions.messages({ sessionID: chat.id })
+    const last = msgs.filter((msg) => msg.info.role === "assistant").at(-1)
+    if (!last || last.info.role !== "assistant") throw new Error("expected final assistant")
+    expect(last.info.parentID).toBe(injected.id)
+    expect(last.parts.some((part) => part.type === "text" && part.text === "injected answer")).toBe(true)
+  }),
+)
+
+it.instance("prompting a completed session resumes with the earlier transcript", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Resume",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* llm.text("first answer")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      parts: [{ type: "text", text: "first question" }],
+    })
+
+    yield* llm.text("second answer")
+    const result = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      parts: [{ type: "text", text: "second question" }],
+    })
+
+    expect(yield* llm.calls).toBe(2)
+    expect(result.info.role).toBe("assistant")
+    const inputs = yield* llm.inputs
+    const messages = inputs.at(-1)?.messages
+    if (!Array.isArray(messages)) throw new Error("expected LLM messages")
+    const serialized = JSON.stringify(messages)
+    expect(serialized).toContain("first question")
+    expect(serialized).toContain("first answer")
+    expect(messages.at(-1)).toEqual({ role: "user", content: "second question" })
+  }),
+)
+
+it.instance("a mid-run injection resets the step budget", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: { build: { steps: 2 } },
+    }))
+    const gate = yield* Deferred.make<void>()
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Step budget",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* llm.tool("glob", { pattern: "*" })
+    // Step 2 of 2: this request carries MAX_STEPS_PROMPT.
+    yield* llm.hold("wrapping up", deferredAsPromise(gate))
+    yield* llm.text("injected answer")
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "do the thing" }],
+    })
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* llm.wait(2)
+    yield* user(chat.id, "one more thing")
+    yield* Deferred.succeed(gate, void 0)
+
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(yield* llm.calls).toBe(3)
+
+    // JSON-escaped so the comparison survives the newlines inside the prompt.
+    const maxSteps = JSON.stringify(MAX_STEPS_PROMPT).slice(1, -1)
+    const inputs = yield* llm.inputs
+    // Step 2 of 2 is the last step and is told so...
+    expect(JSON.stringify(inputs[1])).toContain(maxSteps)
+    // ...but the injection restarts the budget, so the turn answering it is not.
+    expect(JSON.stringify(inputs[2])).not.toContain(maxSteps)
+  }),
+)
+
+it.instance(
+  "a user message injected during a long goal review is answered without disturbing goal accounting",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const goals = yield* SessionGoal.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Goal injection",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "start the durable goal" }],
+      })
+      yield* goals.set({ sessionID: session.id, objective: "continue once, then finish" })
+
+      // Turn 1, rejected: produces the single goal continuation.
+      yield* llm.text("First increment complete.")
+      yield* llm.textFrom((hit) => {
+        const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+        return `VERDICT: NOT_MET ${nonce} another increment is still required`
+      })
+      // Turn 2, accepted. The accepting review is the dangerous window: the goal
+      // completes, so no continuation is queued and the loop is about to break
+      // with the injected message unanswered. The reviewer streams slowly so the
+      // injection lands squarely inside it.
+      yield* llm.text("Second increment complete.")
+      yield* llm.textChunksFrom(
+        (hit) => {
+          const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+          return [
+            "Reading the repository state\n",
+            "Comparing against every explicit requirement\n",
+            "Re-running the authoritative check\n",
+            `VERDICT: MET ${nonce} objective verified`,
+          ]
+        },
+        { pace: 250 },
+      )
+      yield* llm.text("Checked the config path too.")
+
+      const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(4), "timed out waiting for the accepting reviewer request", "20 seconds")
+      const injected = yield* user(session.id, "also double check the config path")
+
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+
+      const goal = yield* goals.get(session.id)
+      expect(goal?.status).toBe("complete")
+      // Two worker turns. The turn that answers the injection runs after the
+      // goal completed, so it is not a goal turn and cannot be double-counted.
+      expect(goal?.turns).toBe(2)
+
+      const msgs = yield* sessions.messages({ sessionID: session.id })
+      const continuations = msgs.filter(
+        (msg) => msg.info.role === "user" && msg.parts.some((part) => "synthetic" in part && part.synthetic === true),
+      )
+      expect(continuations).toHaveLength(1)
+
+      const answered = msgs.find((msg) => msg.info.role === "assistant" && msg.info.parentID === injected.id)
+      expect(answered).toBeDefined()
+      expect(answered?.parts.some((part) => part.type === "text" && part.text === "Checked the config path too.")).toBe(
+        true,
+      )
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(5)
+      expect(JSON.stringify(inputs[4])).toContain("also double check the config path")
+
+      const reviewParts = msgs.flatMap((msg) =>
+        msg.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "goal-review"),
+      )
+      expect(reviewParts).toHaveLength(2)
+      expect(reviewParts[1]?.state.status).toBe("completed")
+    }),
+  30_000,
 )
 
 it.instance("assertNotBusy fails with BusyError when loop running", () =>

@@ -39,7 +39,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { InvalidRequestError, PermissionNotFoundError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -84,6 +84,16 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const requireSession = Effect.fn("SessionHttpApi.requireSession")(function* (sessionID: SessionID) {
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
+    })
+
+    const requirePromptableSession = Effect.fn("SessionHttpApi.requirePromptableSession")(function* (
+      sessionID: SessionID,
+    ) {
+      const current = yield* requireSession(sessionID)
+      if (current.metadata?.goalReviewer !== true) return current
+      return yield* new InvalidRequestError({
+        message: "Goal reviewer sessions are read-only; their independence is what makes the review meaningful.",
+      })
     })
 
     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
@@ -344,7 +354,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePromptableSession(ctx.params.sessionID)
       const message = yield* promptSvc
         .prompt({
           ...ctx.payload,
@@ -360,7 +370,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePromptableSession(ctx.params.sessionID)
       yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
@@ -380,7 +390,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePromptableSession(ctx.params.sessionID)
       return yield* promptSvc
         .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
         .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))

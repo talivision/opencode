@@ -57,6 +57,8 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
 
 const it = testEffect(layer())
 const background = testEffect(layer({ experimentalBackgroundSubagents: true }))
+// Background subagents are on by default now; this exercises the kill switch.
+const backgroundDisabled = testEffect(layer({ experimentalBackgroundSubagents: false }))
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -536,7 +538,7 @@ describe("tool.task", () => {
     },
   )
 
-  it.instance("rejects background execution when the experiment is disabled", () =>
+  backgroundDisabled.instance("rejects background execution when the experiment is disabled", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -671,7 +673,7 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("background task completion waits for running updates", () =>
+  background.instance("steering a running background task delivers the message immediately", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
@@ -728,20 +730,39 @@ describe("tool.task", () => {
       expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain("Background task updated")
-      first.resolve()
-      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+      // The steering message must reach the child while its first run is still
+      // in flight (first has NOT resolved yet). Previously it was queued behind
+      // the running turn, which made "course-correct a running agent"
+      // impossible — the correction only landed after the work it meant to
+      // redirect had finished.
       expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
         { type: "text", text: "also inspect cancellation" },
       ])
+      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+      first.resolve()
 
       second.resolve()
       const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
       expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("second done")
+      // The job settles from the run it started with. This stub calls prompt()
+      // once per message, so the steering answer is a separate call whose result
+      // the job never sees. Against a real loop the injected message is answered
+      // inside the original run (the runLoop re-check keeps it alive), so the
+      // job output does reflect the correction — see the end-to-end coverage in
+      // test/tool/task-steering.test.ts, which drives real child sessions.
+      expect(waited.info?.output).toBe("first done")
       const notification = yield* Effect.promise(() => injected.promise)
       expect(notification.variant).toBe("xhigh")
       expect(notification.parts[0]?.type).toBe("text")
-      if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
+      if (notification.parts[0]?.type === "text") {
+        // The notification is an envelope the model is told is not user input,
+        // carrying the job's result and the ids needed to resume or inspect it.
+        expect(notification.parts[0].text).toContain('<task-notification task_id="')
+        expect(notification.parts[0].text).toContain('status="completed"')
+        expect(notification.parts[0].text).toContain("It is not a message from the user")
+        expect(notification.parts[0].text).toContain("first done")
+        expect(notification.parts[0].text).toContain("task_output(task_id=")
+      }
     }),
   )
 
@@ -894,7 +915,7 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("cancelling the parent run cancels running background tasks", () =>
+  background.instance("cancelling the parent run leaves running background tasks alive until stopped directly", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const runState = yield* SessionRunState.Service
@@ -926,7 +947,14 @@ describe("tool.task", () => {
         },
       )
 
+      // The parent abort must not cascade into a background child.
       yield* runState.cancel(chat.id)
+      const survived = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 100 })
+      expect(survived.timedOut).toBe(true)
+      expect(survived.info?.status).toBe("running")
+
+      // Targeting the child's own session (what task_stop does) still stops it.
+      yield* runState.cancel(result.metadata.sessionId)
       const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
       expect(waited.timedOut).toBe(false)
       expect(waited.info?.status).toBe("cancelled")

@@ -1617,7 +1617,36 @@ const layer = Layer.effect(
         // aligned with user-visible turns, and the flag cannot double-count a
         // turn that a previous loop() invocation already recorded.
         let goalBoundaryPending = false
+        // Newest user message this loop has already reacted to. Used to detect
+        // a message injected mid-run so the step counter can restart with it.
+        let seenUserID: MessageID | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+
+        // Re-read the transcript at a point where the loop is about to return
+        // control and report whether a user message arrived that no assistant
+        // has answered yet. A message persisted while the final step (or a goal
+        // review, which can run for minutes) was in flight is newer than every
+        // assistant message and would otherwise sit until the next run starts.
+        // Endings that are not a clean finish — provider/tool error, a denied
+        // permission, a content-filter refusal, or a structured-output turn —
+        // deliberately leave it pending: the next run picks it up with the
+        // failure visible in the transcript instead of silently continuing.
+        const injectedUser = Effect.fnUntraced(function* (blocked: boolean) {
+          if (blocked) return false
+          const current = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+            Effect.provideService(Database.Service, database),
+          )
+          const { user, assistant } = MessageV2.latest(current)
+          if (!user || !assistant) return false
+          if (user.id < assistant.id) return false
+          if (assistant.error || assistant.finish === "content-filter" || assistant.structured !== undefined)
+            return false
+          yield* Effect.logInfo("answering message injected mid-run", {
+            "session.id": sessionID,
+            messageID: user.id,
+          })
+          return true
+        })
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1630,6 +1659,13 @@ const layer = Layer.effect(
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+          // A message steered in mid-turn starts a new turn as far as the step
+          // budget is concerned. Without this a long conversation that keeps
+          // being steered accumulates steps until it trips agent.steps and gets
+          // MAX_STEPS_PROMPT injected mid-answer.
+          if (seenUserID !== undefined && lastUser.id > seenUserID) step = 0
+          seenUserID = lastUser.id
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1692,6 +1728,15 @@ const layer = Layer.effect(
                 })
                 yield* Effect.sleep(`${wait} millis`)
               }
+              step = 0
+              continue
+            }
+            // Checked last, after the goal boundary is recorded and after the
+            // review/continuation had their chance: if continueGoal already
+            // queued a continuation the loop is running anyway and the next
+            // iteration answers both messages in one assistant reply, so the
+            // injection can neither add a goal turn nor duplicate a reply.
+            if (yield* injectedUser(false)) {
               step = 0
               continue
             }
@@ -1788,6 +1833,9 @@ const layer = Layer.effect(
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
           const goalTurn = (yield* goal.get(sessionID))?.status === "active"
+          // A denied permission is the one stop reason that leaves no trace on
+          // the assistant message, so it is carried out of the step explicitly.
+          let denied = false
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
@@ -1888,7 +1936,10 @@ const layer = Layer.effect(
               }
             }
 
-            if (result === "stop") return "break" as const
+            if (result === "stop") {
+              denied = true
+              return "break" as const
+            }
             if (result === "compact") {
               yield* compaction.create({
                 sessionID,
@@ -1948,6 +1999,13 @@ const layer = Layer.effect(
                 }
                 goalBackoff = undefined
               }
+              step = 0
+              continue
+            }
+            // Same single decision point as the early exit above: a message
+            // that landed while this step was streaming is answered here rather
+            // than left for the next run.
+            if (yield* injectedUser(denied)) {
               step = 0
               continue
             }

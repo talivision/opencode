@@ -86,6 +86,20 @@ export const SessionListQuery = Schema.Struct({
   limit: Schema.optional(Schema.NumberFromString),
   archived: Schema.optional(QueryBoolean),
 })
+export const BackgroundJobListQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  parentSessionId: Schema.optional(SessionID),
+})
+
+const BackgroundJobList = Schema.Array(
+  Schema.Struct({
+    id: Schema.String,
+    sessionID: Schema.String,
+    parentSessionID: Schema.String,
+    status: Schema.Literals(["running", "completed", "error", "cancelled"]),
+    title: Schema.optional(Schema.String),
+  }),
+).annotate({ identifier: "BackgroundJobList" })
 
 export const ExperimentalPaths = {
   capabilities: "/experimental/capabilities",
@@ -96,6 +110,7 @@ export const ExperimentalPaths = {
   toolIDs: "/experimental/tool/ids",
   worktree: "/experimental/worktree",
   worktreeReset: "/experimental/worktree/reset",
+  backgroundJob: "/experimental/background-job",
   session: "/experimental/session",
   sessionBackground: "/experimental/session/:sessionID/background",
   resource: "/experimental/resource",
@@ -219,6 +234,16 @@ export const ExperimentalApi = HttpApi.make("experimental")
             identifier: "worktree.reset",
             summary: "Reset worktree",
             description: "Reset a worktree branch to the primary default branch.",
+          }),
+        ),
+        HttpApiEndpoint.get("backgroundJob", ExperimentalPaths.backgroundJob, {
+          query: BackgroundJobListQuery,
+          success: described(BackgroundJobList, "List of live background jobs"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "experimental.backgroundJob.list",
+            summary: "List background jobs",
+            description: "List live background jobs, optionally filtered by their parent session.",
           }),
         ),
         HttpApiEndpoint.get("session", ExperimentalPaths.session, {

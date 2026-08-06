@@ -10,6 +10,8 @@ import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
+import { TaskOutputTool } from "./task-output"
+import { TaskStopTool } from "./task-stop"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -57,6 +59,7 @@ import { McpCatalog } from "@/mcp/catalog"
 import { GoalTool } from "./goal"
 import { GoalVerdictTool } from "./goal-verdict"
 import { SessionGoal } from "@/session/goal"
+import { SessionStatus } from "@/session/status"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return providerID === ProviderV2.ID.opencode || flags.exa || flags.parallel
@@ -98,6 +101,8 @@ const layer = Layer.effect(
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
+    const taskOutput = yield* TaskOutputTool
+    const taskStop = yield* TaskStopTool
     const read = yield* ReadTool
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
@@ -215,6 +220,8 @@ const layer = Layer.effect(
           edit: Tool.init(edit),
           write: Tool.init(writetool),
           task: Tool.init(task),
+          taskOutput: Tool.init(taskOutput),
+          taskStop: Tool.init(taskStop),
           fetch: Tool.init(webfetch),
           todo: Tool.init(todo),
           search: Tool.init(websearch),
@@ -240,6 +247,8 @@ const layer = Layer.effect(
             tool.edit,
             tool.write,
             tool.task,
+            tool.taskOutput,
+            tool.taskStop,
             tool.fetch,
             tool.todo,
             tool.search,
@@ -459,6 +468,7 @@ export const node = LayerNode.make({
     Database.node,
     Ripgrep.node,
     SessionGoal.node,
+    SessionStatus.node,
   ],
 })
 
