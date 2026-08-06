@@ -106,6 +106,128 @@ describe("SessionGoal", () => {
     }),
   )
 
+  it.live("records an interrupted turn and tells the worker to resume, then clears it", () =>
+    Effect.gen(function* () {
+      const { goal, sessionID } = yield* setup()
+      yield* goal.set({ sessionID, objective: "survive a flaky provider" })
+
+      yield* goal.recordTurn({ sessionID, tokens: 0, interrupted: "Provider is overloaded" })
+      const first = yield* goal.get(sessionID)
+      expect(first?.interrupted?.reason).toBe("Provider is overloaded")
+      expect(first?.interrupted?.count).toBe(1)
+
+      const context = yield* goal.context(sessionID)
+      expect(context).toContain("ended before you completed it: Provider is overloaded")
+      expect(context).toContain("no independent review was run")
+      expect(context).toContain("Resume the objective from current state")
+      // A run that never completed must not read as a rejected completion.
+      expect(context).toContain("No independent completion review is pending.")
+
+      yield* goal.recordTurn({ sessionID, tokens: 0, interrupted: "Provider is overloaded" })
+      const second = yield* goal.get(sessionID)
+      expect(second?.interrupted?.count).toBe(2)
+      expect(yield* goal.context(sessionID)).toContain("2 consecutive interrupted turns")
+
+      // A turn that ends normally clears the note.
+      yield* goal.recordTurn({ sessionID, tokens: 12 })
+      const recovered = yield* goal.get(sessionID)
+      expect(recovered?.interrupted).toBeUndefined()
+      expect(yield* goal.context(sessionID)).not.toContain("ended before you completed it")
+    }),
+  )
+
+  it.live("verdicts are bound to the running reviewer, write-once, and cleared on recovery", () =>
+    Effect.gen(function* () {
+      const { goal, sessionID } = yield* setup()
+      yield* goal.set({ sessionID, objective: "structured verdict lifecycle" })
+      yield* goal.requestReview({ sessionID, evidence: "attempt one" })
+      const reviewerID = SessionID.create()
+      yield* goal.beginReview(sessionID, reviewerID)
+
+      // A verdict from a session that is not the running reviewer is ignored.
+      const forged = yield* goal.submitVerdict({
+        sessionID,
+        reviewerSessionID: SessionID.create(),
+        met: true,
+        summary: "forged",
+      })
+      expect(forged?.review?.verdict).toBeUndefined()
+
+      // First write wins; a second call cannot overwrite it.
+      yield* goal.submitVerdict({ sessionID, reviewerSessionID: reviewerID, met: false, summary: "first verdict" })
+      const overwritten = yield* goal.submitVerdict({
+        sessionID,
+        reviewerSessionID: reviewerID,
+        met: true,
+        summary: "second verdict",
+      })
+      expect(overwritten?.review?.verdict?.summary).toBe("first verdict")
+      expect(overwritten?.review?.verdict?.met).toBe(false)
+
+      // Recovery discards the interrupted reviewer's verdict so it cannot leak
+      // into the replacement reviewer's attempt.
+      const recovered = yield* goal.recoverReview(sessionID)
+      expect(recovered?.review?.verdict).toBeUndefined()
+      const replacementID = SessionID.create()
+      const begun = yield* goal.beginReview(sessionID, replacementID)
+      expect(begun?.review?.verdict).toBeUndefined()
+    }),
+  )
+
+  it.live("history records substantive rejections but not infrastructure errors", () =>
+    Effect.gen(function* () {
+      const { goal, sessionID } = yield* setup()
+      yield* goal.set({ sessionID, objective: "history hygiene" })
+
+      yield* goal.requestReview({ sessionID })
+      const first = SessionID.create()
+      yield* goal.beginReview(sessionID, first)
+      const errored = yield* goal.finishReview({
+        sessionID,
+        reviewerSessionID: first,
+        accepted: false,
+        error: true,
+        reason: "Independent reviewer timed out after 120s without activity",
+        tokens: 0,
+      })
+      expect(errored?.review?.errorStreak).toBe(1)
+      expect(errored?.review?.history ?? []).toHaveLength(0)
+
+      yield* goal.requestReview({ sessionID })
+      const second = SessionID.create()
+      yield* goal.beginReview(sessionID, second)
+      const rejected = yield* goal.finishReview({
+        sessionID,
+        reviewerSessionID: second,
+        accepted: false,
+        reason: "The second requirement is unimplemented.",
+        tokens: 9,
+      })
+      // A real verdict resets the error streak; the rejection enters history.
+      expect(rejected?.review?.errorStreak).toBe(0)
+      expect(rejected?.review?.history).toHaveLength(1)
+      expect(rejected?.review?.history?.[0]?.reason).toContain("second requirement")
+    }),
+  )
+
+  it.live("a successful mid-turn tool step does not reset the interruption streak", () =>
+    Effect.gen(function* () {
+      const { goal, sessionID } = yield* setup()
+      yield* goal.set({ sessionID, objective: "streak survives partial progress" })
+
+      yield* goal.recordTurn({ sessionID, tokens: 0, interrupted: "stream died", completed: true })
+      expect((yield* goal.get(sessionID))?.interrupted?.count).toBe(1)
+      // A tool step that succeeded before the provider died again.
+      yield* goal.recordTurn({ sessionID, tokens: 40, completed: false })
+      expect((yield* goal.get(sessionID))?.interrupted?.count).toBe(1)
+      yield* goal.recordTurn({ sessionID, tokens: 0, interrupted: "stream died again", completed: true })
+      expect((yield* goal.get(sessionID))?.interrupted?.count).toBe(2)
+      // Only a clean completed turn ends the outage.
+      yield* goal.recordTurn({ sessionID, tokens: 12, completed: true })
+      expect((yield* goal.get(sessionID))?.interrupted).toBeUndefined()
+    }),
+  )
+
   it.live("only completes after an independent review accepts current-state evidence", () =>
     Effect.gen(function* () {
       const { goal, sessionID } = yield* setup()

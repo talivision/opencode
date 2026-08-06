@@ -20,6 +20,47 @@ const Review = Schema.Struct({
   evidence: Schema.optional(Schema.String),
   reason: Schema.optional(Schema.String),
   reviewerSessionID: Schema.optional(SessionID),
+  // Consecutive reviews that ended in error (timeout, no verdict, provider
+  // failure). Drives continuation backoff: repeated review errors mean
+  // something is systematically wrong, and re-reviewing instantly just spins
+  // the loop. Reset by any review that produces a real verdict.
+  errorStreak: Schema.optional(NonNegativeInt),
+  // Structured verdict submitted by the reviewer through the goal_verdict
+  // tool. Unforgeable by construction: the tool is only exposed to the
+  // goal-reviewer agent, so the worker can never call it. When present it is
+  // preferred over the text nonce fallback.
+  verdict: Schema.optional(
+    Schema.Struct({
+      met: Schema.Boolean,
+      summary: Schema.String,
+      unmet: Schema.optional(
+        Schema.mutable(
+          Schema.Array(
+            Schema.Struct({
+              requirement: Schema.String,
+              evidence: Schema.String,
+            }),
+          ),
+        ),
+      ),
+      at: NonNegativeInt,
+    }),
+  ),
+  // Rolling window of recent non-accepted attempts. The worker sees these in
+  // its continuation message so a rejection for reason B does not erase the
+  // memory of a rejection for reason A — the pattern that made workers cycle
+  // between two failure modes.
+  history: Schema.optional(
+    Schema.mutable(
+      Schema.Array(
+        Schema.Struct({
+          attempt: NonNegativeInt,
+          reason: Schema.String,
+          at: NonNegativeInt,
+        }),
+      ),
+    ),
+  ),
 })
 
 export const Info = Schema.Struct({
@@ -34,6 +75,17 @@ export const Info = Schema.Struct({
       reason: Schema.String,
       count: NonNegativeInt,
       turn: NonNegativeInt,
+    }),
+  ),
+  // Set when a goal turn ended without the model completing it — a provider
+  // error, an exhausted retry, an abort. Such a turn made no completion claim,
+  // so it is never handed to the reviewer; the worker is told to continue
+  // instead. Cleared by the next turn that ends normally.
+  interrupted: Schema.optional(
+    Schema.Struct({
+      reason: Schema.String,
+      at: NonNegativeInt,
+      count: NonNegativeInt,
     }),
   ),
   pauseReason: Schema.optional(Schema.Literals(["user", "budget"])),
@@ -65,6 +117,13 @@ export type EditInput = Schema.Schema.Type<typeof EditInput>
 export const RecordTurnInput = Schema.Struct({
   sessionID: SessionID,
   tokens: NonNegativeInt,
+  // Present when the turn ended abnormally; carries the operator-facing reason.
+  interrupted: Schema.optional(Schema.String),
+  // True when the turn actually returned control (a user-visible turn boundary).
+  // Steps that continue into tool execution accumulate tokens but are not
+  // goal turns: "three consecutive goal turns" must not be reachable inside a
+  // single worker turn.
+  completed: Schema.optional(Schema.Boolean),
 })
 export type RecordTurnInput = Schema.Schema.Type<typeof RecordTurnInput>
 
@@ -73,6 +132,17 @@ export const ReviewRequestInput = Schema.Struct({
   evidence: Schema.optional(Schema.String),
 })
 export type ReviewRequestInput = Schema.Schema.Type<typeof ReviewRequestInput>
+
+export const SubmitVerdictInput = Schema.Struct({
+  sessionID: SessionID,
+  reviewerSessionID: SessionID,
+  met: Schema.Boolean,
+  summary: Schema.String,
+  unmet: Schema.optional(
+    Schema.mutable(Schema.Array(Schema.Struct({ requirement: Schema.String, evidence: Schema.String }))),
+  ),
+})
+export type SubmitVerdictInput = Schema.Schema.Type<typeof SubmitVerdictInput>
 
 export const ReviewFinishInput = Schema.Struct({
   sessionID: SessionID,
@@ -114,6 +184,7 @@ export interface Interface {
   readonly requestReview: (input: ReviewRequestInput) => Effect.Effect<Info | undefined>
   readonly beginReview: (sessionID: SessionID, reviewerSessionID: SessionID) => Effect.Effect<Info | undefined>
   readonly recoverReview: (sessionID: SessionID) => Effect.Effect<Info | undefined>
+  readonly submitVerdict: (input: SubmitVerdictInput) => Effect.Effect<Info | undefined>
   readonly finishReview: (input: ReviewFinishInput) => Effect.Effect<Info | undefined>
   readonly clear: (sessionID: SessionID) => Effect.Effect<boolean>
   readonly recordTurn: (input: RecordTurnInput) => Effect.Effect<Info | undefined>
@@ -288,6 +359,10 @@ const layer = Layer.effect(
           requestedAt: now,
           updatedAt: now,
           ...(evidence ? { evidence } : {}),
+          // Rejection history and the error streak survive across attempts;
+          // everything else resets.
+          ...(draft.review?.history?.length ? { history: draft.review.history } : {}),
+          ...(draft.review?.errorStreak ? { errorStreak: draft.review.errorStreak } : {}),
         }
       })
     })
@@ -302,6 +377,7 @@ const layer = Layer.effect(
         draft.review.status = "running"
         draft.review.updatedAt = now
         draft.review.reviewerSessionID = reviewerSessionID
+        draft.review.verdict = undefined
       })
     })
 
@@ -312,6 +388,28 @@ const layer = Layer.effect(
         draft.review.updatedAt = now
         draft.review.reason = "The previous independent review was interrupted and has been queued again."
         draft.review.reviewerSessionID = undefined
+        // A verdict submitted by the interrupted reviewer must not leak into
+        // the next attempt as if the replacement reviewer had produced it.
+        draft.review.verdict = undefined
+      })
+    })
+
+    const submitVerdict = Effect.fn("SessionGoal.submitVerdict")(function* (input: SubmitVerdictInput) {
+      return yield* update(input.sessionID, (draft, now) => {
+        // Only the reviewer session named by the running review may submit;
+        // anything else is a stale or forged caller and is ignored.
+        if (draft.review?.status !== "running") return
+        if (draft.review.reviewerSessionID !== input.reviewerSessionID) return
+        // First write wins: the tool contract is "call exactly once", and a
+        // later call must not overwrite the verdict the review will act on.
+        if (draft.review.verdict) return
+        draft.review.verdict = {
+          met: input.met,
+          summary: input.summary,
+          ...(input.unmet?.length ? { unmet: input.unmet } : {}),
+          at: now,
+        }
+        draft.review.updatedAt = now
       })
     })
 
@@ -321,9 +419,19 @@ const layer = Layer.effect(
         if (draft.review.reviewerSessionID !== input.reviewerSessionID) return
         draft.tokensUsed += input.tokens
         draft.review.status = input.error ? "error" : input.accepted ? "accepted" : "rejected"
+        draft.review.errorStreak = input.error ? (draft.review.errorStreak ?? 0) + 1 : 0
         draft.review.updatedAt = now
         draft.review.reason =
           input.reason.trim() || (input.accepted ? "Goal requirements verified." : "Goal not verified.")
+        // Only substantive rejections enter the history the worker sees;
+        // timeouts and provider failures are infrastructure noise tracked by
+        // errorStreak, not reviewer feedback to act on.
+        if (!input.accepted && !input.error) {
+          draft.review.history = [
+            ...(draft.review.history ?? []),
+            { attempt: draft.review.attempt, reason: draft.review.reason, at: now },
+          ].slice(-3)
+        }
         if (!input.accepted) return
         if (draft.status === "complete" || draft.status === "blocked") return
         stopClock(draft, now)
@@ -343,8 +451,20 @@ const layer = Layer.effect(
 
     const recordTurn = Effect.fn("SessionGoal.recordTurn")(function* (input: RecordTurnInput) {
       return yield* update(input.sessionID, (draft, now) => {
-        draft.turns += 1
+        if (input.completed !== false) draft.turns += 1
         draft.tokensUsed += input.tokens
+        if (input.interrupted) {
+          draft.interrupted = {
+            reason: input.interrupted,
+            at: now,
+            count: (draft.interrupted?.count ?? 0) + 1,
+          }
+        } else if (input.completed !== false) {
+          // Only a turn that returned control cleanly ends the outage; a
+          // successful mid-turn tool step before the provider dies again must
+          // not reset the backoff streak.
+          draft.interrupted = undefined
+        }
         if (draft.blocker && draft.blocker.turn < draft.turns) {
           draft.blocker = undefined
         }
@@ -372,10 +492,20 @@ const layer = Layer.effect(
           : info.review?.status === "pending" || info.review?.status === "running"
             ? `Independent review attempt ${info.review.attempt} is ${info.review.status}.`
             : "No independent completion review is pending."
+      const interrupted = info.interrupted
+        ? [
+            `The previous goal turn ended before you completed it: ${info.interrupted.reason}`,
+            `That turn made no completion claim, so no independent review was run for it${
+              info.interrupted.count > 1 ? ` (${info.interrupted.count} consecutive interrupted turns)` : ""
+            }.`,
+            "Resume the objective from current state. Re-establish where you were from the transcript and working tree rather than restarting, and do not treat the interruption as a reason to stop or to claim completion.",
+          ]
+        : []
       return [
         "<active-goal>",
         `Status: ${info.status}`,
         `Objective: ${info.objective}`,
+        ...interrupted,
         `Elapsed: ${formatDuration(info.time.elapsed)} across ${info.turns} completed goal turn(s).`,
         budget,
         blocker,
@@ -404,6 +534,7 @@ const layer = Layer.effect(
       requestReview,
       beginReview,
       recoverReview,
+      submitVerdict,
       finishReview,
       clear,
       recordTurn,

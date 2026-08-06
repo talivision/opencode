@@ -281,6 +281,7 @@ const layer = Layer.effect(
                 read: "allow",
                 webfetch: "allow",
                 websearch: "allow",
+                goal_verdict: "allow",
                 external_directory: readonlyExternalDirectory,
               }),
             ),
@@ -341,6 +342,7 @@ const layer = Layer.effect(
             read: "allow",
             webfetch: "allow",
             websearch: "allow",
+            goal_verdict: "allow",
             external_directory: readonlyExternalDirectory,
           }),
         )

@@ -101,6 +101,26 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+// Outer backoff for goal turns that die on a provider error. The in-turn retry
+// policy (SessionRetry) backs off within a single turn, but every continuation
+// starts a fresh turn with a fresh attempt counter, so without this the goal
+// loop resets the provider backoff exactly when the provider is failing. First
+// interruption continues immediately (the in-turn retries already waited);
+// consecutive failures then double from 5s up to a 5 minute ceiling. The goal
+// never gives up — it just stops hammering.
+const GOAL_CONTINUE_BACKOFF_INITIAL = 5_000
+const GOAL_CONTINUE_BACKOFF_MAX = 300_000
+export function goalContinueBackoffMs(consecutive: number) {
+  if (consecutive <= 1) return 0
+  return Math.min(GOAL_CONTINUE_BACKOFF_INITIAL * Math.pow(2, consecutive - 2), GOAL_CONTINUE_BACKOFF_MAX)
+}
+
+function formatMessageError(error: { name?: string; message?: string; data?: unknown }) {
+  const data = error.data as { message?: unknown } | undefined
+  const detail = typeof data?.message === "string" ? data.message.trim() : (error.message?.trim() ?? "")
+  return detail || error.name || "the provider ended the turn with an unspecified error"
+}
+
 function goalReviewVerdict(text: string, nonce: string) {
   const last = text
     .split("\n")
@@ -1152,6 +1172,41 @@ const layer = Layer.effect(
     const continueGoal = Effect.fnUntraced(function* (sessionID: SessionID, lastUser: SessionV1.User) {
       const current = yield* goal.get(sessionID)
       if (current?.status !== "active") return false
+      // The continuation is where the goal loop talks to the worker, so it
+      // carries what actually just happened — reviewer feedback, interruptions,
+      // budget pressure — as conversation content the model attends to and that
+      // persists in the transcript, instead of a mutated system-prompt block
+      // that silently overwrites its own history.
+      const lines: string[] = []
+      const review = current.review
+      if (review?.status === "rejected" || review?.status === "error") {
+        lines.push(
+          review.status === "rejected"
+            ? `The independent reviewer rejected completion attempt #${review.attempt}: ${review.reason ?? "no reason recorded"}`
+            : `Independent review attempt #${review.attempt} failed to verify completion: ${review.reason ?? "no reason recorded"}`,
+          "Address that concrete reason and gather stronger current-state evidence before requesting another review.",
+        )
+        const earlier = (review.history ?? []).filter((entry) => entry.attempt !== review.attempt)
+        if (earlier.length > 0) {
+          lines.push(
+            "Earlier attempts were also rejected — make sure your fix does not regress these:",
+            ...earlier.map((entry) => `  - attempt #${entry.attempt}: ${entry.reason}`),
+          )
+        }
+      }
+      if (current.interrupted) {
+        lines.push(
+          `The previous turn ended before you completed it (${current.interrupted.reason}). Resume from current state — re-establish where you were from the transcript and working tree rather than restarting.`,
+        )
+      }
+      if (current.tokenBudget !== undefined && current.tokensUsed >= current.tokenBudget * 0.8) {
+        lines.push(
+          `Token budget is nearly exhausted (${current.tokensUsed} of ${current.tokenBudget} tokens used). Prioritize the smallest verifiable increment.`,
+        )
+      }
+      lines.push(
+        "Continue working toward the active goal. Re-read the active-goal context, inspect current state, and make the next meaningful increment of progress. Do not stop merely to report partial progress. Use the goal tool only when its completion or blocking rules are satisfied.",
+      )
       yield* createUserMessage({
         sessionID,
         agent: lastUser.agent,
@@ -1163,11 +1218,7 @@ const layer = Layer.effect(
         parts: [
           {
             type: "text",
-            text: [
-              "Continue working toward the active goal.",
-              "Re-read the active-goal context, inspect current state, and make the next meaningful increment of progress.",
-              "Do not stop merely to report partial progress. Use the goal tool only when its completion or blocking rules are satisfied.",
-            ].join(" "),
+            text: lines.join("\n"),
             synthetic: true,
           },
         ],
@@ -1318,7 +1369,8 @@ const layer = Layer.effect(
           },
           system: [
             `The verdict nonce for this review is ${nonce}.`,
-            `Your final non-empty line must be exactly "VERDICT: MET ${nonce} <reason>" or "VERDICT: NOT_MET ${nonce} <reason>".`,
+            "Submit your verdict by calling the goal_verdict tool exactly once at the end of your review — met plus a decisive summary, or not met plus every unmet requirement with evidence.",
+            `Only if the goal_verdict tool is unavailable, your final non-empty line must be exactly "VERDICT: MET ${nonce} <reason>" or "VERDICT: NOT_MET ${nonce} <reason>".`,
             "Never accept a verdict without independently checking authoritative current state.",
           ].join("\n"),
           parts: [
@@ -1484,11 +1536,28 @@ const layer = Layer.effect(
         .filter((part): part is SessionV1.TextPart => part.type === "text")
         .map((part) => part.text)
         .join("\n")
-      const verdict = goalReviewVerdict(output, nonce)
-      const tokens =
-        result.exit.value.info.role === "assistant"
-          ? Math.max(0, result.exit.value.info.tokens.output + result.exit.value.info.tokens.reasoning)
-          : 0
+      // Prefer the structured verdict the reviewer submitted through the
+      // goal_verdict tool — unforgeable because only the reviewer agent has the
+      // tool, and rich enough for the worker to act on. The nonce-bound text
+      // verdict remains as the fallback for models that fail to call tools.
+      const submitted = (yield* goal.get(sessionID))?.review?.verdict
+      const verdict = submitted
+        ? {
+            accepted: submitted.met,
+            reason: [
+              submitted.summary.trim() || (submitted.met ? "All goal requirements verified." : "Goal requirements unmet."),
+              ...(submitted.unmet ?? []).map((item) => `Unmet — ${item.requirement}: ${item.evidence}`),
+            ].join("\n"),
+          }
+        : goalReviewVerdict(output, nonce)
+      // Sum every assistant message in the reviewer session: a structured
+      // review is at least two provider responses (the goal_verdict call and
+      // the closing message), and counting only the last one undercounts the
+      // budget the goal is charged.
+      const tokens = (yield* sessions.messages({ sessionID: child.id }).pipe(Effect.orElseSucceed(() => [])))
+        .map((message) => message.info)
+        .filter((info): info is SessionV1.Assistant => info.role === "assistant")
+        .reduce((sum, info) => sum + Math.max(0, info.tokens.output + info.tokens.reasoning), 0)
       const reason =
         verdict?.reason ?? "Independent reviewer returned no valid nonce-bound verdict; completion remains unverified."
       yield* goal.finishReview({
@@ -1541,6 +1610,13 @@ const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        let goalBackoff: { count: number; reason: string } | undefined
+        // Set when a step ran under an active goal and control has not yet
+        // returned; consumed by the loop early-exit, which is where a normal
+        // turn actually ends. Counting there (not per step) keeps goal turns
+        // aligned with user-visible turns, and the flag cannot double-count a
+        // turn that a previous loop() invocation already recorded.
+        let goalBoundaryPending = false
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1584,8 +1660,38 @@ const layer = Layer.effect(
               })
             }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+            // This early exit is where a normal turn actually returns control
+            // (the processor answers "continue" after a clean stop; only errors
+            // break at the step site), so the goal turn boundary is marked here.
+            // Tokens were already accumulated per step.
+            if (goalBoundaryPending) {
+              goalBoundaryPending = false
+              // Counted even when the goal completed mid-turn (a review accepted
+              // during the turn): the turn still happened. Post-completion turns
+              // can never be counted here because the flag is only set by steps
+              // that ran under an active goal.
+              yield* goal.recordTurn({ sessionID, tokens: 0, completed: true })
+            }
             yield* reviewGoal(sessionID, lastUser, true)
             if (yield* continueGoal(sessionID, lastUser)) {
+              // Repeated review errors pace the loop exactly like repeated
+              // provider failures: first error continues immediately, then 5s
+              // doubling to the 5 minute ceiling. Without this, a reviewer
+              // that keeps failing to produce a verdict re-reviews hundreds of
+              // times a minute (observed 337 attempts in 30s in the TUI
+              // harness before this guard).
+              const review = (yield* goal.get(sessionID))?.review
+              const streak = review?.status === "error" ? (review.errorStreak ?? 0) : 0
+              const wait = goalContinueBackoffMs(streak)
+              if (wait > 0) {
+                yield* status.set(sessionID, {
+                  type: "retry",
+                  attempt: streak,
+                  message: review?.reason ?? "Independent review keeps failing",
+                  next: (yield* Clock.currentTimeMillis) + wait,
+                })
+                yield* Effect.sleep(`${wait} millis`)
+              }
               step = 0
               continue
             }
@@ -1798,14 +1904,50 @@ const layer = Layer.effect(
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
           if (goalTurn) {
-            yield* goal.recordTurn({
+            // A turn that died on a provider error, an exhausted retry, or an
+            // abort never claimed completion, so there is nothing to verify.
+            // Handing it to the reviewer spawns a child session against the same
+            // provider that just failed — doubling load precisely while it is
+            // rate limited — and overwrites review.reason with a verdict about a
+            // turn that never happened. Skip the review and tell the worker to
+            // carry on instead.
+            const interrupted = handle.message.error ? formatMessageError(handle.message.error) : undefined
+            const updated = yield* goal.recordTurn({
               sessionID,
               tokens: Math.max(0, handle.message.tokens.output + handle.message.tokens.reasoning),
+              interrupted,
+              // Only a turn that returns control is a goal turn; intermediate
+              // tool-call steps just accumulate tokens.
+              completed: outcome === "break",
             })
-            yield* reviewGoal(sessionID, lastUser, outcome === "break")
+            if (outcome === "continue") goalBoundaryPending = true
+            else goalBoundaryPending = false
+            // An interrupted turn defers even an already-pending review (one the
+            // worker requested before the provider died): the reviewer would run
+            // against the same failing provider. The review stays pending and
+            // runs at the next clean turn boundary.
+            if (!interrupted) yield* reviewGoal(sessionID, lastUser, outcome === "break")
+            if (interrupted && updated?.interrupted) {
+              goalBackoff = { count: updated.interrupted.count, reason: updated.interrupted.reason }
+            }
           }
           if (outcome === "break") {
             if (yield* continueGoal(sessionID, lastUser)) {
+              if (goalBackoff) {
+                const wait = goalContinueBackoffMs(goalBackoff.count)
+                if (wait > 0) {
+                  // Reuses the in-turn retry status so the TUI shows the same
+                  // countdown it shows for provider retries within a turn.
+                  yield* status.set(sessionID, {
+                    type: "retry",
+                    attempt: goalBackoff.count,
+                    message: goalBackoff.reason,
+                    next: (yield* Clock.currentTimeMillis) + wait,
+                  })
+                  yield* Effect.sleep(`${wait} millis`)
+                }
+                goalBackoff = undefined
+              }
               step = 0
               continue
             }

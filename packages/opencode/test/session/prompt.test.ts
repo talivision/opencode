@@ -1224,6 +1224,250 @@ reviewerPaced.instance(
     }),
 )
 
+it.instance("goal continuation backoff doubles from the second consecutive failure and caps at 5 minutes", () =>
+  Effect.sync(() => {
+    // First failure continues immediately: the in-turn retry policy already
+    // backed off before the turn died.
+    expect(SessionPrompt.goalContinueBackoffMs(0)).toBe(0)
+    expect(SessionPrompt.goalContinueBackoffMs(1)).toBe(0)
+    expect(SessionPrompt.goalContinueBackoffMs(2)).toBe(5_000)
+    expect(SessionPrompt.goalContinueBackoffMs(3)).toBe(10_000)
+    expect(SessionPrompt.goalContinueBackoffMs(4)).toBe(20_000)
+    expect(SessionPrompt.goalContinueBackoffMs(8)).toBe(300_000)
+    expect(SessionPrompt.goalContinueBackoffMs(100)).toBe(300_000)
+  }),
+)
+
+it.instance("a goal turn that dies on a provider error is never handed to the reviewer", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal provider failure",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the flaky goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "keep going across a provider failure", tokenBudget: 1 })
+    // The turn dies without the model ever claiming completion. Non-retryable
+    // (4xx, not marked retryable) so the retry policy gives up immediately.
+    yield* llm.error(400, { error: { message: "provider exploded" } })
+    // Second turn succeeds and exhausts the budget, ending the loop.
+    yield* llm.text("Recovered.", { usage: { input: 10, output: 4 } })
+
+    yield* prompt.loop({ sessionID: session.id })
+
+    // The decisive assertion: no reviewer child session was ever created. Before
+    // this fix the errored turn spawned one against the provider that just failed.
+    expect(yield* sessions.children(session.id)).toHaveLength(0)
+    const goal = yield* goals.get(session.id)
+    expect(goal?.review).toBeUndefined()
+  }),
+)
+
+it.instance("a second consecutive provider failure delays the next goal turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal backoff",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the outage goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "outlast a provider outage", tokenBudget: 1 })
+    yield* llm.error(400, { error: { message: "provider exploded" } })
+    yield* llm.error(400, { error: { message: "provider exploded" } })
+    yield* llm.text("Recovered.", { usage: { input: 10, output: 4 } })
+
+    const startedAt = Date.now()
+    yield* prompt.loop({ sessionID: session.id })
+
+    // Second consecutive failure must wait goalContinueBackoffMs(2) = 5s before
+    // the third turn; the first failure continues immediately.
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(5_000)
+    const goal = yield* goals.get(session.id)
+    expect(goal?.turns).toBe(3)
+    expect(goal?.interrupted).toBeUndefined()
+    expect(yield* sessions.children(session.id)).toHaveLength(0)
+  }),
+  15_000,
+)
+
+it.instance("the reviewer accepts through the goal_verdict tool without a nonce line", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal verdict tool accept",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the structured goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "say lima once and return control" })
+    yield* llm.text("Lima", { usage: { input: 9_000, output: 4 } })
+    // Reviewer submits through the tool; its closing text has NO nonce line, so
+    // acceptance can only have come from the structured verdict.
+    yield* llm.tool("goal_verdict", { met: true, summary: "verified by structured tool verdict" })
+    yield* llm.text("Review finished.", { usage: { input: 100, output: 5 } })
+
+    yield* prompt.loop({ sessionID: session.id })
+    const goal = yield* goals.get(session.id)
+    expect(goal?.status).toBe("complete")
+    expect(goal?.review?.status).toBe("accepted")
+    expect(goal?.review?.reason).toContain("verified by structured tool verdict")
+    expect(goal?.review?.verdict?.met).toBe(true)
+  }),
+)
+
+it.instance("a contradictory verdict is refused and the corrected retry is the one recorded", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal verdict contradiction",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the contradictory goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "say lima once" })
+    yield* llm.text("Lima", { usage: { input: 9_000, output: 4 } })
+    // met:true with unmet items must be refused by the tool, not recorded.
+    yield* llm.tool("goal_verdict", {
+      met: true,
+      summary: "claims met",
+      unmet: [{ requirement: "say lima once", evidence: "lima is missing" }],
+    })
+    // The reviewer corrects itself after the tool's error output.
+    yield* llm.tool("goal_verdict", { met: true, summary: "corrected verdict after contradiction" })
+    yield* llm.text("Review finished.", { usage: { input: 100, output: 5 } })
+
+    yield* prompt.loop({ sessionID: session.id })
+    const goal = yield* goals.get(session.id)
+    expect(goal?.status).toBe("complete")
+    expect(goal?.review?.verdict?.summary).toBe("corrected verdict after contradiction")
+  }),
+)
+
+it.instance("a structured rejection feeds unmet requirements into the continuation message", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal verdict tool reject",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the rejected goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "say lima twice" })
+    yield* llm.text("Lima", { usage: { input: 9_000, output: 4 } })
+    // Review #1: structured rejection with a concrete unmet requirement.
+    yield* llm.tool("goal_verdict", {
+      met: false,
+      summary: "objective not yet satisfied",
+      unmet: [{ requirement: "say lima twice", evidence: "only one lima appears in the transcript" }],
+    })
+    yield* llm.text("Review finished.", { usage: { input: 100, output: 5 } })
+    // Worker continuation turn; capture what the model was actually sent.
+    let continuation: string | undefined
+    let workerTools: string | undefined
+    yield* llm.textFrom((hit) => {
+      const body = hit.body as { messages?: { role: string; content: unknown }[]; tools?: unknown }
+      continuation = JSON.stringify(body.messages?.filter((m) => m.role === "user") ?? [])
+      workerTools = JSON.stringify(body.tools ?? [])
+      return "Lima"
+    })
+    // Review #2 accepts.
+    yield* llm.tool("goal_verdict", { met: true, summary: "both limas verified" })
+    yield* llm.text("Review finished.", { usage: { input: 100, output: 5 } })
+
+    yield* prompt.loop({ sessionID: session.id })
+    const goal = yield* goals.get(session.id)
+    expect(goal?.status).toBe("complete")
+    expect(goal?.review?.attempt).toBe(2)
+    // The rejection reached the worker as conversation content, verbatim.
+    expect(continuation).toContain("rejected completion attempt #1")
+    expect(continuation).toContain("only one lima appears in the transcript")
+    // The worker must never see the reviewer's verdict tool.
+    expect(workerTools).not.toContain("goal_verdict")
+    // History carried the rejection across the attempt boundary.
+    expect(goal?.review?.history?.length).toBe(1)
+    expect(goal?.review?.history?.[0]?.reason).toContain("say lima twice")
+  }),
+)
+
+it.instance("a multi-step worker turn counts as one goal turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal turn accounting",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the multi-step goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "use two tools, then answer once" })
+    // One user-visible turn: two tool rounds, then the final text that returns
+    // control. Each round is a separate provider request, but the goal turn
+    // counter must see exactly one turn — otherwise "three consecutive goal
+    // turns" is reachable inside a single worker turn.
+    yield* llm.tool("glob", { pattern: "*" })
+    yield* llm.tool("glob", { pattern: "**/*.json" })
+    yield* llm.text("Done", { usage: { input: 9_000, output: 4 } })
+    yield* llm.textFrom((hit) => {
+      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+      return `VERDICT: MET ${nonce} both tools ran and control returned`
+    })
+
+    yield* prompt.loop({ sessionID: session.id })
+    const goal = yield* goals.get(session.id)
+    expect(goal?.turns).toBe(1)
+    expect(goal?.status).toBe("complete")
+  }),
+)
+
 it.instance("goal accounting counts only generated worker and reviewer tokens", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

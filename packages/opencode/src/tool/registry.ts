@@ -55,6 +55,7 @@ import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpCatalog } from "@/mcp/catalog"
 import { GoalTool } from "./goal"
+import { GoalVerdictTool } from "./goal-verdict"
 import { SessionGoal } from "@/session/goal"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
@@ -112,6 +113,7 @@ const layer = Layer.effect(
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
     const goaltool = yield* GoalTool
+    const goalverdicttool = yield* GoalVerdictTool
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
@@ -218,6 +220,7 @@ const layer = Layer.effect(
           search: Tool.init(websearch),
           skill: Tool.init(skilltool),
           goal: Tool.init(goaltool),
+          goalVerdict: Tool.init(goalverdicttool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
@@ -242,6 +245,7 @@ const layer = Layer.effect(
             tool.search,
             tool.skill,
             tool.goal,
+            tool.goalVerdict,
             tool.patch,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
@@ -293,6 +297,11 @@ const layer = Layer.effect(
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }
+        // The verdict tool is the reviewer's unforgeable channel: no other
+        // agent — especially not the worker whose claim is under review — may
+        // ever see it in its tool list. The native check keeps a config agent
+        // that merely renamed itself "goal-reviewer" from qualifying.
+        if (tool.id === GoalVerdictTool.id) return input.agent.name === "goal-reviewer" && input.agent.native === true
 
         const usePatch =
           input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")
