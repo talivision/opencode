@@ -172,11 +172,11 @@ export const Info = Schema.Struct({
         Schema.Struct({
           timeout: Schema.optional(PositiveInt).annotate({
             description:
-              "Milliseconds the independent goal reviewer may go without any activity before it is cancelled. Resets on streamed text, reasoning, and tool calls, so it only fires on a genuinely stalled reviewer (default: 120000)",
+              "Milliseconds the independent goal reviewer may go without any activity before it is cancelled. Resets on streamed text, reasoning, and tool calls, so it only fires on a genuinely stalled reviewer (default: 1200000, i.e. 20 minutes)",
           }),
           max_duration: Schema.optional(PositiveInt).annotate({
             description:
-              "Maximum total milliseconds a single goal review may run before it is cancelled, regardless of activity (default: 1800000)",
+              "Maximum total milliseconds a single goal review may run before it is cancelled, regardless of activity (default: 18000000, i.e. 5 hours)",
           }),
         }),
       ).annotate({

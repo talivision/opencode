@@ -1315,8 +1315,8 @@ const layer = Layer.effect(
       // reviewer inspecting a large working tree is a normal slow path, not a
       // stall. See goalReviewTimeoutMs/goalReviewMaxMs in runtime-flags.
       const reviewConfig = (yield* config.get()).goal?.review
-      const reviewTimeoutMs = flags.goalReviewTimeoutMs ?? reviewConfig?.timeout ?? 120_000
-      const reviewMaxMs = flags.goalReviewMaxMs ?? reviewConfig?.max_duration ?? 1_800_000
+      const reviewTimeoutMs = flags.goalReviewTimeoutMs ?? reviewConfig?.timeout ?? 1_200_000
+      const reviewMaxMs = flags.goalReviewMaxMs ?? reviewConfig?.max_duration ?? 18_000_000
       // Both limits are configurable, so the reason has to describe whatever the
       // operator actually set: a sub-minute cap must not report "1 minute".
       const reviewMaxLabel =

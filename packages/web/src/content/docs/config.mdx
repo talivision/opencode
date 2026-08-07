@@ -767,19 +767,19 @@ run through the `goal.review` option.
   "$schema": "https://opencode.ai/config.json",
   "goal": {
     "review": {
-      "timeout": 120000,
-      "max_duration": 1800000
+      "timeout": 1200000,
+      "max_duration": 18000000
     }
   }
 }
 ```
 
 - `timeout` - Milliseconds the reviewer may go without any activity before it is
-  cancelled (default: `120000`). This is an inactivity timer, not a wall clock:
+  cancelled (default: `1200000` — 20 minutes). This is an inactivity timer, not a wall clock:
   it resets on streamed text, reasoning, and tool calls, so it only fires on a
   reviewer that has genuinely stalled.
 - `max_duration` - Maximum total milliseconds a single review may run, regardless
-  of activity (default: `1800000`). This is the backstop against a reviewer that
+  of activity (default: `18000000` — 5 hours). This is the backstop against a reviewer that
   stays busy but never converges.
 
 Raise both if you run long-lived goals against large working trees or slow
