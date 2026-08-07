@@ -1,17 +1,19 @@
 // Isolated fake OpenAI-compatible provider used to exercise background
 // subagents deterministically. Never contacts a real provider.
 //
-// Request classification uses prompt markers carried in the transcript:
-//   * parent request -> contains PARENT_MARKER, the driver's first user prompt
-//   * child request  -> everything else; task prompts contain CHILD_MARKER
-// The child gets a separate system prompt and transcript, so it does not inherit
-// PARENT_MARKER. Title-generation requests have no tools and get a quick reply
-// without advancing either scenario.
+// Request classification uses exact prompt markers carried in the transcript:
+//   * parent A request -> contains PARENT_MARKER, the driver's first user prompt
+//   * parent B request -> contains PARENT_B_MARKER, the ownership probe prompt
+//   * child request    -> contains CHILD_MARKER from the task prompt
+// Title-generation requests have no tools and get a quick reply without
+// advancing any scenario. Do not classify on generic system-prompt words such
+// as "summary", "compact", "task", or "background".
 //
 // env:
 //   PORT      listen port (default 4599)
 //   LOG       path to append one JSON line per request
-//   SCENARIO  notify | steer | inspect (default notify)
+//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership (default notify)
+//   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
 import http from "node:http"
 import fs from "node:fs"
 
@@ -19,6 +21,7 @@ const PORT = Number(process.env.PORT ?? 4599)
 const LOG = process.env.LOG
 const SCENARIO = process.env.SCENARIO ?? "notify"
 const PARENT_MARKER = "Spawn a background investigation and then wait."
+const PARENT_B_MARKER = "SECOND_PARENT_OWNERSHIP_PROBE"
 const CHILD_MARKER = "SUBAGENT_HARNESS_CHILD"
 const USAGE = { input: 100, output: 10 }
 
@@ -27,6 +30,7 @@ let childCount = 0
 let childID
 let firstChildOpen = false
 let inspectStopIssued = false
+const activeChildModels = new Set()
 
 function log(entry) {
   if (!LOG) return
@@ -85,6 +89,27 @@ function toolReply(res, name, args, id = "call_1") {
   ])
 }
 
+function toolReplies(res, calls) {
+  sse(res, [
+    chunk({ delta: { role: "assistant" } }),
+    ...calls.map((call, index) =>
+      chunk({
+        delta: {
+          tool_calls: [
+            {
+              index,
+              id: call.id,
+              type: "function",
+              function: { name: call.name, arguments: JSON.stringify(call.args) },
+            },
+          ],
+        },
+      }),
+    ),
+    chunk({ finish: "tool_calls", usage: USAGE }),
+  ])
+}
+
 function slowTextReply(req, res, text, duration, track = false) {
   const pieces = text.split(" ")
   if (track) firstChildOpen = true
@@ -117,8 +142,9 @@ function slowTextReply(req, res, text, duration, track = false) {
   })
 }
 
-function hang(req, res) {
+function hang(req, res, model) {
   firstChildOpen = true
+  activeChildModels.add(model)
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -127,6 +153,8 @@ function hang(req, res) {
   res.write(`data: ${JSON.stringify(chunk({ delta: { role: "assistant" } }))}\n\n`)
   res.on("close", () => {
     firstChildOpen = false
+    activeChildModels.delete(model)
+    log({ role: "child-close", scenario: SCENARIO, model })
   })
 }
 
@@ -144,13 +172,46 @@ function findChildID(flat) {
   return /<task id=\\?"(ses_[^"\\]+)\\?"/.exec(flat)?.[1] ?? /task_id=\\?"(ses_[^"\\]+)\\?"/.exec(flat)?.[1]
 }
 
+export function classifyRequest(parsed) {
+  const flat = JSON.stringify(parsed)
+  const isParentA = flat.includes(PARENT_MARKER)
+  const isParentB = flat.includes(PARENT_B_MARKER)
+  const isParent = isParentA || isParentB
+  // Parent transcripts retain task-call arguments, including CHILD_MARKER.
+  // Parent markers therefore take precedence; a child is the exact child
+  // marker in a transcript that contains neither exact parent marker.
+  const isChild = !isParent && flat.includes(CHILD_MARKER)
+  const isMainRequest = Array.isArray(parsed.tools) && parsed.tools.length > 0
+  const role = !isMainRequest
+    ? isParent
+      ? "parent-title"
+      : isChild
+        ? "child-title"
+        : "auxiliary"
+    : isParentB
+      ? "parent-b"
+      : isParentA
+        ? "parent"
+        : isChild
+          ? "child"
+          : "unclassified-main"
+  return { flat, isParentA, isParentB, isParent, isChild, isMainRequest, role }
+}
+
 const server = http.createServer(async (req, res) => {
+  if (req.url === "/__harness/state") {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ activeChildModels: [...activeChildModels].sort(), firstChildOpen }))
+    return
+  }
+
   const raw = await body(req)
   let parsed = {}
   try {
     parsed = JSON.parse(raw || "{}")
   } catch {}
-  const flat = JSON.stringify(parsed)
+  const classification = classifyRequest(parsed)
+  const flat = classification.flat
 
   if (req.url?.startsWith("/v1/models")) {
     res.writeHead(200, { "content-type": "application/json" })
@@ -158,18 +219,21 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  const isParent = flat.includes(PARENT_MARKER)
-  const isMainRequest = Array.isArray(parsed.tools) && parsed.tools.length > 0
+  const isParentA = classification.isParentA
+  const isParentB = classification.isParentB
+  const isParent = classification.isParent
+  const isChild = classification.isChild
+  const isMainRequest = classification.isMainRequest
   const foundChildID = findChildID(flat)
   if (foundChildID) childID = foundChildID
 
   if (!isMainRequest) {
-    log({ role: isParent ? "parent-title" : "child-title", scenario: SCENARIO, url: req.url, body: parsed })
-    textReply(res, isParent ? "Background investigation" : "Cache investigation")
+    log({ role: isParent ? "parent-title" : isChild ? "child-title" : "auxiliary", scenario: SCENARIO, url: req.url, body: parsed })
+    textReply(res, isParent ? "Background investigation" : isChild ? "Cache investigation" : "Harness auxiliary request")
     return
   }
 
-  if (!isParent) {
+  if (isChild) {
     childCount += 1
     const corrected = flat.includes("change of plan: only inspect the cache layer")
     log({
@@ -178,6 +242,7 @@ const server = http.createServer(async (req, res) => {
       scenario: SCENARIO,
       marker: flat.includes(CHILD_MARKER),
       corrected,
+      model: parsed.model,
       url: req.url,
       body: parsed,
     })
@@ -193,12 +258,22 @@ const server = http.createServer(async (req, res) => {
       slowTextReply(req, res, "initial cache sweep in progress and now complete", 12_000, true)
       return
     }
+    if (SCENARIO === "stop-one" || SCENARIO === "ownership") {
+      hang(req, res, parsed.model ?? "unknown")
+      return
+    }
     slowTextReply(req, res, "child work finished", SCENARIO === "inspect" ? 15_000 : 8_000)
     return
   }
 
+  if (!isParent) {
+    log({ role: "unclassified-main", scenario: SCENARIO, url: req.url, body: parsed })
+    textReply(res, "Harness unclassified main request")
+    return
+  }
+
   parentCount += 1
-  log({ role: "parent", n: parentCount, scenario: SCENARIO, childID, url: req.url, body: parsed })
+  log({ role: isParentB ? "parent-b" : "parent", n: parentCount, scenario: SCENARIO, childID, url: req.url, body: parsed })
 
   // Match the ENVELOPE, not the bare word. The task tool's description now
   // contains a literal <task-notification> tag as part of its anti-forgery
@@ -207,6 +282,103 @@ const server = http.createServer(async (req, res) => {
   // the parent's very first turn — before it had spawned anything.
   if (flat.includes("<task-notification task_id=")) {
     textReply(res, SCENARIO === "inspect" ? "stopped it" : "acknowledged background completion")
+    return
+  }
+
+  if (SCENARIO === "ownership" && isParentB) {
+    if (flat.includes("not owned by session")) {
+      textReply(res, "ownership refusal observed")
+      return
+    }
+    log({ role: "ownership-attempt", scenario: SCENARIO, childID })
+    if (!childID) {
+      textReply(res, "missing child task id")
+      return
+    }
+    toolReply(
+      res,
+      "task",
+      {
+        task_id: childID,
+        description: "refuse foreign task",
+        prompt: `${CHILD_MARKER}: this prompt must never reach the foreign child`,
+        subagent_type: "general",
+      },
+      "call_foreign_task",
+    )
+    return
+  }
+
+  if (SCENARIO === "fanout") {
+    if (flat.includes("<task id=")) {
+      textReply(res, "three background investigations launched")
+      return
+    }
+    toolReplies(
+      res,
+      [
+        ["one", "low"],
+        ["two", "medium"],
+        ["three", "high"],
+      ].map(([name, variant], index) => ({
+        id: `call_fanout_${index + 1}`,
+        name: "task",
+        args: {
+          description: `fanout ${name}`,
+          prompt: `${CHILD_MARKER}: FANOUT_${name.toUpperCase()} inspect the cache layer`,
+          subagent_type: "general",
+          model: `fake/fake-model-${name}`,
+          variant,
+          background: true,
+        },
+      })),
+    )
+    return
+  }
+
+  if (SCENARIO === "stop-one") {
+    if (flat.includes("<task id=")) {
+      textReply(res, "two cancellable background tasks launched")
+      return
+    }
+    toolReplies(res, [
+      {
+        id: "call_stop_one",
+        name: "task",
+        args: {
+          description: "first cancellable task",
+          prompt: `${CHILD_MARKER}: STOP_ONE_FIRST remain active until cancelled`,
+          subagent_type: "general",
+          model: "fake/fake-model-one",
+          background: true,
+        },
+      },
+      {
+        id: "call_stop_two",
+        name: "task",
+        args: {
+          description: "second cancellable task",
+          prompt: `${CHILD_MARKER}: STOP_ONE_SECOND remain active until cancelled`,
+          subagent_type: "general",
+          model: "fake/fake-model-two",
+          background: true,
+        },
+      },
+    ])
+    return
+  }
+
+  if (SCENARIO === "ownership") {
+    if (flat.includes("<task id=")) {
+      textReply(res, "owned child launched and left running")
+      return
+    }
+    toolReply(res, "task", {
+      description: "owned child task",
+      prompt: `${CHILD_MARKER}: OWNERSHIP_A1 remain active and accept no foreign prompt`,
+      subagent_type: "general",
+      background: true,
+    })
     return
   }
 
@@ -274,6 +446,46 @@ const server = http.createServer(async (req, res) => {
   })
 })
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`fake provider listening on http://127.0.0.1:${PORT} (${SCENARIO})`)
-})
+if (process.env.CLASSIFIER_SELF_TEST === "1") {
+  const task = [{ type: "function", function: { name: "task" } }]
+  const cases = [
+    {
+      name: "positive parent A",
+      expected: "parent",
+      body: { messages: [{ role: "user", content: PARENT_MARKER }], tools: task },
+    },
+    {
+      name: "positive parent B",
+      expected: "parent-b",
+      body: { messages: [{ role: "user", content: PARENT_B_MARKER }], tools: task },
+    },
+    {
+      name: "positive child",
+      expected: "child",
+      body: { messages: [{ role: "user", content: `${CHILD_MARKER}: inspect` }], tools: task },
+    },
+    {
+      name: "parent precedence control",
+      expected: "parent",
+      body: { messages: [{ role: "user", content: `${PARENT_MARKER} prior args ${CHILD_MARKER}` }], tools: task },
+    },
+    {
+      name: "generic-word control",
+      expected: "unclassified-main",
+      body: {
+        messages: [{ role: "system", content: "Summarize and compact the background task history." }],
+        tools: task,
+      },
+    },
+  ]
+  const failed = cases.filter((item) => {
+    const actual = classifyRequest(item.body).role
+    console.log(`${actual === item.expected ? "ok" : "not ok"} ${item.name}: ${actual}`)
+    return actual !== item.expected
+  })
+  process.exit(failed.length ? 1 : 0)
+} else {
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`fake provider listening on http://127.0.0.1:${PORT} (${SCENARIO})`)
+  })
+}

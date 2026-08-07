@@ -16,6 +16,13 @@
 #   retrieval reviewer builds a checklist, pulls evidence through goal_transcript,
 #             rejects with per-requirement verdicts, then inherits the checklist
 #             on attempt 2 and accepts. Asserted by assert-retrieval.mjs.
+#   not_met_history reviewer rejects twice for different reasons, then accepts;
+#             asserts both reasons reach worker request 3 under the anti-cycling heading
+#   turns    one worker turn calls glob twice, then answers; durable turns must be 1
+#   interrupted worker request 1 gets a non-retryable 400, is not reviewed, and resumes
+#   cache-stable two glob steps plus the final answer share a byte-identical system message
+#             (comparisons stop at review boundaries because review state legitimately changes it)
+#   goal-events reviewer accepts; asserts the rendered Goal achieved indication and durable completion
 #   invalid   verdict carries the wrong nonce         -> forged verdict must be refused
 #   http500   provider fails the reviewer request     -> reviewer failure inline
 #   silent    reviewer never responds                 -> inactivity timeout
@@ -41,6 +48,14 @@ PORT="${PORT:-4599}"
 WORK="${WORK:-${TMPDIR:-/tmp}/opencode-goal-harness}"
 SOCK="${SOCK:-/tmp/opencode-goal-harness.sock}"
 
+case "$SCENARIO" in
+  met | not_met | met_tool | not_met_tool | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | busy | slow) ;;
+  *)
+    echo "usage: $0 <met|not_met|met_tool|not_met_tool|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|busy|slow> [seconds]" >&2
+    exit 2
+    ;;
+esac
+
 if [ ! -x "$BIN" ]; then
   echo "no binary at $BIN" >&2
   echo "build one with: OPENCODE_VERSION=dev ./packages/opencode/script/build.ts --single --skip-install --skip-embed-web-ui" >&2
@@ -48,6 +63,7 @@ if [ ! -x "$BIN" ]; then
 fi
 command -v tmux >/dev/null || { echo "tmux is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "node is required" >&2; exit 1; }
+command -v sqlite3 >/dev/null || { echo "sqlite3 is required" >&2; exit 1; }
 
 cleanup() {
   tmux -S "$SOCK" kill-server 2>/dev/null || true
@@ -103,6 +119,19 @@ tmux -S "$SOCK" send-keys -t goal "/goal $OBJECTIVE"
 sleep 1
 tmux -S "$SOCK" send-keys -t goal Enter
 
+if [ "$SCENARIO" = "interrupted" ]; then
+  # A later clean turn intentionally clears goal.interrupted. Capture the
+  # durable record while the provider's finite recovery stream is in flight.
+  for ((attempt = 0; attempt < 60; attempt++)); do
+    state="$(ls "$WORK/home/.local/share/opencode/storage/goal/"*.json 2>/dev/null | head -1 || true)"
+    if [ -n "$state" ] && node -e 'const fs=require("fs");const state=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.exit(state.interrupted?.count===1?0:1)' "$state"; then
+      cp "$state" "$WORK/interrupted-goal.json"
+      break
+    fi
+    sleep 0.1
+  done
+fi
+
 elapsed=0
 while [ "$elapsed" -lt "$WATCH" ]; do
   sleep 5
@@ -128,3 +157,17 @@ if [ "$SCENARIO" = "retrieval" ]; then
     "${DB:-}" \
     "$WORK/home/.local/share/opencode/storage/goal"
 fi
+
+case "$SCENARIO" in
+  not_met_history | turns | interrupted | cache-stable | goal-events)
+    echo "==> $SCENARIO assertions"
+    DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
+    node "$HERE/assert-scenarios.mjs" \
+      "$SCENARIO" \
+      "$WORK/provider.log" \
+      "${DB:-}" \
+      "$WORK/home/.local/share/opencode/storage/goal" \
+      "$WORK/snaps" \
+      "$WORK/interrupted-goal.json"
+    ;;
+esac

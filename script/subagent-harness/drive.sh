@@ -11,6 +11,11 @@
 #   notify  child completes while parent is idle; notification re-invokes parent
 #   steer   a second parent prompt redirects a child whose first request is hung
 #   inspect task_output observes a running child, then task_stop stops it
+#   fanout  three background children use distinct per-call models and variants;
+#           all three completion notifications must reach the parent
+#   stop-one two children remain busy; the running-tasks dialog's two-press
+#           ctrl+d action stops only the selected row and renders its stopped state
+#   ownership parent A owns A1; a fresh parent B is refused when it calls task(task_id=A1)
 #
 # Useful overrides:
 #   BIN=...     path to the compiled binary
@@ -32,9 +37,9 @@ WORK="${WORK:-${TMPDIR:-/tmp}/opencode-subagent-harness}"
 SOCK="${SOCK:-/tmp/opencode-subagent-harness.sock}"
 
 case "$SCENARIO" in
-  notify | steer | inspect) ;;
+  notify | steer | inspect | fanout | stop-one | ownership) ;;
   *)
-    echo "usage: $0 <notify|steer|inspect> [seconds]" >&2
+    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -57,6 +62,7 @@ fi
 command -v tmux >/dev/null || { echo "tmux is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "node is required" >&2; exit 1; }
 command -v sqlite3 >/dev/null || { echo "sqlite3 is required" >&2; exit 1; }
+command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 
 cleanup() {
   tmux -S "$SOCK" kill-server 2>/dev/null || true
@@ -70,6 +76,21 @@ cp "$HERE/opencode.json" "$WORK/proj/opencode.json"
 if [ "$PORT" != "4599" ]; then
   node -e 'const f=process.argv[1],p=process.argv[2],fs=require("fs");fs.writeFileSync(f,fs.readFileSync(f,"utf8").replace("4599",p))' \
     "$WORK/proj/opencode.json" "$PORT"
+fi
+if [ "$SCENARIO" = "fanout" ] || [ "$SCENARIO" = "stop-one" ]; then
+  # Keep the checked-in config single-model. These scenarios expand only the
+  # isolated scratch copy so each task(model=..., variant=...) resolves through
+  # the same fake provider without touching opencode.json.
+  node -e '
+    const fs=require("fs")
+    const file=process.argv[1]
+    const config=JSON.parse(fs.readFileSync(file,"utf8"))
+    const base=config.provider.fake.models["fake-model"]
+    for (const [name,variant] of [["one","low"],["two","medium"],["three","high"]]) {
+      config.provider.fake.models[`fake-model-${name}`]={...base,id:`fake-model-${name}`,name:`Fake Model ${name}`,variants:{[variant]:{}}}
+    }
+    fs.writeFileSync(file,JSON.stringify(config,null,2))
+  ' "$WORK/proj/opencode.json"
 fi
 
 echo "==> fake provider (:$PORT, SCENARIO=$SCENARIO)"
@@ -96,6 +117,19 @@ send_prompt() {
   tmux -S "$SOCK" send-keys -t subagent Enter
 }
 
+wait_for_children() {
+  local expected="$1"
+  for ((attempt = 0; attempt < 40; attempt++)); do
+    if curl --silent --show-error "http://127.0.0.1:$PORT/__harness/state" \
+      | node -e 'let data="";process.stdin.on("data",(chunk)=>data+=chunk).on("end",()=>process.exit(JSON.parse(data).activeChildModels.length===Number(process.argv[1])?0:1))' "$expected"; then
+      return
+    fi
+    sleep 0.25
+  done
+  echo "FAIL expected $expected live child provider request(s) before driving the dialog" >&2
+  return 1
+}
+
 sleep 15
 tmux -S "$SOCK" capture-pane -p -t subagent >"$WORK/snaps/00-startup.txt"
 send_prompt "$PROMPT"
@@ -114,6 +148,34 @@ while [ "$elapsed" -lt "$WATCH" ]; do
   if [ "$SCENARIO" = "inspect" ] && [ "$elapsed" -eq 13 ]; then
     send_prompt "Stop it."
   fi
+  if [ "$SCENARIO" = "stop-one" ] && [ "$elapsed" -eq 8 ]; then
+    wait_for_children 2
+    echo "==> open Running tasks and stop the selected row with two ctrl+d presses"
+    tmux -S "$SOCK" send-keys -t subagent C-p
+    sleep 1
+    tmux -S "$SOCK" send-keys -l -t subagent -- "running"
+    sleep 1
+    tmux -S "$SOCK" send-keys -t subagent Enter
+    sleep 1
+    tmux -S "$SOCK" capture-pane -p -t subagent >"$WORK/snaps/stop-dialog.txt"
+    tmux -S "$SOCK" send-keys -t subagent C-d
+    sleep 1
+    tmux -S "$SOCK" capture-pane -p -t subagent >"$WORK/snaps/stop-confirm.txt"
+    tmux -S "$SOCK" send-keys -t subagent C-d
+    sleep 2
+    tmux -S "$SOCK" capture-pane -p -t subagent >"$WORK/snaps/stop-result.txt"
+  fi
+  if [ "$SCENARIO" = "ownership" ] && [ "$elapsed" -eq 8 ]; then
+    wait_for_children 1
+    echo "==> create parent B from the command palette"
+    tmux -S "$SOCK" send-keys -t subagent C-p
+    sleep 1
+    tmux -S "$SOCK" send-keys -l -t subagent -- "new session"
+    sleep 1
+    tmux -S "$SOCK" send-keys -t subagent Enter
+    sleep 2
+    send_prompt "SECOND_PARENT_OWNERSHIP_PROBE: attempt to resume parent A's child."
+  fi
 
   if [ $((elapsed % 5)) -ne 0 ]; then
     continue
@@ -121,7 +183,7 @@ while [ "$elapsed" -lt "$WATCH" ]; do
   tmux -S "$SOCK" capture-pane -p -t subagent >"$WORK/snaps/$(printf '%03d' "$elapsed").txt"
   echo "--- +${elapsed}s"
   tmux -S "$SOCK" capture-pane -p -t subagent \
-    | grep -E "background|subagent|task|acknowledged|stopped|correction" \
+    | grep -E "background|subagent|task|acknowledged|stopped|correction|Running tasks|Press ctrl.d again|ownership" \
     | head -8 || true
 done
 
@@ -250,6 +312,24 @@ SQL
     fail "inspect parent received stopped task-notification"
   fi
 fi
+
+if [ "$SCENARIO" = "stop-one" ]; then
+  curl --silent --show-error "http://127.0.0.1:$PORT/__harness/state" >"$WORK/provider-state.json"
+  echo "==> provider live state"
+  cat "$WORK/provider-state.json"
+fi
+
+case "$SCENARIO" in
+  fanout | stop-one | ownership)
+    echo "==> $SCENARIO assertions"
+    node "$HERE/assert-scenarios.mjs" \
+      "$SCENARIO" \
+      "$WORK/provider.log" \
+      "$DB" \
+      "$WORK/snaps" \
+      "$WORK/provider-state.json"
+    ;;
+esac
 
 echo "==> snapshots: $WORK/snaps"
 echo "==> provider request log: $WORK/provider.log"

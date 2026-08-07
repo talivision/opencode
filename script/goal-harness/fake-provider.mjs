@@ -1,9 +1,13 @@
 // Isolated fake OpenAI-compatible provider used to drive the compiled OpenCode
 // binary deterministically. Never contacts a real provider.
 //
-// Behaviour is chosen from the request body:
-//   * reviewer request  -> body contains "verdict nonce for this review is <nonce>"
-//   * worker request    -> everything else
+// Request classification uses protocol markers that only the corresponding
+// OpenCode path emits:
+//   * reviewer request -> exact verdict-nonce sentence plus goal_verdict tool
+//   * worker request   -> exact <active-goal> system block plus goal tool
+//   * auxiliary request (for example title generation) -> neither marker
+// Do not classify on generic words such as "summary" or "compact": they occur
+// in ordinary system prompts and make control requests indistinguishable.
 //
 // env:
 //   PORT                  listen port (default 4599)
@@ -11,8 +15,10 @@
 //   WORKER_TEXT           worker reply text (default "Lima")
 //   WORKER_INPUT/OUTPUT   fake worker usage (default 9000 / 4)
 //   REVIEWER_INPUT/OUTPUT fake reviewer usage (default 12000 / 58)
-//   REVIEWER_MODE         met | not_met | met_tool | not_met_tool | retrieval | invalid | silent | slow | busy | http500
+//   REVIEWER_MODE         met | not_met | not_met_history | turns | interrupted | cache-stable | goal-events |
+//                         met_tool | not_met_tool | retrieval | invalid | silent | slow | busy | http500
 //   REVIEWER_NOT_MET_N    first N reviews return NOT_MET, then MET (default 0)
+//   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
 import http from "node:http"
 import fs from "node:fs"
 
@@ -83,10 +89,49 @@ function toolReply(res, name, args, usage = REVIEWER_USAGE, id = `call_${Date.no
   ])
 }
 
+function slowTextReply(req, res, text, duration, usage = WORKER_USAGE) {
+  const pieces = text.split(" ")
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  res.write(`data: ${JSON.stringify(chunk({ delta: { role: "assistant" } }))}\n\n`)
+  let index = 0
+  const timer = setInterval(
+    () => {
+      if (index < pieces.length) {
+        const suffix = index === pieces.length - 1 ? "" : " "
+        res.write(`data: ${JSON.stringify(chunk({ delta: { content: pieces[index] + suffix } }))}\n\n`)
+        index += 1
+        return
+      }
+      clearInterval(timer)
+      res.write(`data: ${JSON.stringify(chunk({ finish: "stop", usage }))}\n\n`)
+      res.write("data: [DONE]\n\n")
+      res.end()
+    },
+    Math.ceil(duration / (pieces.length + 1)),
+  )
+  req.on("close", () => clearInterval(timer))
+}
+
 async function body(req) {
   const parts = []
   for await (const c of req) parts.push(c)
   return Buffer.concat(parts).toString("utf8")
+}
+
+function hasTool(parsed, name) {
+  return parsed.tools?.some((item) => item.function?.name === name)
+}
+
+export function classifyRequest(parsed) {
+  const flat = JSON.stringify(parsed)
+  const nonce = /The verdict nonce for this review is ([A-Za-z0-9-]+)\./.exec(flat)?.[1]
+  if (nonce && hasTool(parsed, "goal_verdict")) return { role: "reviewer", flat, nonce }
+  if (flat.includes("<active-goal>") && hasTool(parsed, "goal")) return { role: "worker", flat }
+  return { role: "auxiliary", flat }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -95,9 +140,11 @@ const server = http.createServer(async (req, res) => {
   try {
     parsed = JSON.parse(raw || "{}")
   } catch {}
-  const flat = JSON.stringify(parsed)
-  const nonce = /verdict nonce for this review is ([A-Za-z0-9-]+)/i.exec(flat)?.[1]
-  const isReviewer = Boolean(nonce)
+  const classification = classifyRequest(parsed)
+  const flat = classification.flat
+  const nonce = classification.nonce
+  const isReviewer = classification.role === "reviewer"
+  const isWorker = classification.role === "worker"
 
   if (req.url?.startsWith("/v1/models")) {
     res.writeHead(200, { "content-type": "application/json" })
@@ -222,7 +269,22 @@ const server = http.createServer(async (req, res) => {
       textReply(res, "I think it is fine.\nVERDICT: MET deadbeefdead no matching nonce", REVIEWER_USAGE)
       return
     }
-    const met = REVIEWER_MODE === "met" || REVIEWER_MODE === "met_tool" || reviewCount > REVIEWER_NOT_MET_N
+    if (REVIEWER_MODE === "not_met_history" && reviewCount <= 2) {
+      const reason =
+        reviewCount === 1
+          ? "alpha evidence is missing from the authoritative state"
+          : "beta regression remains unresolved after the latest worker turn"
+      textReply(
+        res,
+        `Checked the transcript and current state.\nVERDICT: NOT_MET ${nonce} ${reason}`,
+        REVIEWER_USAGE,
+      )
+      return
+    }
+    const met =
+      ["met", "met_tool", "not_met_history", "turns", "interrupted", "cache-stable", "goal-events"].includes(
+        REVIEWER_MODE,
+      ) || reviewCount > REVIEWER_NOT_MET_N
     if (REVIEWER_MODE === "met_tool" || REVIEWER_MODE === "not_met_tool") {
       const verdictArguments = met
         ? '{"met": true, "summary": "tool verdict: objective verified against current state", "unmet": []}'
@@ -261,11 +323,73 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (!isWorker) {
+    log({ role: "auxiliary", mode: REVIEWER_MODE, url: req.url, body: parsed })
+    textReply(res, "Harness auxiliary request", { input: 10, output: 3 })
+    return
+  }
+
   workerCount += 1
-  log({ role: "worker", n: workerCount, url: req.url, body: parsed })
+  log({ role: "worker", mode: REVIEWER_MODE, n: workerCount, at: Date.now(), url: req.url, body: parsed })
+  if (REVIEWER_MODE === "interrupted" && workerCount === 1) {
+    res.writeHead(400, { "content-type": "application/json" })
+    res.end(JSON.stringify({ error: { message: "GOAL_HARNESS_PROVIDER_400" } }))
+    return
+  }
+  if (REVIEWER_MODE === "interrupted" && workerCount === 2) {
+    // A normal, finite stream with enough duration for drive.sh to snapshot the
+    // durable interrupted record before the clean turn clears it.
+    slowTextReply(req, res, "worker resumed after the provider error", 4_000)
+    return
+  }
+  if (["turns", "cache-stable"].includes(REVIEWER_MODE) && workerCount <= 2) {
+    toolReply(
+      res,
+      "glob",
+      { pattern: workerCount === 1 ? "script/goal-harness/*" : "script/subagent-harness/*" },
+      WORKER_USAGE,
+      `call_goal_glob_${workerCount}`,
+    )
+    return
+  }
   textReply(res, WORKER_TEXT, WORKER_USAGE)
 })
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`fake provider listening on http://127.0.0.1:${PORT}`)
-})
+if (process.env.CLASSIFIER_SELF_TEST === "1") {
+  const cases = [
+    {
+      name: "positive reviewer",
+      expected: "reviewer",
+      body: {
+        messages: [{ role: "system", content: "The verdict nonce for this review is nonce-positive-1." }],
+        tools: [{ type: "function", function: { name: "goal_verdict" } }],
+      },
+    },
+    {
+      name: "positive worker",
+      expected: "worker",
+      body: {
+        messages: [{ role: "system", content: "<active-goal>\nObjective: probe\n</active-goal>" }],
+        tools: [{ type: "function", function: { name: "goal" } }],
+      },
+    },
+    {
+      name: "generic-word control",
+      expected: "auxiliary",
+      body: {
+        messages: [{ role: "system", content: "Please summarize compact goal review history." }],
+        tools: [{ type: "function", function: { name: "goal" } }],
+      },
+    },
+  ]
+  const failed = cases.filter((item) => {
+    const actual = classifyRequest(item.body).role
+    console.log(`${actual === item.expected ? "ok" : "not ok"} ${item.name}: ${actual}`)
+    return actual !== item.expected
+  })
+  process.exit(failed.length ? 1 : 0)
+} else {
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`fake provider listening on http://127.0.0.1:${PORT}`)
+  })
+}

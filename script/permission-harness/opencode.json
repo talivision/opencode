@@ -1,0 +1,37 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "fake/fake-model",
+  "share": "disabled",
+  "autoupdate": false,
+  "permission_persist": true,
+  "permission": { "bash": "ask" },
+  "compaction": {
+    "auto": true,
+    "dynamic_output": true,
+    "output_floor": 1000,
+    "reserved": 1000
+  },
+  "provider": {
+    "fake": {
+      "name": "Fake",
+      "id": "fake",
+      "env": [],
+      "npm": "@ai-sdk/openai-compatible",
+      "models": {
+        "fake-model": {
+          "id": "fake-model",
+          "name": "Fake Model",
+          "attachment": false,
+          "reasoning": false,
+          "temperature": false,
+          "tool_call": true,
+          "release_date": "2025-01-01",
+          "limit": { "context": 12000, "output": 4000 },
+          "cost": { "input": 0, "output": 0 },
+          "options": {}
+        }
+      },
+      "options": { "apiKey": "fake-key", "baseURL": "http://127.0.0.1:4599/v1" }
+    }
+  }
+}
