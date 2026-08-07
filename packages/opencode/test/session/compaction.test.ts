@@ -1731,7 +1731,10 @@ describe("session.output-window", () => {
       tools: {
         big: {
           description: "d".repeat(4_000),
-          inputSchema: jsonSchema({ type: "object", properties: { q: { type: "string", description: "x".repeat(4_000) } } }),
+          inputSchema: jsonSchema({
+            type: "object",
+            properties: { q: { type: "string", description: "x".repeat(4_000) } },
+          }),
         } as any,
       },
     })
@@ -1799,9 +1802,9 @@ describe("session.output-window", () => {
     const cfg = cfgOf({ dynamic_output: false })
     // Old trigger: context - maxOutputTokens
     expect(usable({ cfg, model, outputTokenMax: 64_000 })).toBe(200_000 - 64_000)
-    expect(
-      requestedOutput({ model, estimatedInputTokens: 150_000, outputTokenMax: 64_000, dynamic: false }),
-    ).toBe(64_000)
+    expect(requestedOutput({ model, estimatedInputTokens: 150_000, outputTokenMax: 64_000, dynamic: false })).toBe(
+      64_000,
+    )
 
     const prepared = await Effect.runPromise(
       prepareRequest({ model, messages: [{ role: "user", content: "x".repeat(600_000) }], cfg }),

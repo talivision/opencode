@@ -153,9 +153,7 @@ export const TaskTool = Tool.define(
       // compaction, title, summary — none of which are built to be driven by
       // another model, and the reviewer of the worker's own goal least of all.
       if (next.mode === "primary" || next.hidden === true) {
-        return yield* Effect.fail(
-          new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`),
-        )
+        return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
       }
 
       const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(

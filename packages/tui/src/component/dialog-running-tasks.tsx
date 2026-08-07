@@ -28,20 +28,20 @@ export function DialogRunningTasks(props: { tasks: ToolPart[] }) {
   // disappeared. The pre-extraction version was reactive; this restores that.
   const tasks = createMemo(() =>
     props.tasks
-    .flatMap((part) => {
-      if (part.state.status === "pending") return []
-      const sessionID = part.state.metadata?.sessionId
-      if (typeof sessionID !== "string") return []
-      return [
-        {
-          sessionID,
-          title: sync.session.get(sessionID)?.title ?? taskDescription(part) ?? "Subagent",
-          modelID: typeof part.state.metadata?.modelID === "string" ? part.state.metadata.modelID : "unknown model",
-          start: part.state.time.start,
-        },
-      ]
-    })
-    .filter((task, index, all) => all.findIndex((item) => item.sessionID === task.sessionID) === index),
+      .flatMap((part) => {
+        if (part.state.status === "pending") return []
+        const sessionID = part.state.metadata?.sessionId
+        if (typeof sessionID !== "string") return []
+        return [
+          {
+            sessionID,
+            title: sync.session.get(sessionID)?.title ?? taskDescription(part) ?? "Subagent",
+            modelID: typeof part.state.metadata?.modelID === "string" ? part.state.metadata.modelID : "unknown model",
+            start: part.state.time.start,
+          },
+        ]
+      })
+      .filter((task, index, all) => all.findIndex((item) => item.sessionID === task.sessionID) === index),
   )
 
   const options = createMemo<DialogSelectOption<string>[]>(() =>

@@ -374,6 +374,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   const renderer = useRenderer()
   const dialog = useDialog()
   const local = useLocal()
+  const args = useArgs()
   const kv = useKV()
   const keymap = useOpencodeKeymap()
   const event = useEvent()
@@ -389,13 +390,39 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   const attention = createTuiAttention({ renderer, config: tuiConfig, kv })
   const clipboard = useClipboard()
   const permissionMode = {
-    get(_sessionID: string | undefined) {
+    get(sessionID: string | undefined) {
+      if (sessionID && sync.data.capabilities.permissionAuto) {
+        return sync.permissionAuto.get(sessionID)?.enabled ? "auto" : "normal"
+      }
       return local.permission.mode
     },
-    set(_sessionID: string | undefined, mode: PermissionMode) {
+    set(sessionID: string | undefined, mode: PermissionMode) {
+      if (sessionID && sync.data.capabilities.permissionAuto) {
+        const session = sync.session.get(sessionID)
+        void sync.permissionAuto
+          .set(sessionID, mode === "auto", {
+            directory: session?.directory,
+            workspace: session?.workspaceID,
+          })
+          .catch(toast.error)
+        return
+      }
       local.permission.set(mode)
     },
   }
+  const cliAutoSessions = new Set<string>()
+  createEffect(() => {
+    if (!args.auto || !sync.data.capabilities.permissionAuto || route.data.type !== "session") return
+    const session = sync.session.get(route.data.sessionID)
+    if (!session || cliAutoSessions.has(session.id)) return
+    cliAutoSessions.add(session.id)
+    void sync.permissionAuto
+      .set(session.id, true, { directory: session.directory, workspace: session.workspaceID })
+      .catch((error) => {
+        cliAutoSessions.delete(session.id)
+        toast.error(error)
+      })
+  })
   let lastAgent: string | undefined
 
   function currentSessionID() {
@@ -531,7 +558,6 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     }
   })
 
-  const args = useArgs()
   onMount(() => {
     batch(() => {
       if (args.agent) local.agent.set(args.agent)

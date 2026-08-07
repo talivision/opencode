@@ -102,8 +102,7 @@ export const GoalChecklistTool = define<typeof Parameters, Metadata, SessionGoal
           if (!updated?.requirements?.length) {
             return {
               title: "Checklist not recorded",
-              output:
-                "No running review names this session as its reviewer; the checklist was ignored. Do not retry.",
+              output: "No running review names this session as its reviewer; the checklist was ignored. Do not retry.",
               metadata: {},
             }
           }

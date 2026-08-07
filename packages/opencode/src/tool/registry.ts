@@ -331,8 +331,7 @@ const layer = Layer.effect(
         // native reviewer construction and never copied from user config —
         // config MAY rename a native agent, so keying on the name would let
         // any renamed native inherit the reviewer's tool surface.
-        if (REVIEWER_ONLY_TOOLS.has(tool.id))
-          return input.agent.goalReviewer === true && input.agent.native === true
+        if (REVIEWER_ONLY_TOOLS.has(tool.id)) return input.agent.goalReviewer === true && input.agent.native === true
 
         const usePatch =
           input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")

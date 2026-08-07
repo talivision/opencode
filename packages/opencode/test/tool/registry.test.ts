@@ -290,7 +290,14 @@ describe("tool.registry", () => {
       })).find((item) => item.id === "goal_transcript")
       if (!tool) throw new Error("goal_transcript was not exposed to the reviewer")
       const schema = ToolJsonSchema.fromTool(tool) as { properties?: Record<string, unknown> }
-      expect(Object.keys(schema.properties ?? {})).toEqual(["mode", "start_id", "end_id", "call_id", "query", "max_chars"])
+      expect(Object.keys(schema.properties ?? {})).toEqual([
+        "mode",
+        "start_id",
+        "end_id",
+        "call_id",
+        "query",
+        "max_chars",
+      ])
     }),
   )
 

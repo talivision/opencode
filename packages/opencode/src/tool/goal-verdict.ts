@@ -133,8 +133,7 @@ export const GoalVerdictTool = define<typeof Parameters, Metadata, SessionGoal.S
           if (updated?.review?.verdict === undefined) {
             return {
               title: "Verdict not recorded",
-              output:
-                "No running review names this session as its reviewer; the verdict was ignored. Do not retry.",
+              output: "No running review names this session as its reviewer; the verdict was ignored. Do not retry.",
               metadata: {},
             }
           }

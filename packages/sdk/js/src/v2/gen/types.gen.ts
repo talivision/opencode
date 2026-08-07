@@ -71,6 +71,7 @@ export type Event =
   | EventLspUpdated
   | EventPermissionAsked
   | EventPermissionReplied
+  | EventPermissionAutoChanged
   | EventTuiPromptAppend2
   | EventTuiCommandExecute2
   | EventTuiToastShow2
@@ -79,6 +80,9 @@ export type Event =
   | EventMcpBrowserOpenFailed
   | EventCommandExecuted
   | EventProjectUpdated
+  | EventSessionGoalCompleted
+  | EventSessionGoalBlocked
+  | EventSessionGoalPaused
   | EventSessionStatus
   | EventSessionIdle
   | EventQuestionAsked
@@ -1402,6 +1406,16 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "permission.auto.changed"
+        properties: {
+          sessionID: string
+          enabled: boolean
+          explicit: boolean
+          source?: string
+        }
+      }
+    | {
+        id: string
         type: "tui.prompt.append"
         properties: {
           text: string
@@ -1488,6 +1502,31 @@ export type GlobalEvent = {
           commands?: ProjectCommands
           time: ProjectTime
           sandboxes: Array<string>
+        }
+      }
+    | {
+        id: string
+        type: "session.goal.completed"
+        properties: {
+          sessionID: string
+        }
+      }
+    | {
+        id: string
+        type: "session.goal.blocked"
+        properties: {
+          sessionID: string
+          reason: string
+        }
+      }
+    | {
+        id: string
+        type: "session.goal.paused"
+        properties: {
+          sessionID: string
+          reason: "budget"
+          tokensUsed: number
+          tokenBudget: number
         }
       }
     | {
@@ -1996,6 +2035,7 @@ export type Config = {
   instructions?: Array<string>
   layout?: LayoutConfig
   permission?: PermissionConfig
+  permission_persist?: boolean
   tools?: {
     [key: string]: boolean
   }
@@ -2013,6 +2053,14 @@ export type Config = {
     tail_turns?: number
     preserve_recent_tokens?: number
     reserved?: number
+    output_floor?: number
+    dynamic_output?: boolean
+  }
+  goal?: {
+    review?: {
+      timeout?: number
+      max_duration?: number
+    }
   }
   experimental?: {
     disable_paste_summary?: boolean
@@ -2182,6 +2230,14 @@ export type WorktreeResetInput = {
   directory: string
 }
 
+export type BackgroundJobList = Array<{
+  id: string
+  sessionID: string
+  parentSessionID: string
+  status: "running" | "completed" | "error" | "cancelled"
+  title?: string
+}>
+
 export type ProjectSummary = {
   id: string
   name?: string
@@ -2348,6 +2404,7 @@ export type Agent = {
   description?: string
   mode: "subagent" | "primary" | "all"
   native?: boolean
+  goalReviewer?: boolean
   hidden?: boolean
   topP?: number
   temperature?: number
@@ -2482,6 +2539,18 @@ export type PermissionNotFoundError = {
   message: string
 }
 
+export type PermissionAutoStatus = {
+  enabled: boolean
+  explicit: boolean
+  source?: string
+}
+
+export type SessionNotFoundError = {
+  _tag: "SessionNotFoundError"
+  sessionID: string
+  message: string
+}
+
 export type ProviderAuthMethod = {
   type: "oauth" | "api"
   label: string
@@ -2555,7 +2624,19 @@ export type SessionGoal = {
     count: number
     turn: number
   }
+  interrupted?: {
+    reason: string
+    at: number
+    count: number
+  }
   pauseReason?: "user" | "budget"
+  requirements?: Array<{
+    id: string
+    text: string
+    status: "unverified" | "met" | "unmet"
+    evidence?: string
+    attempt: number
+  }>
   review?: {
     status: "pending" | "running" | "accepted" | "rejected" | "error"
     attempt: number
@@ -2564,6 +2645,29 @@ export type SessionGoal = {
     evidence?: string
     reason?: string
     reviewerSessionID?: string
+    errorStreak?: number
+    verdict?: {
+      met: boolean
+      summary: string
+      unmet?: Array<{
+        requirement: string
+        evidence: string
+      }>
+      at: number
+    }
+    history?: Array<{
+      attempt: number
+      reason: string
+      at: number
+    }>
+    attemptStats?: Array<{
+      attempt: number
+      inputTokens: number
+      cacheReadTokens: number
+      outputTokens: number
+      retrievalCalls: number
+      durationMs: number
+    }>
   }
   time: {
     created: number
@@ -2724,12 +2828,6 @@ export type InvalidCursorError = {
 
 export type SessionActive = {
   type: "running"
-}
-
-export type SessionNotFoundError = {
-  _tag: "SessionNotFoundError"
-  sessionID: string
-  message: string
 }
 
 export type PromptInput = {
@@ -2946,6 +3044,7 @@ export type V2Event =
   | LspUpdated
   | PermissionAsked
   | PermissionReplied
+  | PermissionAutoChanged
   | TuiPromptAppend
   | TuiCommandExecute
   | TuiToastShow
@@ -2954,6 +3053,9 @@ export type V2Event =
   | McpBrowserOpenFailed
   | CommandExecuted
   | ProjectUpdated
+  | SessionGoalCompleted
+  | SessionGoalBlocked
+  | SessionGoalPaused
   | SessionStatus2
   | SessionIdle
   | QuestionAsked
@@ -5767,6 +5869,26 @@ export type PermissionReplied = {
   }
 }
 
+export type PermissionAutoChanged = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "permission.auto.changed"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    enabled: boolean
+    explicit: boolean
+    source?: string
+  }
+}
+
 export type TuiPromptAppend = {
   id: string
   metadata?: {
@@ -5934,6 +6056,61 @@ export type ProjectUpdated = {
     commands?: ProjectCommands
     time: ProjectTime
     sandboxes: Array<string>
+  }
+}
+
+export type SessionGoalCompleted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.goal.completed"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+  }
+}
+
+export type SessionGoalBlocked = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.goal.blocked"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    reason: string
+  }
+}
+
+export type SessionGoalPaused = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.goal.paused"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    reason: "budget"
+    tokensUsed: number
+    tokenBudget: number
   }
 }
 
@@ -6912,6 +7089,17 @@ export type EventPermissionReplied = {
   }
 }
 
+export type EventPermissionAutoChanged = {
+  id: string
+  type: "permission.auto.changed"
+  properties: {
+    sessionID: string
+    enabled: boolean
+    explicit: boolean
+    source?: string
+  }
+}
+
 export type EventMcpToolsChanged = {
   id: string
   type: "mcp.tools.changed"
@@ -6952,6 +7140,34 @@ export type EventProjectUpdated = {
     commands?: ProjectCommands
     time: ProjectTime
     sandboxes: Array<string>
+  }
+}
+
+export type EventSessionGoalCompleted = {
+  id: string
+  type: "session.goal.completed"
+  properties: {
+    sessionID: string
+  }
+}
+
+export type EventSessionGoalBlocked = {
+  id: string
+  type: "session.goal.blocked"
+  properties: {
+    sessionID: string
+    reason: string
+  }
+}
+
+export type EventSessionGoalPaused = {
+  id: string
+  type: "session.goal.paused"
+  properties: {
+    sessionID: string
+    reason: "budget"
+    tokensUsed: number
+    tokenBudget: number
   }
 }
 
@@ -7818,6 +8034,37 @@ export type WorktreeResetResponses = {
 }
 
 export type WorktreeResetResponse = WorktreeResetResponses[keyof WorktreeResetResponses]
+
+export type ExperimentalBackgroundJobListData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+    parentSessionId?: string
+  }
+  url: "/experimental/background-job"
+}
+
+export type ExperimentalBackgroundJobListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ExperimentalBackgroundJobListError =
+  ExperimentalBackgroundJobListErrors[keyof ExperimentalBackgroundJobListErrors]
+
+export type ExperimentalBackgroundJobListResponses = {
+  /**
+   * List of live background jobs
+   */
+  200: BackgroundJobList
+}
+
+export type ExperimentalBackgroundJobListResponse =
+  ExperimentalBackgroundJobListResponses[keyof ExperimentalBackgroundJobListResponses]
 
 export type ExperimentalSessionListData = {
   body?: never
@@ -9325,6 +9572,165 @@ export type PermissionReplyResponses = {
 }
 
 export type PermissionReplyResponse = PermissionReplyResponses[keyof PermissionReplyResponses]
+
+export type PermissionSetAutoData = {
+  body?: {
+    sessionID: string
+    enabled: boolean
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/permission/auto"
+}
+
+export type PermissionSetAutoErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+}
+
+export type PermissionSetAutoError = PermissionSetAutoErrors[keyof PermissionSetAutoErrors]
+
+export type PermissionSetAutoResponses = {
+  /**
+   * Resulting auto-mode status
+   */
+  200: PermissionAutoStatus
+}
+
+export type PermissionSetAutoResponse = PermissionSetAutoResponses[keyof PermissionSetAutoResponses]
+
+export type PermissionGetAutoData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/permission/auto/{sessionID}"
+}
+
+export type PermissionGetAutoErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PermissionGetAutoError = PermissionGetAutoErrors[keyof PermissionGetAutoErrors]
+
+export type PermissionGetAutoResponses = {
+  /**
+   * Effective auto-mode status for the session
+   */
+  200: PermissionAutoStatus
+}
+
+export type PermissionGetAutoResponse = PermissionGetAutoResponses[keyof PermissionGetAutoResponses]
+
+export type PermissionAutoLogData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/permission/auto-log"
+}
+
+export type PermissionAutoLogErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PermissionAutoLogError = PermissionAutoLogErrors[keyof PermissionAutoLogErrors]
+
+export type PermissionAutoLogResponses = {
+  /**
+   * Audit trail of auto-approved permissions
+   */
+  200: Array<{
+    sessionID: string
+    permission: string
+    pattern: string
+    time: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    last?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    count?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }>
+}
+
+export type PermissionAutoLogResponse = PermissionAutoLogResponses[keyof PermissionAutoLogResponses]
+
+export type PermissionGrantsData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/permission/grant"
+}
+
+export type PermissionGrantsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PermissionGrantsError = PermissionGrantsErrors[keyof PermissionGrantsErrors]
+
+export type PermissionGrantsResponses = {
+  /**
+   * Runtime permission grants in effect
+   */
+  200: Array<PermissionRule>
+}
+
+export type PermissionGrantsResponse = PermissionGrantsResponses[keyof PermissionGrantsResponses]
+
+export type PermissionRevokeData = {
+  body?: {
+    permission?: string
+    pattern?: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/permission/grant/revoke"
+}
+
+export type PermissionRevokeErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PermissionRevokeError = PermissionRevokeErrors[keyof PermissionRevokeErrors]
+
+export type PermissionRevokeResponses = {
+  /**
+   * Number of grants removed
+   */
+  200: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type PermissionRevokeResponse = PermissionRevokeResponses[keyof PermissionRevokeResponses]
 
 export type ProviderListData = {
   body?: never

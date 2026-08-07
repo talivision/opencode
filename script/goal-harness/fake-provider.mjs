@@ -115,7 +115,7 @@ const server = http.createServer(async (req, res) => {
     const sawChecklist = flat.includes("Checklist recorded")
     const sawTranscript = flat.includes("untrusted-parent-transcript")
     const sawVerdict = flat.includes("Verdict recorded")
-    const isFirstStep = !flat.includes("\"tool_call_id\"") && !flat.includes("\"role\":\"tool\"")
+    const isFirstStep = !flat.includes('"tool_call_id"') && !flat.includes('"role":"tool"')
     if (isFirstStep) reviewCount += 1
     log({ role: "reviewer", mode: "retrieval", n: reviewCount, nonce, url: req.url, body: parsed })
     if (sawVerdict) {
@@ -162,7 +162,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (isReviewer) {
-    if (flat.includes("\"tool_call_id\"") || flat.includes("\"role\":\"tool\"")) {
+    if (flat.includes('"tool_call_id"') || flat.includes('"role":"tool"')) {
       log({ role: "reviewer", n: reviewCount, nonce, url: req.url, body: parsed })
       textReply(res, "Verdict submitted.", { input: 100, output: 3 })
       return
@@ -208,7 +208,9 @@ const server = http.createServer(async (req, res) => {
           return
         }
         clearInterval(timer)
-        res.write(`data: ${JSON.stringify(chunk({ delta: { content: `VERDICT: MET ${nonce} slow but verified` } }))}\n\n`)
+        res.write(
+          `data: ${JSON.stringify(chunk({ delta: { content: `VERDICT: MET ${nonce} slow but verified` } }))}\n\n`,
+        )
         res.write(`data: ${JSON.stringify(chunk({ finish: "stop", usage: REVIEWER_USAGE }))}\n\n`)
         res.write("data: [DONE]\n\n")
         res.end()
@@ -223,8 +225,8 @@ const server = http.createServer(async (req, res) => {
     const met = REVIEWER_MODE === "met" || REVIEWER_MODE === "met_tool" || reviewCount > REVIEWER_NOT_MET_N
     if (REVIEWER_MODE === "met_tool" || REVIEWER_MODE === "not_met_tool") {
       const verdictArguments = met
-        ? "{\"met\": true, \"summary\": \"tool verdict: objective verified against current state\", \"unmet\": []}"
-        : "{\"met\": false, \"summary\": \"tool verdict: not yet met\", \"unmet\": [{\"requirement\": \"say lima twice\", \"evidence\": \"only one lima found in the transcript\"}]}"
+        ? '{"met": true, "summary": "tool verdict: objective verified against current state", "unmet": []}'
+        : '{"met": false, "summary": "tool verdict: not yet met", "unmet": [{"requirement": "say lima twice", "evidence": "only one lima found in the transcript"}]}'
       const split = Math.ceil(verdictArguments.length / 2)
       sse(res, [
         chunk({ delta: { role: "assistant" } }),

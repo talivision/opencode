@@ -411,9 +411,9 @@ const layer = Layer.effect(
         // edit or a wider read scope, which merging user rules wholesale would
         // allow. Same asymmetry as runtime grants, which may only upgrade
         // ask->allow: config may only downgrade toward deny.
-        const reviewerUserRules = Permission.fromConfig(
-          cfg.agent?.["goal-reviewer"]?.permission ?? {},
-        ).filter((rule) => rule.action !== "allow")
+        const reviewerUserRules = Permission.fromConfig(cfg.agent?.["goal-reviewer"]?.permission ?? {}).filter(
+          (rule) => rule.action !== "allow",
+        )
         reviewer.permission = Permission.merge(
           reviewer.permission,
           Permission.fromConfig({

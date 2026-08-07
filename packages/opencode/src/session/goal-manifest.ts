@@ -279,7 +279,8 @@ export function slice(
     .slice(startIndex, endIndex + 1)
     .map(renderMessage)
     .filter((value): value is string => value !== undefined)
-  if (!rendered.length) return { ok: true, text: "(the requested range contains no text or tool content)", truncated: false }
+  if (!rendered.length)
+    return { ok: true, text: "(the requested range contains no text or tool content)", truncated: false }
   const text = rendered.join("\n\n")
   if (text.length <= limit) return { ok: true, text, truncated: false }
   return {
@@ -290,10 +291,7 @@ export function slice(
 }
 
 /** One tool call in full: its input and its result. */
-export function toolCall(
-  messages: SessionV1.WithParts[],
-  params: { callID: string; maxChars?: number },
-): Retrieval {
+export function toolCall(messages: SessionV1.WithParts[], params: { callID: string; maxChars?: number }): Retrieval {
   const limit = clampChars(params.maxChars)
   for (const message of messages) {
     for (const part of message.parts) {

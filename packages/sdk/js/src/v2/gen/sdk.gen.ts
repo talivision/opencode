@@ -29,6 +29,8 @@ import type {
   EventTuiPromptAppend,
   EventTuiSessionSelect,
   EventTuiToastShow,
+  ExperimentalBackgroundJobListErrors,
+  ExperimentalBackgroundJobListResponses,
   ExperimentalCapabilitiesGetErrors,
   ExperimentalCapabilitiesGetResponses,
   ExperimentalConsoleGetErrors,
@@ -121,13 +123,23 @@ import type {
   PartUpdateResponses,
   PathGetErrors,
   PathGetResponses,
+  PermissionAutoLogErrors,
+  PermissionAutoLogResponses,
+  PermissionGetAutoErrors,
+  PermissionGetAutoResponses,
+  PermissionGrantsErrors,
+  PermissionGrantsResponses,
   PermissionListErrors,
   PermissionListResponses,
   PermissionReplyErrors,
   PermissionReplyResponses,
   PermissionRespondErrors,
   PermissionRespondResponses,
+  PermissionRevokeErrors,
+  PermissionRevokeResponses,
   PermissionRuleset,
+  PermissionSetAutoErrors,
+  PermissionSetAutoResponses,
   PermissionV2Reply,
   PermissionV2Source,
   ProjectCommands,
@@ -810,6 +822,44 @@ export class Console extends HeyApiClient {
   }
 }
 
+export class BackgroundJob extends HeyApiClient {
+  /**
+   * List background jobs
+   *
+   * List live background jobs, optionally filtered by their parent session.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      parentSessionId?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "parentSessionId" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      ExperimentalBackgroundJobListResponses,
+      ExperimentalBackgroundJobListErrors,
+      ThrowOnError
+    >({
+      url: "/experimental/background-job",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Session extends HeyApiClient {
   /**
    * List sessions
@@ -1262,6 +1312,11 @@ export class Experimental extends HeyApiClient {
   private _console?: Console
   get console(): Console {
     return (this._console ??= new Console({ client: this.client }))
+  }
+
+  private _backgroundJob?: BackgroundJob
+  get backgroundJob(): BackgroundJob {
+    return (this._backgroundJob ??= new BackgroundJob({ client: this.client }))
   }
 
   private _session?: Session
@@ -3154,6 +3209,176 @@ export class Permission extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<PermissionReplyResponses, PermissionReplyErrors, ThrowOnError>({
       url: "/permission/{requestID}/reply",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Toggle permission auto mode for a session
+   *
+   * Turn auto mode on or off for a session. The session must exist. Descendant sessions (subagents) inherit it, requests already pending in the session tree are released, and explicit deny rules are still enforced. Emits permission.auto.changed.
+   */
+  public setAuto<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      sessionID?: string
+      enabled?: boolean
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "sessionID" },
+            { in: "body", key: "enabled" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<PermissionSetAutoResponses, PermissionSetAutoErrors, ThrowOnError>({
+      url: "/permission/auto",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get permission auto mode for a session
+   *
+   * Effective auto-mode status, resolving inheritance from ancestor sessions.
+   */
+  public getAuto<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<PermissionGetAutoResponses, PermissionGetAutoErrors, ThrowOnError>({
+      url: "/permission/auto/{sessionID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * List auto-approved permissions
+   *
+   * Audit trail of everything auto mode approved without asking, for after-the-fact review.
+   */
+  public autoLog<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<PermissionAutoLogResponses, PermissionAutoLogErrors, ThrowOnError>({
+      url: "/permission/auto-log",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * List permission grants
+   *
+   * Grants produced by answering "always", including the ones restored from the project store.
+   */
+  public grants<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<PermissionGrantsResponses, PermissionGrantsErrors, ThrowOnError>({
+      url: "/permission/grant",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Revoke permission grants
+   *
+   * Remove runtime grants matching permission and/or pattern (omit both to remove all) from memory and from the project store.
+   */
+  public revoke<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      permission?: string
+      pattern?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "permission" },
+            { in: "body", key: "pattern" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<PermissionRevokeResponses, PermissionRevokeErrors, ThrowOnError>({
+      url: "/permission/grant/revoke",
       ...options,
       ...params,
       headers: {

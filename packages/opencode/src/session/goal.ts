@@ -464,9 +464,7 @@ const layer = Layer.effect(
       })
     })
 
-    const recordRequirements = Effect.fn("SessionGoal.recordRequirements")(function* (
-      input: RecordRequirementsInput,
-    ) {
+    const recordRequirements = Effect.fn("SessionGoal.recordRequirements")(function* (input: RecordRequirementsInput) {
       return yield* update(input.sessionID, (draft, now) => {
         // Same gate as submitVerdict: only the reviewer session named by the
         // running review may write, and only once per goal.

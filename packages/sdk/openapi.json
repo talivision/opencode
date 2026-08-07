@@ -1500,6 +1500,69 @@
         ]
       }
     },
+    "/experimental/background-job": {
+      "get": {
+        "tags": ["experimental"],
+        "operationId": "experimental.backgroundJob.list",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "parentSessionId",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of live background jobs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackgroundJobList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "List live background jobs, optionally filtered by their parent session.",
+        "summary": "List background jobs",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.experimental.backgroundJob.list({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/experimental/session": {
       "get": {
         "tags": ["experimental"],
@@ -4970,6 +5033,444 @@
         ]
       }
     },
+    "/permission/auto": {
+      "post": {
+        "tags": ["permission"],
+        "operationId": "permission.setAuto",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resulting auto-mode status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionAutoStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Turn auto mode on or off for a session. The session must exist. Descendant sessions (subagents) inherit it, requests already pending in the session tree are released, and explicit deny rules are still enforced. Emits permission.auto.changed.",
+        "summary": "Toggle permission auto mode for a session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "sessionID": {
+                    "type": "string",
+                    "pattern": "^ses"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  }
+                },
+                "required": ["sessionID", "enabled"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.permission.setAuto({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/permission/auto/{sessionID}": {
+      "get": {
+        "tags": ["permission"],
+        "operationId": "permission.getAuto",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Effective auto-mode status for the session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionAutoStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Effective auto-mode status, resolving inheritance from ancestor sessions.",
+        "summary": "Get permission auto mode for a session",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.permission.getAuto({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/permission/auto-log": {
+      "get": {
+        "tags": ["permission"],
+        "operationId": "permission.autoLog",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit trail of auto-approved permissions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "permission": {
+                        "type": "string"
+                      },
+                      "pattern": {
+                        "type": "string"
+                      },
+                      "time": {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["NaN"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["Infinity"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["-Infinity"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["Infinity", "-Infinity", "NaN"]
+                          }
+                        ]
+                      },
+                      "last": {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["NaN"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["Infinity"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["-Infinity"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["Infinity", "-Infinity", "NaN"]
+                          }
+                        ]
+                      },
+                      "count": {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["NaN"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["Infinity"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["-Infinity"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["Infinity", "-Infinity", "NaN"]
+                          }
+                        ]
+                      }
+                    },
+                    "required": ["sessionID", "permission", "pattern", "time"],
+                    "additionalProperties": false
+                  },
+                  "description": "Audit trail of auto-approved permissions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Audit trail of everything auto mode approved without asking, for after-the-fact review.",
+        "summary": "List auto-approved permissions",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.permission.autoLog({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/permission/grant": {
+      "get": {
+        "tags": ["permission"],
+        "operationId": "permission.grants",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Runtime permission grants in effect",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PermissionRule"
+                  },
+                  "description": "Runtime permission grants in effect"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Grants produced by answering \"always\", including the ones restored from the project store.",
+        "summary": "List permission grants",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.permission.grants({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/permission/grant/revoke": {
+      "post": {
+        "tags": ["permission"],
+        "operationId": "permission.revoke",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Number of grants removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string",
+                      "enum": ["NaN"]
+                    },
+                    {
+                      "type": "string",
+                      "enum": ["Infinity"]
+                    },
+                    {
+                      "type": "string",
+                      "enum": ["-Infinity"]
+                    },
+                    {
+                      "type": "string",
+                      "enum": ["Infinity", "-Infinity", "NaN"]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Remove runtime grants matching permission and/or pattern (omit both to remove all) from memory and from the project store.",
+        "summary": "Revoke permission grants",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "permission": {
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.permission.revoke({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/provider": {
       "get": {
         "tags": ["provider"],
@@ -6266,6 +6767,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -6731,6 +7235,391 @@
         ]
       }
     },
+    "/session/{sessionID}/goal": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "session.goal.get",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current long-running goal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionGoal"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Retrieve the durable long-running goal and its lifecycle, usage, and timing state.",
+        "summary": "Get session goal",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.goal.get({\n  ...\n})"
+          }
+        ]
+      },
+      "put": {
+        "tags": ["session"],
+        "operationId": "session.goal.set",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Goal created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionGoal"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Create or replace a durable long-running goal and activate autonomous pursuit.",
+        "summary": "Set session goal",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "objective": {
+                    "type": "string"
+                  },
+                  "tokenBudget": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.goal.set({\n  ...\n})"
+          }
+        ]
+      },
+      "patch": {
+        "tags": ["session"],
+        "operationId": "session.goal.action",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Goal updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionGoal"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Edit, pause, or resume the current long-running goal.",
+        "summary": "Update session goal",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "action": {
+                        "type": "string",
+                        "enum": ["edit"]
+                      },
+                      "objective": {
+                        "type": "string"
+                      },
+                      "tokenBudget": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0
+                      }
+                    },
+                    "required": ["action", "objective"],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "action": {
+                        "type": "string",
+                        "enum": ["pause"]
+                      }
+                    },
+                    "required": ["action"],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "action": {
+                        "type": "string",
+                        "enum": ["resume"]
+                      }
+                    },
+                    "required": ["action"],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.goal.action({\n  ...\n})"
+          }
+        ]
+      },
+      "delete": {
+        "tags": ["session"],
+        "operationId": "session.goal.clear",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Goal cleared",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "boolean",
+                  "description": "Goal cleared"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Stop autonomous pursuit and remove durable goal state while preserving transcript history.",
+        "summary": "Clear session goal",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.goal.clear({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/session/{sessionID}/init": {
       "post": {
         "tags": ["session"],
@@ -7148,6 +8037,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -7307,6 +8199,9 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
                     },
                     {
                       "$ref": "#/components/schemas/InvalidRequestError"
@@ -15461,6 +16356,9 @@
             "$ref": "#/components/schemas/EventPermissionReplied"
           },
           {
+            "$ref": "#/components/schemas/EventPermissionAutoChanged"
+          },
+          {
             "$ref": "#/components/schemas/Event.tui.prompt.append"
           },
           {
@@ -15483,6 +16381,15 @@
           },
           {
             "$ref": "#/components/schemas/EventProjectUpdated"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionGoalCompleted"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionGoalBlocked"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionGoalPaused"
           },
           {
             "$ref": "#/components/schemas/EventSessionStatus"
@@ -19769,6 +20676,42 @@
                   },
                   "type": {
                     "type": "string",
+                    "enum": ["permission.auto.changed"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "explicit": {
+                        "type": "boolean"
+                      },
+                      "source": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      }
+                    },
+                    "required": ["sessionID", "enabled", "explicit"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
                     "enum": ["tui.prompt.append"]
                   },
                   "properties": {
@@ -20030,6 +20973,99 @@
                       }
                     },
                     "required": ["id", "worktree", "time", "sandboxes"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.goal.completed"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      }
+                    },
+                    "required": ["sessionID"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.goal.blocked"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "reason": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["sessionID", "reason"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.goal.paused"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "reason": {
+                        "type": "string",
+                        "enum": ["budget"]
+                      },
+                      "tokensUsed": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "tokenBudget": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": ["sessionID", "reason", "tokensUsed", "tokenBudget"],
                     "additionalProperties": false
                   }
                 },
@@ -21452,6 +22488,9 @@
           "permission": {
             "$ref": "#/components/schemas/PermissionConfig"
           },
+          "permission_persist": {
+            "type": "boolean"
+          },
           "tools": {
             "type": "object",
             "additionalProperties": {
@@ -21504,6 +22543,33 @@
               "reserved": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "output_floor": {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              "dynamic_output": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          },
+          "goal": {
+            "type": "object",
+            "properties": {
+              "review": {
+                "type": "object",
+                "properties": {
+                  "timeout": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  },
+                  "max_duration": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                },
+                "additionalProperties": false
               }
             },
             "additionalProperties": false
@@ -21985,6 +23051,32 @@
         },
         "required": ["directory"],
         "additionalProperties": false
+      },
+      "BackgroundJobList": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "sessionID": {
+              "type": "string"
+            },
+            "parentSessionID": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "enum": ["running", "completed", "error", "cancelled"]
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": ["id", "sessionID", "parentSessionID", "status"],
+          "additionalProperties": false
+        }
       },
       "ProjectSummary": {
         "type": "object",
@@ -22506,6 +23598,9 @@
           "native": {
             "type": "boolean"
           },
+          "goalReviewer": {
+            "type": "boolean"
+          },
           "hidden": {
             "type": "boolean"
           },
@@ -22883,6 +23978,40 @@
         "required": ["_tag", "requestID", "message"],
         "additionalProperties": false
       },
+      "PermissionAutoStatus": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "explicit": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string",
+            "pattern": "^ses"
+          }
+        },
+        "required": ["enabled", "explicit"],
+        "additionalProperties": false
+      },
+      "SessionNotFoundError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["SessionNotFoundError"]
+          },
+          "sessionID": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "sessionID", "message"],
+        "additionalProperties": false
+      },
       "ProviderAuthMethod": {
         "type": "object",
         "properties": {
@@ -23064,6 +24193,262 @@
             }
           }
         }
+      },
+      "SessionGoal": {
+        "type": "object",
+        "properties": {
+          "sessionID": {
+            "type": "string",
+            "pattern": "^ses"
+          },
+          "objective": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["active", "paused", "complete", "blocked"]
+          },
+          "tokenBudget": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "tokensUsed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "turns": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "blocker": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "turn": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": ["reason", "count", "turn"],
+            "additionalProperties": false
+          },
+          "interrupted": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "at": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": ["reason", "at", "count"],
+            "additionalProperties": false
+          },
+          "pauseReason": {
+            "type": "string",
+            "enum": ["user", "budget"]
+          },
+          "requirements": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": ["unverified", "met", "unmet"]
+                },
+                "evidence": {
+                  "type": "string"
+                },
+                "attempt": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": ["id", "text", "status", "attempt"],
+              "additionalProperties": false
+            }
+          },
+          "review": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": ["pending", "running", "accepted", "rejected", "error"]
+              },
+              "attempt": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "requestedAt": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "updatedAt": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "evidence": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "reviewerSessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "errorStreak": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "verdict": {
+                "type": "object",
+                "properties": {
+                  "met": {
+                    "type": "boolean"
+                  },
+                  "summary": {
+                    "type": "string"
+                  },
+                  "unmet": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "requirement": {
+                          "type": "string"
+                        },
+                        "evidence": {
+                          "type": "string"
+                        }
+                      },
+                      "required": ["requirement", "evidence"],
+                      "additionalProperties": false
+                    }
+                  },
+                  "at": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "required": ["met", "summary", "at"],
+                "additionalProperties": false
+              },
+              "history": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "attempt": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "at": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": ["attempt", "reason", "at"],
+                  "additionalProperties": false
+                }
+              },
+              "attemptStats": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "attempt": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "inputTokens": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "cacheReadTokens": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "outputTokens": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "retrievalCalls": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "durationMs": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "attempt",
+                    "inputTokens",
+                    "cacheReadTokens",
+                    "outputTokens",
+                    "retrievalCalls",
+                    "durationMs"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": ["status", "attempt", "requestedAt", "updatedAt"],
+            "additionalProperties": false
+          },
+          "time": {
+            "type": "object",
+            "properties": {
+              "created": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "updated": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "running": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "elapsed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "completed": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": ["created", "updated", "elapsed"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["sessionID", "objective", "status", "tokensUsed", "turns", "time"],
+        "additionalProperties": false
       },
       "TextPartInput": {
         "type": "object",
@@ -23524,23 +24909,6 @@
           }
         },
         "required": ["type"],
-        "additionalProperties": false
-      },
-      "SessionNotFoundError": {
-        "type": "object",
-        "properties": {
-          "_tag": {
-            "type": "string",
-            "enum": ["SessionNotFoundError"]
-          },
-          "sessionID": {
-            "type": "string"
-          },
-          "message": {
-            "type": "string"
-          }
-        },
-        "required": ["_tag", "sessionID", "message"],
         "additionalProperties": false
       },
       "PromptInput": {
@@ -24184,6 +25552,9 @@
             "$ref": "#/components/schemas/PermissionReplied"
           },
           {
+            "$ref": "#/components/schemas/PermissionAutoChanged"
+          },
+          {
             "$ref": "#/components/schemas/TuiPromptAppend"
           },
           {
@@ -24206,6 +25577,15 @@
           },
           {
             "$ref": "#/components/schemas/ProjectUpdated"
+          },
+          {
+            "$ref": "#/components/schemas/SessionGoalCompleted"
+          },
+          {
+            "$ref": "#/components/schemas/SessionGoalBlocked"
+          },
+          {
+            "$ref": "#/components/schemas/SessionGoalPaused"
           },
           {
             "$ref": "#/components/schemas/session.status"
@@ -32702,6 +34082,64 @@
         "required": ["id", "type", "data"],
         "additionalProperties": false
       },
+      "PermissionAutoChanged": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["permission.auto.changed"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "explicit": {
+                "type": "boolean"
+              },
+              "source": {
+                "type": "string",
+                "pattern": "^ses"
+              }
+            },
+            "required": ["sessionID", "enabled", "explicit"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
       "TuiPromptAppend": {
         "type": "object",
         "properties": {
@@ -33148,6 +34586,165 @@
               }
             },
             "required": ["id", "worktree", "time", "sandboxes"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
+      "SessionGoalCompleted": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.goal.completed"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              }
+            },
+            "required": ["sessionID"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
+      "SessionGoalBlocked": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.goal.blocked"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": ["sessionID", "reason"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
+      "SessionGoalPaused": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.goal.paused"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "reason": {
+                "type": "string",
+                "enum": ["budget"]
+              },
+              "tokensUsed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "tokenBudget": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": ["sessionID", "reason", "tokensUsed", "tokenBudget"],
             "additionalProperties": false
           }
         },
@@ -36143,6 +37740,42 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
+      "EventPermissionAutoChanged": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["permission.auto.changed"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "explicit": {
+                "type": "boolean"
+              },
+              "source": {
+                "type": "string",
+                "pattern": "^ses"
+              }
+            },
+            "required": ["sessionID", "enabled", "explicit"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
       "EventMcpToolsChanged": {
         "type": "object",
         "properties": {
@@ -36275,6 +37908,99 @@
               }
             },
             "required": ["id", "worktree", "time", "sandboxes"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionGoalCompleted": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.goal.completed"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              }
+            },
+            "required": ["sessionID"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionGoalBlocked": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.goal.blocked"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": ["sessionID", "reason"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionGoalPaused": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.goal.paused"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "reason": {
+                "type": "string",
+                "enum": ["budget"]
+              },
+              "tokensUsed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "tokenBudget": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": ["sessionID", "reason", "tokensUsed", "tokenBudget"],
             "additionalProperties": false
           }
         },

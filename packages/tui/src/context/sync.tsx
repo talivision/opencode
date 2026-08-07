@@ -19,6 +19,7 @@ import type {
   VcsInfo,
   SnapshotFileDiff,
   ConsoleState,
+  PermissionAutoStatus,
 } from "@opencode-ai/sdk/v2"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "./project"
@@ -69,12 +70,16 @@ export const {
       console_state: ConsoleState
       capabilities: {
         experimentalBackgroundSubagents: boolean
+        permissionAuto: boolean
       }
       provider_auth: Record<string, ProviderAuthMethod[]>
       agent: Agent[]
       command: Command[]
       permission: {
         [sessionID: string]: PermissionRequest[]
+      }
+      permission_auto: {
+        [sessionID: string]: PermissionAutoStatus
       }
       question: {
         [sessionID: string]: QuestionRequest[]
@@ -114,12 +119,14 @@ export const {
       console_state: emptyConsoleState,
       capabilities: {
         experimentalBackgroundSubagents: false,
+        permissionAuto: false,
       },
       provider_auth: {},
       config: {},
       status: "loading",
       agent: [],
       permission: {},
+      permission_auto: {},
       question: {},
       command: [],
       provider: [],
@@ -143,6 +150,8 @@ export const {
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
+    const permissionAutoWrites = new Map<string, Promise<void>>()
+    const permissionAutoVersions = new Map<string, number>()
     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
     const touchMessage = (sessionID: string, messageID: string) => {
       hydratingSessions.get(sessionID)?.messages.add(messageID)
@@ -167,6 +176,26 @@ export const {
         .then((x) => (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)))
     }
 
+    function syncPermissionAuto(sessionID: string, routing: { directory?: string; workspace?: string } = {}) {
+      return sdk.client.permission.getAuto({ sessionID, ...routing }, { throwOnError: true }).then((response) => {
+        if (!permissionAutoWrites.has(sessionID)) {
+          setStore("permission_auto", sessionID, reconcile(response.data))
+        }
+        return response.data
+      })
+    }
+
+    function isDescendant(sessionID: string, ancestorID: string) {
+      const seen = new Set<string>()
+      let current = store.session.find((session) => session.id === sessionID)
+      while (current?.parentID && !seen.has(current.parentID)) {
+        if (current.parentID === ancestorID) return true
+        seen.add(current.parentID)
+        current = store.session.find((session) => session.id === current?.parentID)
+      }
+      return false
+    }
+
     event.subscribe((event, { directory, workspace }) => {
       switch (event.type) {
         case "server.instance.disposed":
@@ -187,9 +216,25 @@ export const {
           break
         }
 
+        case "permission.auto.changed": {
+          setStore("capabilities", "permissionAuto", true)
+          if (!permissionAutoWrites.has(event.properties.sessionID)) {
+            setStore("permission_auto", event.properties.sessionID, reconcile(event.properties))
+          }
+          Object.keys(store.permission_auto)
+            .filter(
+              (sessionID) =>
+                sessionID !== event.properties.sessionID && isDescendant(sessionID, event.properties.sessionID),
+            )
+            .forEach((sessionID) => {
+              void syncPermissionAuto(sessionID, { directory, workspace }).catch(() => {})
+            })
+          break
+        }
+
         case "permission.asked": {
           const request = event.properties
-          if (permission.mode === "auto") {
+          if (!store.capabilities.permissionAuto && permission.mode === "auto") {
             void sdk.client.permission.reply({
               requestID: request.id,
               reply: "once",
@@ -274,6 +319,12 @@ export const {
               }),
             )
           }
+          setStore(
+            "permission_auto",
+            produce((draft) => {
+              delete draft[event.properties.info.id]
+            }),
+          )
           break
         }
         case "session.updated": {
@@ -455,6 +506,12 @@ export const {
         .get({ workspace }, { throwOnError: true })
         .then((x) => x.data)
         .catch(() => undefined)
+      // getAuto intentionally resolves a missing session as disabled, making this
+      // a side-effect-free feature probe while older servers answer with 404.
+      const permissionAutoCapabilityPromise = sdk.client.permission
+        .getAuto({ sessionID: "ses_permission_auto_capability", workspace }, { throwOnError: true })
+        .then(() => true)
+        .catch(() => false)
       const consoleStatePromise = sdk.client.experimental.console
         .get({ workspace }, { throwOnError: true })
         .then((x) => x.data)
@@ -465,6 +522,7 @@ export const {
         providersPromise,
         providerListPromise,
         capabilitiesPromise,
+        permissionAutoCapabilityPromise,
         agentsPromise,
         configPromise,
         projectPromise,
@@ -474,6 +532,7 @@ export const {
           const providersResponse = providersPromise.then((x) => x.data!)
           const providerListResponse = providerListPromise.then((x) => x.data!)
           const capabilitiesResponse = capabilitiesPromise
+          const permissionAutoCapabilityResponse = permissionAutoCapabilityPromise
           const consoleStateResponse = consoleStatePromise
           const agentsResponse = agentsPromise.then((x) => x.data ?? [])
           const configResponse = configPromise.then((x) => x.data!)
@@ -483,6 +542,7 @@ export const {
             providersResponse,
             providerListResponse,
             capabilitiesResponse,
+            permissionAutoCapabilityResponse,
             consoleStateResponse,
             agentsResponse,
             configResponse,
@@ -491,16 +551,18 @@ export const {
             const providers = responses[0]
             const providerList = responses[1]
             const capabilities = responses[2]
-            const consoleState = responses[3]
-            const agents = responses[4]
-            const config = responses[5]
-            const sessions = responses[6]
+            const permissionAutoCapability = responses[3]
+            const consoleState = responses[4]
+            const agents = responses[5]
+            const config = responses[6]
+            const sessions = responses[7]
 
             batch(() => {
               setStore("provider", reconcile(providers.providers))
               setStore("provider_default", reconcile(providers.default))
               setStore("provider_next", reconcile(providerList))
               setStore("capabilities", "experimentalBackgroundSubagents", capabilities?.backgroundSubagents === true)
+              setStore("capabilities", "permissionAuto", permissionAutoCapability)
               setStore("console_state", reconcile(consoleState))
               setStore("agent", reconcile(agents))
               setStore("config", reconcile(config))
@@ -592,11 +654,14 @@ export const {
           const tracker = { messages: new Set<string>(), parts: new Set<string>() }
           hydratingSessions.set(sessionID, tracker)
           const task = (async () => {
-            const [session, messages, todo, diff] = await Promise.all([
+            const [session, messages, todo, diff, permissionAuto] = await Promise.all([
               sdk.client.session.get({ sessionID }, { throwOnError: true }),
               sdk.client.session.messages({ sessionID, limit: 100 }),
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
+              store.capabilities.permissionAuto
+                ? sdk.client.permission.getAuto({ sessionID }, { throwOnError: true })
+                : undefined,
             ])
             setStore(
               produce((draft) => {
@@ -604,6 +669,9 @@ export const {
                 if (match.found) draft.session[match.index] = session.data!
                 if (!match.found) draft.session.splice(match.index, 0, session.data!)
                 draft.todo[sessionID] = todo.data ?? []
+                if (permissionAuto?.data && !permissionAutoWrites.has(sessionID)) {
+                  draft.permission_auto[sessionID] = permissionAuto.data
+                }
                 const currentMessages = draft.message[sessionID] ?? []
                 const infos = (messages.data ?? []).flatMap((message) => {
                   if (!tracker.messages.has(message.info.id)) return [message.info]
@@ -656,6 +724,50 @@ export const {
             hydratingSessions.delete(sessionID)
           })
           syncingSessions.set(sessionID, task)
+          return task
+        },
+      },
+      permissionAuto: {
+        get(sessionID: string) {
+          return store.permission_auto[sessionID]
+        },
+        sync: syncPermissionAuto,
+        set(sessionID: string, enabled: boolean, routing: { directory?: string; workspace?: string } = {}) {
+          const previous = store.permission_auto[sessionID]
+          const version = (permissionAutoVersions.get(sessionID) ?? 0) + 1
+          permissionAutoVersions.set(sessionID, version)
+          setStore("permission_auto", sessionID, {
+            enabled,
+            explicit: enabled,
+            source: enabled ? sessionID : undefined,
+          })
+
+          const pending = permissionAutoWrites.get(sessionID) ?? Promise.resolve()
+          const task = pending
+            .catch(() => {})
+            .then(() => sdk.client.permission.setAuto({ sessionID, enabled, ...routing }, { throwOnError: true }))
+            .then((response) => {
+              if (permissionAutoVersions.get(sessionID) !== version) return
+              setStore("permission_auto", sessionID, reconcile(response.data))
+            })
+            .catch((error) => {
+              if (permissionAutoVersions.get(sessionID) === version) {
+                if (previous) setStore("permission_auto", sessionID, reconcile(previous))
+                if (!previous) {
+                  setStore(
+                    "permission_auto",
+                    produce((draft) => {
+                      delete draft[sessionID]
+                    }),
+                  )
+                }
+              }
+              throw error
+            })
+            .finally(() => {
+              if (permissionAutoWrites.get(sessionID) === task) permissionAutoWrites.delete(sessionID)
+            })
+          permissionAutoWrites.set(sessionID, task)
           return task
         },
       },

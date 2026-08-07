@@ -1104,7 +1104,8 @@ describe("tool.task", () => {
           Effect.provide(
             Logger.layer([
               Logger.make((entry) => {
-                if (JSON.stringify(entry.message).includes("failed to steer background task")) logged.resolve(entry.message)
+                if (JSON.stringify(entry.message).includes("failed to steer background task"))
+                  logged.resolve(entry.message)
               }),
             ]),
           ),

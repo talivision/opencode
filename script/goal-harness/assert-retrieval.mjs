@@ -64,7 +64,9 @@ const RAW_OUTPUT_MARKERS = ["Completion is pending independent review", "Checkli
 for (const marker of RAW_OUTPUT_MARKERS) {
   check(
     `attempt 2's seed omits raw worker tool output: ${JSON.stringify(marker.slice(0, 32))}`,
-    !inherited.some((body) => body.split("<parent-session-index>")[1]?.split("</parent-session-index>")[0]?.includes(marker)),
+    !inherited.some((body) =>
+      body.split("<parent-session-index>")[1]?.split("</parent-session-index>")[0]?.includes(marker),
+    ),
   )
 }
 

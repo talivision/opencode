@@ -1024,6 +1024,11 @@ export function Prompt(props: PromptProps) {
       }
 
       sessionID = res.data.id
+      if (sync.data.capabilities.permissionAuto && local.permission.mode === "auto") {
+        await sync.permissionAuto
+          .set(sessionID, true, { directory: res.data.directory, workspace: res.data.workspaceID })
+          .catch(toast.error)
+      }
     }
 
     const inputText = expandTrackedPastedText(
@@ -1478,7 +1483,7 @@ export function Prompt(props: PromptProps) {
                       <text fg={fadeColor(highlight(), agentMetaAlpha())}>
                         {store.mode === "shell" ? "Shell" : Locale.titlecase(agent().name)}
                       </text>
-                      <PermissionBadge mode={store.mode} />
+                      <PermissionBadge mode={store.mode} sessionID={props.sessionID} />
                       <Show when={store.mode === "normal"}>
                         <box flexDirection="row" gap={1}>
                           <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
