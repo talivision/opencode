@@ -1,6 +1,6 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { expect, test } from "bun:test"
-import { Effect, Exit, Fiber, Layer } from "effect"
+import { Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Permission } from "../../src/permission"
@@ -8,6 +8,8 @@ import { Session } from "../../src/session/session"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
+import { Storage } from "../../src/storage/storage"
+import { InstanceRef } from "../../src/effect/instance-ref"
 import { TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { SessionID } from "../../src/session/schema"
@@ -23,6 +25,7 @@ const env = AppNodeBuilder.build(
     InstanceStore.node,
     Session.node,
     SessionProjector.node,
+    Storage.node,
   ]),
   [[InstanceStore.bootstrapNode, noopBootstrap]],
 )
@@ -526,15 +529,32 @@ it.instance(
 // auto mode
 // ---------------------------------------------------------------------------
 
+const newSession = (input?: { parentID?: SessionID; title?: string }) =>
+  Session.Service.use((sessions) => sessions.create({ title: "test", ...input }))
+
+const removeSession = (sessionID: SessionID) => Session.Service.use((sessions) => sessions.remove(sessionID))
+
+/** Everything the permission store has written for this run, by project id. */
+const storedProjects = () =>
+  Storage.Service.use((storage) => storage.list(["permission"]).pipe(Effect.map((keys) => keys.map((key) => key[1]))))
+
+const storedAuto = (projectID: string) =>
+  Storage.Service.use((storage) =>
+    storage
+      .read<{ auto?: { sessionID: string }[] }>(["permission", projectID])
+      .pipe(Effect.map((file) => file.auto ?? []))
+      .pipe(Effect.catchCause(() => Effect.succeed([] as { sessionID: string }[]))),
+  )
+
 it.instance(
   "auto mode turns ask into allow without asking",
   () =>
     Effect.gen(function* () {
-      const sessionID = SessionID.make("session_auto")
-      expect((yield* setAuto(sessionID, true)).enabled).toBe(true)
+      const session = yield* newSession()
+      expect((yield* setAuto(session.id, true)).enabled).toBe(true)
       expect(
         yield* askOrPending({
-          sessionID,
+          sessionID: session.id,
           permission: "bash",
           patterns: ["ls"],
           metadata: {},
@@ -551,10 +571,10 @@ it.instance(
   "auto mode never turns an explicit deny into allow",
   () =>
     Effect.gen(function* () {
-      const sessionID = SessionID.make("session_auto_deny")
-      yield* setAuto(sessionID, true)
+      const session = yield* newSession()
+      yield* setAuto(session.id, true)
       const exit = yield* ask({
-        sessionID,
+        sessionID: session.id,
         permission: "bash",
         patterns: ["rm -rf /"],
         metadata: {},
@@ -573,10 +593,10 @@ it.instance(
     Effect.gen(function* () {
       const test = yield* TestInstance
       const store = yield* InstanceStore.Service
-      const sessionID = SessionID.make("session_auto_clean")
-      yield* setAuto(sessionID, true)
+      const session = yield* newSession()
+      yield* setAuto(session.id, true)
       yield* ask({
-        sessionID,
+        sessionID: session.id,
         permission: "bash",
         patterns: ["ls"],
         metadata: {},
@@ -585,11 +605,11 @@ it.instance(
       })
       expect(yield* grants()).toEqual([])
 
-      expect((yield* setAuto(sessionID, false)).enabled).toBe(false)
+      expect((yield* setAuto(session.id, false)).enabled).toBe(false)
       expect(yield* grants()).toEqual([])
       expect(
         yield* askOrPending({
-          sessionID,
+          sessionID: session.id,
           permission: "bash",
           patterns: ["ls"],
           metadata: {},
@@ -608,10 +628,10 @@ it.instance(
   "auto mode records an audit trail",
   () =>
     Effect.gen(function* () {
-      const sessionID = SessionID.make("session_auto_audit")
-      yield* setAuto(sessionID, true)
+      const session = yield* newSession()
+      yield* setAuto(session.id, true)
       yield* ask({
-        sessionID,
+        sessionID: session.id,
         permission: "bash",
         patterns: ["git push"],
         metadata: {},
@@ -622,8 +642,35 @@ it.instance(
       expect(log).toHaveLength(1)
       expect(log[0]!.permission).toBe("bash")
       expect(log[0]!.pattern).toBe("git push")
-      expect(log[0]!.sessionID).toBe(sessionID)
+      expect(log[0]!.sessionID).toBe(session.id)
       expect(log[0]!.time).toBeGreaterThan(0)
+      expect(log[0]!.count).toBe(1)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "a repeated auto-approval counts instead of vanishing",
+  () =>
+    Effect.gen(function* () {
+      const session = yield* newSession()
+      yield* setAuto(session.id, true)
+      const call = () =>
+        ask({
+          sessionID: session.id,
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        })
+      yield* call()
+      yield* call()
+      yield* call()
+      const log = yield* autoLog()
+      expect(log).toHaveLength(1)
+      expect(log[0]!.count).toBe(3)
+      expect(log[0]!.last).toBeGreaterThanOrEqual(log[0]!.time)
     }),
   { git: true },
 )
@@ -634,15 +681,15 @@ it.instance(
     Effect.gen(function* () {
       const test = yield* TestInstance
       const store = yield* InstanceStore.Service
-      const sessionID = SessionID.make("session_auto_resume")
-      yield* setAuto(sessionID, true)
+      const session = yield* newSession()
+      yield* setAuto(session.id, true)
 
       yield* store.reload({ directory: test.directory })
 
-      expect((yield* getAuto(sessionID)).enabled).toBe(true)
+      expect((yield* getAuto(session.id)).enabled).toBe(true)
       expect(
         yield* askOrPending({
-          sessionID,
+          sessionID: session.id,
           permission: "bash",
           patterns: ["ls"],
           metadata: {},
@@ -658,10 +705,10 @@ it.instance(
   "enabling auto releases requests already pending in the session",
   () =>
     Effect.gen(function* () {
-      const sessionID = SessionID.make("session_auto_drain")
+      const session = yield* newSession()
       const fiber = yield* ask({
         id: PermissionV1.ID.make("per_auto_drain"),
-        sessionID,
+        sessionID: session.id,
         permission: "bash",
         patterns: ["ls"],
         metadata: {},
@@ -669,7 +716,7 @@ it.instance(
         ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
       }).pipe(Effect.forkScoped)
       yield* waitForPending(1)
-      yield* setAuto(sessionID, true)
+      yield* setAuto(session.id, true)
       yield* Fiber.join(fiber)
       expect(yield* Permission.Service.use((p) => p.list())).toHaveLength(0)
     }),
@@ -680,10 +727,9 @@ it.instance(
   "a subagent session inherits auto mode from its parent",
   () =>
     Effect.gen(function* () {
-      const sessions = yield* Session.Service
-      const parent = yield* sessions.create({ title: "parent" })
-      const child = yield* sessions.create({ parentID: parent.id, title: "goal reviewer" })
-      const grandchild = yield* sessions.create({ parentID: child.id, title: "nested" })
+      const parent = yield* newSession({ title: "parent" })
+      const child = yield* newSession({ parentID: parent.id, title: "goal reviewer" })
+      const grandchild = yield* newSession({ parentID: child.id, title: "nested" })
 
       expect((yield* getAuto(child.id)).enabled).toBe(false)
       yield* setAuto(parent.id, true)
@@ -719,9 +765,8 @@ it.instance(
   "auto mode on a parent releases a pending subagent request",
   () =>
     Effect.gen(function* () {
-      const sessions = yield* Session.Service
-      const parent = yield* sessions.create({ title: "parent" })
-      const child = yield* sessions.create({ parentID: parent.id, title: "goal reviewer" })
+      const parent = yield* newSession({ title: "parent" })
+      const child = yield* newSession({ parentID: parent.id, title: "goal reviewer" })
 
       const fiber = yield* ask({
         id: PermissionV1.ID.make("per_auto_child"),
@@ -744,12 +789,12 @@ it.instance(
   "auto mode is per session, not process wide",
   () =>
     Effect.gen(function* () {
-      const auto = SessionID.make("session_auto_only")
-      const manual = SessionID.make("session_manual")
-      yield* setAuto(auto, true)
+      const auto = yield* newSession()
+      const manual = yield* newSession()
+      yield* setAuto(auto.id, true)
       expect(
         yield* askOrPending({
-          sessionID: manual,
+          sessionID: manual.id,
           permission: "bash",
           patterns: ["ls"],
           metadata: {},
@@ -759,4 +804,108 @@ it.instance(
       ).toBe("pending")
     }),
   { git: true },
+)
+
+// ---------------------------------------------------------------------------
+// auto mode: self-escalation surface
+// ---------------------------------------------------------------------------
+
+it.instance(
+  "auto mode cannot be armed for a session that does not exist",
+  () =>
+    Effect.gen(function* () {
+      const exit = yield* setAuto(SessionID.make("session_never_created"), true).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(yield* Permission.Service.use((p) => p.autoSessions())).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "turning auto mode on publishes an event",
+  () =>
+    Effect.gen(function* () {
+      const bus = yield* EventV2Bridge.Service
+      const session = yield* newSession()
+      const seen: unknown[] = []
+      yield* bus.subscribe(Permission.Event.AutoChanged).pipe(
+        Stream.runForEach((event) => Effect.sync(() => seen.push(event.data))),
+        Effect.forkScoped,
+      )
+      yield* Effect.sleep("20 millis")
+      yield* setAuto(session.id, true)
+      yield* setAuto(session.id, false)
+      yield* Effect.sleep("100 millis")
+      expect(seen).toEqual([
+        { sessionID: session.id, enabled: true, explicit: true, source: session.id },
+        { sessionID: session.id, enabled: false, explicit: false, source: undefined },
+      ])
+    }),
+  { git: true },
+)
+
+it.instance(
+  "a deleted ancestor stops conferring auto mode and its row is dropped",
+  () =>
+    Effect.gen(function* () {
+      const parent = yield* newSession({ title: "parent" })
+      const child = yield* newSession({ parentID: parent.id, title: "reviewer" })
+      yield* setAuto(parent.id, true)
+      expect((yield* getAuto(child.id)).enabled).toBe(true)
+      const projectID = yield* Effect.map(InstanceRef, (ctx) => ctx!.project.id)
+      expect(yield* storedAuto(projectID)).toHaveLength(1)
+
+      // Removing a session cascades to its children, so the survivor here is a
+      // session created afterwards that still points at the dead parent - the
+      // case where the walk used to find the auto row before it noticed the
+      // session behind it was gone.
+      yield* removeSession(parent.id)
+      const survivor = yield* newSession({ parentID: parent.id, title: "orphan" })
+
+      expect((yield* getAuto(survivor.id)).enabled).toBe(false)
+      expect((yield* getAuto(parent.id)).enabled).toBe(false)
+      // and the row is gone from memory and from disk, so it cannot grow forever
+      expect(yield* Permission.Service.use((p) => p.autoSessions())).toHaveLength(0)
+      expect(yield* storedAuto(projectID)).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+// ---------------------------------------------------------------------------
+// persistence boundary
+// ---------------------------------------------------------------------------
+
+it.instance("nothing is persisted for the shared global project id", () =>
+  Effect.gen(function* () {
+    // No git repo: Project.resolve falls back to the "global" sentinel, which
+    // every non-git directory on the machine shares. Persisting under it would
+    // put an "always" granted in one scratch directory in force in every other.
+    const session = yield* newSession()
+    const other = yield* newSession()
+    yield* setAuto(other.id, true)
+    yield* ask({
+      sessionID: other.id,
+      permission: "bash",
+      patterns: ["ls"],
+      metadata: {},
+      always: [],
+      ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+    })
+
+    const fiber = yield* ask({
+      id: PermissionV1.ID.make("per_global_grant"),
+      sessionID: session.id,
+      permission: "webfetch",
+      patterns: ["https://example.com"],
+      metadata: {},
+      always: [],
+      ruleset: [{ permission: "webfetch", pattern: "*", action: "ask" }],
+    }).pipe(Effect.forkScoped)
+    yield* waitForPending(1)
+    yield* reply({ requestID: PermissionV1.ID.make("per_global_grant"), reply: "always" })
+    yield* Fiber.join(fiber)
+    expect(yield* grants()).toHaveLength(1)
+
+    expect(yield* storedProjects()).not.toContain("global")
+  }),
 )

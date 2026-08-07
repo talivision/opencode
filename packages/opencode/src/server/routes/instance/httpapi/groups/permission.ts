@@ -3,7 +3,7 @@ import { Permission } from "@/permission"
 import { SessionID } from "@/session/schema"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
-import { PermissionNotFoundError } from "../errors"
+import { PermissionNotFoundError, SessionNotFoundError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -62,12 +62,13 @@ export const PermissionApi = HttpApi.make("permission")
           query: WorkspaceRoutingQuery,
           payload: AutoPayload,
           success: described(AutoStatus, "Resulting auto-mode status"),
+          error: [SessionNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.setAuto",
             summary: "Toggle permission auto mode for a session",
             description:
-              "Turn auto mode on or off for a session. Descendant sessions (subagents) inherit it, requests already pending in the session tree are released, and explicit deny rules are still enforced.",
+              "Turn auto mode on or off for a session. The session must exist. Descendant sessions (subagents) inherit it, requests already pending in the session tree are released, and explicit deny rules are still enforced. Emits permission.auto.changed.",
           }),
         ),
         HttpApiEndpoint.get("getAuto", `${root}/auto/:sessionID`, {

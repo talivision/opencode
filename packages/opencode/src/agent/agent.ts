@@ -18,6 +18,7 @@ import PROMPT_TITLE from "./prompt/title.txt"
 import { Permission } from "@/permission"
 import { mergeDeep, pipe, sortBy, values } from "remeda"
 import { Global } from "@opencode-ai/core/global"
+import os from "os"
 import path from "path"
 import { Plugin } from "@/plugin"
 import { Skill } from "../skill"
@@ -161,8 +162,18 @@ const layer = Layer.effect(
         // go. Hence the credential denylist above rather than a blanket allow:
         // everything a review could plausibly need is readable without a human,
         // and the handful of paths that are only ever secrets still stop for one.
+        // external_directory asks with the PARENT directory glob, and
+        // Wildcard `*` compiles to `.*`, which crosses `/`. So a read of
+        // ~/.netrc evaluates the pattern "$HOME/*" and can only ever match a
+        // rule written at that same level — none of the ~/.ssh/* style entries
+        // below can catch it. The explicit "$HOME/*": "ask" rule is what covers
+        // the credential files that sit directly in the home directory
+        // (.netrc, .npmrc, .git-credentials, shell history). It also catches
+        // ~/projects/*, which is the price of the glob crossing `/`; reads
+        // there now pause once rather than proceeding silently.
         const reviewerExternalDirectory = {
           "*": "allow",
+          [path.join(os.homedir(), "*")]: "ask",
           ...Object.fromEntries(credentialDirs.map((dir) => [dir, "ask"])),
           ...Object.fromEntries(whitelistedDirs.map((dir) => [dir, "allow"])),
         } satisfies Record<string, "allow" | "ask" | "deny">
@@ -330,8 +341,11 @@ const layer = Layer.effect(
                 glob: "allow",
                 list: "allow",
                 read: "allow",
-                webfetch: "allow",
-                websearch: "allow",
+                // Network tools are the exfiltration half of "read widely".
+                // The call site disables them outright; ask here so a config
+                // that re-enables them still cannot do it silently.
+                webfetch: "ask",
+                websearch: "ask",
                 goal_verdict: "allow",
                 goal_transcript: "allow",
                 goal_checklist: "allow",
@@ -386,6 +400,20 @@ const layer = Layer.effect(
         reviewer.goalReviewer = true
         reviewer.hidden = true
         reviewer.prompt = PROMPT_GOAL_REVIEWER
+        // User config merges LAST. Previously the hardcoded block was appended
+        // after it, so `evaluate`'s findLast made these rules beat an explicit
+        // user deny on the reviewer — the one agent a security-conscious
+        // operator is most likely to want to restrict. Identity fields above
+        // stay forced; only the permission ruleset yields to the user.
+        // Only the RESTRICTING half of user config is honoured. A user must be
+        // able to tighten the reviewer — that is the whole point of an
+        // auditable read-only agent — but must never be able to hand it bash,
+        // edit or a wider read scope, which merging user rules wholesale would
+        // allow. Same asymmetry as runtime grants, which may only upgrade
+        // ask->allow: config may only downgrade toward deny.
+        const reviewerUserRules = Permission.fromConfig(
+          cfg.agent?.["goal-reviewer"]?.permission ?? {},
+        ).filter((rule) => rule.action !== "allow")
         reviewer.permission = Permission.merge(
           reviewer.permission,
           Permission.fromConfig({
@@ -394,13 +422,15 @@ const layer = Layer.effect(
             glob: "allow",
             list: "allow",
             read: "allow",
-            webfetch: "allow",
-            websearch: "allow",
+            webfetch: "ask",
+            websearch: "ask",
             goal_verdict: "allow",
             goal_transcript: "allow",
             goal_checklist: "allow",
             external_directory: reviewerExternalDirectory,
           }),
+          user.filter((rule) => rule.action !== "allow"),
+          reviewerUserRules,
         )
 
         // Ensure Truncate.GLOB is allowed unless explicitly configured

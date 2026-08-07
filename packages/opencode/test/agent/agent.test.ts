@@ -269,10 +269,22 @@ it.instance("goal reviewer reads outside the worktree without prompting (native 
 )
 
 it.instance(
-  "goal reviewer read scope survives the config merge and config cannot re-narrow it",
+  "config can restrict the goal reviewer but never widen it",
   () =>
     Effect.gen(function* () {
-      reviewerReadScope(yield* load((svc) => svc.get("goal-reviewer")))
+      const reviewer = yield* load((svc) => svc.get("goal-reviewer"))
+      if (!reviewer) throw new Error("goal-reviewer not found")
+      // Widening is refused: the config above grants bash/edit/write/patch and
+      // they must all still be denied. This is the invariant that makes a
+      // read-only auditor trustworthy.
+      for (const permission of ["bash", "edit", "write", "patch", "apply_patch"]) {
+        expect(Permission.evaluate(permission, "*", reviewer.permission).action).toBe("deny")
+      }
+      // Restricting IS honoured: an operator who denies external reads must get
+      // that. Previously the hardcoded block was merged after user config, so
+      // this deny was silently overridden — and once reads were widened to
+      // "allow", overridden into silent permission rather than a prompt.
+      expect(Permission.evaluate("external_directory", "/etc/anything", reviewer.permission).action).toBe("deny")
     }),
   {
     config: {

@@ -2,6 +2,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { Wildcard } from "@opencode-ai/core/util/wildcard"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { Project } from "@opencode-ai/schema/project"
 import { Deferred, Effect, Layer, Context, Schema } from "effect"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
@@ -44,8 +46,15 @@ export interface Interface {
    * it, so a subagent (goal reviewer included) spawned from an auto session
    * never asks. Turning it on also releases anything already pending for that
    * session tree. Returns the effective status of the session afterwards.
+   *
+   * Fails when the session does not exist: this is reachable unauthenticated
+   * over HTTP, and an id that names nothing would let a caller arm auto mode
+   * for a session before it is created, where no UI can show it.
    */
-  readonly setAuto: (input: { sessionID: SessionID; enabled: boolean }) => Effect.Effect<AutoStatus>
+  readonly setAuto: (input: {
+    sessionID: SessionID
+    enabled: boolean
+  }) => Effect.Effect<AutoStatus, Storage.NotFoundError>
   /** Effective auto-mode status for a session, resolving the ancestor chain. */
   readonly getAuto: (sessionID: SessionID) => Effect.Effect<AutoStatus>
   /** Sessions auto mode was explicitly turned on for. */
@@ -71,7 +80,19 @@ interface State {
   auto: Map<SessionID, number>
   /** Memoized ancestor-chain resolution; cleared whenever `auto` changes. */
   autoResolved: Map<SessionID, { enabled: boolean; source?: SessionID }>
-  audit: AutoApproval[]
+  /**
+   * Bumped every time `auto`/`autoResolved` change. `resolveAuto` suspends on
+   * session lookups while it walks the ancestor chain, so it captures this
+   * before the walk and refuses to write a memo entry computed from a snapshot
+   * that has since been invalidated - otherwise a stale "enabled" could outlive
+   * the very call that turned auto mode off.
+   */
+  autoGen: number
+  audit: AuditEntry[]
+  /** `audit` keyed by session+permission+pattern, for O(1) recurrence lookup. */
+  auditIndex: Map<string, AuditEntry>
+  auditDirty: boolean
+  auditFlushedAt: number
 }
 
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
@@ -133,16 +154,36 @@ export type AutoSession = Schema.Schema.Type<typeof AutoSession>
  * Audit trail entry: something auto mode approved without asking. This is NOT a
  * grant - it grants nothing and is never consulted by `evaluate`. It exists so
  * an unattended run can be reviewed afterwards.
+ *
+ * One entry per (session, permission, pattern). Recurrences bump `count` and
+ * `last` instead of appending, so a loop cannot flood the file, and - unlike
+ * plain dedup - the review still shows that the call happened 900 times.
  */
 export const AutoApproval = Schema.Struct({
   sessionID: SessionID,
   permission: Schema.String,
   pattern: Schema.String,
+  /** First time this was auto-approved. */
   time: Schema.Number,
+  /** Most recent time. Optional so files written before it existed decode. */
+  last: Schema.optional(Schema.Number),
+  /** How many times in total. Optional for the same reason. */
+  count: Schema.optional(Schema.Number),
 })
 export type AutoApproval = Schema.Schema.Type<typeof AutoApproval>
 
+/** Working copy of an audit entry: recurrences update it in place. */
+type AuditEntry = { -readonly [K in keyof AutoApproval]: AutoApproval[K] }
+
 const AUDIT_LIMIT = 500
+/**
+ * A brand new audit entry is always written through immediately. A recurrence
+ * only moves a counter, so it is written at most this often - otherwise every
+ * auto-approved tool call in an unattended loop would rewrite the file.
+ */
+const AUDIT_FLUSH_MS = 2_000
+
+const auditKey = (sessionID: string, permission: string, pattern: string) => `${sessionID} ${permission} ${pattern}`
 
 const ProjectFile = Schema.Struct({
   projectID: Schema.String,
@@ -160,7 +201,7 @@ interface ProjectFile {
   worktree?: string
   grants: Grant[]
   auto: AutoSession[]
-  audit: AutoApproval[]
+  audit: AuditEntry[]
 }
 
 /**
@@ -177,9 +218,27 @@ interface ProjectFile {
  * concrete pattern the user saw is stored, so the blast radius equals the
  * request the user actually read, and (b) an explicit config `deny` outranks
  * every stored grant, so denies stay authoritative across restarts.
+ *
+ * Exception, and the reason `persistable` exists: `Project.resolve` has no
+ * repository to derive an id from outside a VCS checkout, so it returns the
+ * shared sentinel `global`. Every non-git directory on the machine resolves to
+ * that one id, which would make one file the store for all of them - an
+ * "always" granted in ~/scratch would be in force in ~/finance, which is
+ * exactly the property the paragraph above promises. Rather than key those
+ * directories separately (there is no stable key: the same path can be two
+ * unrelated trust domains over time), nothing is persisted for them at all.
+ * Grants there last for the run, as if `permission_persist` were off.
  */
 function grantKey(projectID: string) {
   return ["permission", projectID]
+}
+
+/**
+ * False for the `global` sentinel project - see the note above. Every non-git
+ * directory shares that id, so it can never be a persistence boundary.
+ */
+function persistable(projectID: string) {
+  return projectID !== Project.ID.global
 }
 
 const layer = Layer.effect(
@@ -189,6 +248,7 @@ const layer = Layer.effect(
     const storage = yield* Storage.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
+    const flock = yield* EffectFlock.Service
 
     const read = (projectID: string): Effect.Effect<ProjectFile | undefined> =>
       storage.read<unknown>(grantKey(projectID)).pipe(
@@ -202,6 +262,8 @@ const layer = Layer.effect(
             audit: [...(file.audit ?? [])],
           }),
         ),
+        Effect.catchTag("NotFoundError", () => Effect.succeed(undefined)),
+        Effect.tapCause((cause) => Effect.logError("failed to read persisted permission state", { projectID, cause })),
         Effect.catchCause(() => Effect.succeed(undefined)),
       )
 
@@ -209,14 +271,46 @@ const layer = Layer.effect(
       storage.write(grantKey(file.projectID), file).pipe(Effect.catchCause(() => Effect.void))
 
     /**
+     * `Storage.update`'s lock is per-path and in-process only. Two opencode
+     * processes on sibling worktrees resolve to the same project id and so to
+     * the same file, and would interleave their read-modify-writes with no
+     * exclusion at all. This is the same advisory file lock the rest of the
+     * codebase uses for cross-process state.
+     *
+     * It is best-effort: if the lock cannot be taken the write still happens,
+     * because losing a grant to a racing process is a smaller failure than
+     * refusing to record one at all. Lock loss is logged.
+     */
+    const guarded = <R>(projectID: string, body: Effect.Effect<void, never, R>): Effect.Effect<void, never, R> =>
+      flock.withLock(body, "permission-" + projectID).pipe(
+        Effect.catchTags({
+          LockTimeoutError: (error) =>
+            Effect.logWarning("permission store lock timed out; writing unlocked", {
+              projectID,
+              key: error.key,
+            }).pipe(Effect.andThen(body)),
+          LockCompromisedError: (error) =>
+            Effect.logWarning("permission store lock compromised; writing unlocked", {
+              projectID,
+              detail: error.detail,
+            }).pipe(Effect.andThen(body)),
+        }),
+      )
+
+    /**
      * Read-modify-write the project file, or do nothing when persistence is off.
      * Goes through `Storage.update` so the read and the write happen under one
      * write lock: two sessions approving at the same moment cannot lose a grant.
+     *
+     * `fn` must express a *delta* against whatever is already on disk (append
+     * this grant, drop this session id) and never assign a whole array from
+     * in-memory state: another instance on the same project has its own state,
+     * and a wholesale assignment silently deletes its rows.
      */
     const mutate = (current: State, fn: (file: ProjectFile) => boolean) =>
       Effect.gen(function* () {
         if (!current.persist) return
-        const updated = yield* storage
+        const missing = yield* storage
           .update<ProjectFile>(grantKey(current.projectID), (draft) => {
             // A file written before `auto`/`audit` existed has neither.
             draft.grants ??= []
@@ -225,10 +319,17 @@ const layer = Layer.effect(
             fn(draft)
           })
           .pipe(
-            Effect.as(true),
+            Effect.as(false),
+            // Only "the file is not there yet" may be answered by writing a new
+            // one. A decode error or a disk error must not be, or a single
+            // transient failure would replace every stored grant with nothing.
+            Effect.catchTag("NotFoundError", () => Effect.succeed(true)),
+            Effect.tapCause((cause) =>
+              Effect.logError("failed to update permission store", { projectID: current.projectID, cause }),
+            ),
             Effect.catchCause(() => Effect.succeed(false)),
           )
-        if (updated) return
+        if (!missing) return
         const fresh: ProjectFile = {
           projectID: current.projectID,
           worktree: (yield* InstanceState.context).worktree,
@@ -238,15 +339,22 @@ const layer = Layer.effect(
         }
         if (!fn(fresh)) return
         yield* write(fresh)
-      })
+      }).pipe((body) => guarded(current.projectID, body))
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
-        const persist = yield* Effect.map(config.get(), (cfg) => cfg.permission_persist !== false)
         const projectID = ctx.project.id
+        const configured = yield* Effect.map(config.get(), (cfg) => cfg.permission_persist !== false)
+        const persist = configured && persistable(projectID)
+        if (configured && !persist)
+          yield* Effect.logInfo("permission state is not persisted outside a repository", {
+            projectID,
+            worktree: ctx.worktree,
+          })
         // Opting out disables both halves: nothing is written, and anything a
         // previous run wrote is ignored rather than silently still in force.
         const stored = persist ? yield* read(projectID) : undefined
+        const audit = (stored?.audit ?? []).slice(-AUDIT_LIMIT)
         const state: State = {
           pending: new Map<PermissionV1.ID, PendingEntry>(),
           approved: (stored?.grants ?? []).map((grant) => ({
@@ -261,7 +369,11 @@ const layer = Layer.effect(
           // the client that happened to set it.
           auto: new Map((stored?.auto ?? []).map((item) => [item.sessionID, item.time])),
           autoResolved: new Map(),
-          audit: (stored?.audit ?? []).slice(-AUDIT_LIMIT),
+          autoGen: 0,
+          audit,
+          auditIndex: new Map(audit.map((item) => [auditKey(item.sessionID, item.permission, item.pattern), item])),
+          auditDirty: false,
+          auditFlushedAt: 0,
         }
         if (state.approved.length)
           yield* Effect.logInfo("loaded persisted permission grants", { projectID, count: state.approved.length })
@@ -273,6 +385,9 @@ const layer = Layer.effect(
               yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
             }
             state.pending.clear()
+            // Recurrence counters are throttled while running; a clean shutdown
+            // must not lose the last window of them.
+            if (state.auditDirty) yield* flushAudit(state, Date.now())
           }),
         )
 
@@ -301,42 +416,135 @@ const layer = Layer.effect(
         })
     })
 
+    const lookup = (sessionID: SessionID) =>
+      sessions.get(sessionID).pipe(
+        Effect.map((info): Session.Info | undefined => info),
+        Effect.catchCause(() => Effect.succeed(undefined)),
+      )
+
+    /** Invalidate every memoized answer. Must accompany any change to `auto`. */
+    const invalidate = (current: State) => {
+      current.autoGen++
+      current.autoResolved.clear()
+    }
+
+    /**
+     * Drop the auto row for a session that no longer exists, from memory and
+     * from disk. Without this a deleted session's row lives forever: it keeps
+     * conferring inherited auto mode on the descendants that outlived it (the
+     * ancestor walk would find the row before it discovered the session was
+     * gone), and the stored array only ever grows.
+     */
+    const forget = Effect.fnUntraced(function* (current: State, sessionID: SessionID) {
+      if (!current.auto.delete(sessionID)) return false
+      invalidate(current)
+      yield* Effect.logInfo("dropped auto mode for a deleted session", {
+        projectID: current.projectID,
+        sessionID,
+      })
+      yield* mutate(current, (stored) => {
+        const kept = stored.auto.filter((item) => item.sessionID !== sessionID)
+        if (kept.length === stored.auto.length) return false
+        stored.auto = kept
+        return true
+      })
+      return true
+    })
+
+    /**
+     * A memoized answer is only good while the session it came from still
+     * exists. Deleting the session auto mode was turned on for revokes it for
+     * everything below, the same way a deleted ancestor fails closed elsewhere.
+     */
+    const aliveSource = Effect.fnUntraced(function* (current: State, source: SessionID | undefined) {
+      if (source === undefined) return true
+      if (yield* lookup(source)) return true
+      // Always invalidates on the way out, even when there was no row left to
+      // drop, so a caller can safely retry instead of reading the same dead
+      // answer back out of the memo forever.
+      if (!(yield* forget(current, source))) invalidate(current)
+      return false
+    })
+
+    const status = (sessionID: SessionID, value: { enabled: boolean; source?: SessionID }): AutoStatus => ({
+      enabled: value.enabled,
+      // Derived rather than read off `auto` separately: the two must never
+      // disagree, and a cached answer has no separate `explicit` to return.
+      explicit: value.enabled && value.source === sessionID,
+      source: value.source,
+    })
+
     /**
      * Is this session running in auto mode? A session inherits the mode from any
      * ancestor, which is what makes subagents - goal reviewers above all - stop
-     * re-asking when their parent is auto. Unknown/orphan sessions simply
-     * terminate the walk.
+     * re-asking when their parent is auto. Sessions that do not exist, and
+     * ancestors that have been deleted, terminate the walk without enabling it.
      */
     const resolveAuto = Effect.fnUntraced(function* (current: State, sessionID: SessionID) {
-      const explicit = current.auto.has(sessionID)
-      const cached = current.autoResolved.get(sessionID)
-      if (cached !== undefined) return { ...cached, explicit } satisfies AutoStatus
-      const chain: SessionID[] = []
-      const seen = new Set<SessionID>()
-      let cursor: SessionID | undefined = sessionID
-      let enabled = false
-      let source: SessionID | undefined
-      while (cursor && !seen.has(cursor)) {
-        seen.add(cursor)
-        chain.push(cursor)
-        if (current.auto.has(cursor)) {
-          enabled = true
-          source = cursor
-          break
+      // Loops only when the walk discovered that the session behind a memoized
+      // answer had been deleted. Each such pass drops the offending row and
+      // clears the memo, so it cannot spin.
+      while (true) {
+        const cached = current.autoResolved.get(sessionID)
+        if (cached !== undefined) {
+          if (yield* aliveSource(current, cached.source)) return status(sessionID, cached)
+          continue
         }
-        const resolved = current.autoResolved.get(cursor)
-        if (resolved !== undefined) {
-          enabled = resolved.enabled
-          source = resolved.source
-          break
+        // Captured before the first suspension point below. Anything that
+        // changes `auto` while this walk is parked bumps it, and the result is
+        // then used once but not memoized - a memo written after its own
+        // invalidation would keep answering with the pre-change value
+        // indefinitely.
+        const generation = current.autoGen
+        const chain: SessionID[] = []
+        const seen = new Set<SessionID>()
+        let cursor: SessionID | undefined = sessionID
+        let enabled = false
+        let source: SessionID | undefined
+        let stale = false
+        while (cursor && !seen.has(cursor)) {
+          seen.add(cursor)
+          chain.push(cursor)
+          if (chain.length > 1) {
+            const resolved = current.autoResolved.get(cursor)
+            if (resolved !== undefined) {
+              // An ancestor's memo is only usable while the session it credits
+              // still exists, or a deleted grantor would keep granting through
+              // every descendant that had already been resolved once.
+              if (!(yield* aliveSource(current, resolved.source))) {
+                stale = true
+                break
+              }
+              enabled = resolved.enabled
+              source = resolved.source
+              break
+            }
+          }
+          const info: Session.Info | undefined = yield* lookup(cursor)
+          if (!info) {
+            // Fail closed. A row for a session that is gone grants nothing.
+            yield* forget(current, cursor)
+            break
+          }
+          if (current.auto.has(cursor)) {
+            enabled = true
+            source = cursor
+            break
+          }
+          cursor = info.parentID
         }
-        const info: Session.Info | undefined = yield* sessions
-          .get(cursor)
-          .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-        cursor = info?.parentID
+        if (stale) continue
+        if (generation === current.autoGen) for (const id of chain) current.autoResolved.set(id, { enabled, source })
+        return status(sessionID, { enabled, source })
       }
-      for (const id of chain) current.autoResolved.set(id, { enabled, source })
-      return { enabled, explicit, source } satisfies AutoStatus
+    })
+
+    /** Drop every auto row whose session no longer exists. */
+    const pruneAuto = Effect.fnUntraced(function* (current: State) {
+      for (const sessionID of Array.from(current.auto.keys())) {
+        if (yield* lookup(sessionID)) continue
+        yield* forget(current, sessionID)
+      }
     })
 
     /** The session and every ancestor above it, nearest first. */
@@ -357,10 +565,47 @@ const layer = Layer.effect(
     })
 
     /**
+     * Write the in-memory audit trail through, merging into whatever is on
+     * disk instead of replacing it: another instance on the same project keeps
+     * its own trail, and for a security log silent deletion is the worst
+     * possible failure mode.
+     *
+     * `count` merges by max, not by sum: the same entry is flushed repeatedly
+     * from this process and summing would multiply it. Two processes counting
+     * the same pattern concurrently therefore under-report the total, which is
+     * the safe direction - the entry itself is never lost.
+     */
+    const flushAudit = Effect.fnUntraced(function* (current: State, now: number) {
+      current.auditDirty = false
+      current.auditFlushedAt = now
+      yield* mutate(current, (stored) => {
+        const index = new Map(
+          stored.audit.map((item) => [auditKey(item.sessionID, item.permission, item.pattern), item] as const),
+        )
+        for (const item of current.audit) {
+          const key = auditKey(item.sessionID, item.permission, item.pattern)
+          const existing = index.get(key)
+          if (!existing) {
+            const copy = { ...item }
+            stored.audit.push(copy)
+            index.set(key, copy)
+            continue
+          }
+          existing.time = Math.min(existing.time, item.time)
+          existing.last = Math.max(existing.last ?? existing.time, item.last ?? item.time)
+          existing.count = Math.max(existing.count ?? 1, item.count ?? 1)
+        }
+        if (stored.audit.length > AUDIT_LIMIT) stored.audit.splice(0, stored.audit.length - AUDIT_LIMIT)
+        return true
+      })
+    })
+
+    /**
      * Record an auto-approval. Deliberately separate from `remember`: auto mode
      * must never widen the durable allow list, so this only ever appends to the
-     * audit trail. Deduped per session so a loop of identical calls does not
-     * rewrite the file on every tool call.
+     * audit trail. A repeat of something already recorded bumps its counter
+     * rather than appending, so a loop cannot flood the file - but the repeat
+     * is still visible in the review, which a plain dedup threw away.
      */
     const recordAuto = Effect.fnUntraced(function* (
       current: State,
@@ -369,22 +614,35 @@ const layer = Layer.effect(
       patterns: readonly string[],
     ) {
       const now = Date.now()
-      const fresh = patterns.filter(
-        (pattern) =>
-          !current.audit.some(
-            (item) => item.sessionID === sessionID && item.permission === permission && item.pattern === pattern,
-          ),
-      )
-      yield* Effect.logInfo("auto-approved permission", { sessionID, permission, patterns })
-      if (!fresh.length) return
-      for (const pattern of fresh) {
-        current.audit.push({ sessionID, permission, pattern, time: now })
+      let added = false
+      for (const pattern of patterns) {
+        const key = auditKey(sessionID, permission, pattern)
+        const existing = current.auditIndex.get(key)
+        if (existing) {
+          existing.last = now
+          existing.count = (existing.count ?? 1) + 1
+          continue
+        }
+        const entry: AuditEntry = { sessionID, permission, pattern, time: now, last: now, count: 1 }
+        current.audit.push(entry)
+        current.auditIndex.set(key, entry)
+        added = true
       }
-      if (current.audit.length > AUDIT_LIMIT) current.audit.splice(0, current.audit.length - AUDIT_LIMIT)
-      yield* mutate(current, (stored) => {
-        stored.audit = current.audit.slice()
-        return true
-      })
+      yield* Effect.logInfo("auto-approved permission", { sessionID, permission, patterns })
+      if (current.audit.length > AUDIT_LIMIT) {
+        const dropped = current.audit.splice(0, current.audit.length - AUDIT_LIMIT)
+        for (const item of dropped) current.auditIndex.delete(auditKey(item.sessionID, item.permission, item.pattern))
+        // The trail is capped, so a long unattended run does lose its oldest
+        // entries. Say so rather than letting the review silently be partial.
+        yield* Effect.logWarning("auto-approval audit trail truncated", {
+          projectID: current.projectID,
+          dropped: dropped.length,
+          limit: AUDIT_LIMIT,
+        })
+      }
+      current.auditDirty = true
+      if (!added && now - current.auditFlushedAt < AUDIT_FLUSH_MS) return
+      yield* flushAudit(current, now)
     })
 
     const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
@@ -535,11 +793,15 @@ const layer = Layer.effect(
       const removed = current.approved.length - kept.length
       current.approved.splice(0, current.approved.length, ...kept)
 
-      const stored = yield* read(current.projectID)
-      if (stored) {
+      // Filtering inside the callback keeps the read and the write under one
+      // lock. Read-then-write took the lock twice and dropped anything a
+      // concurrent `remember` wrote in between.
+      yield* mutate(current, (stored) => {
         const keptGrants = stored.grants.filter((grant) => !matches(grant))
-        if (keptGrants.length !== stored.grants.length) yield* write({ ...stored, grants: keptGrants })
-      }
+        if (keptGrants.length === stored.grants.length) return false
+        stored.grants = keptGrants
+        return true
+      })
       return removed
     })
 
@@ -550,20 +812,43 @@ const layer = Layer.effect(
 
     const setAuto = Effect.fn("Permission.setAuto")(function* (input: { sessionID: SessionID; enabled: boolean }) {
       const current = yield* InstanceState.get(state)
-      if (input.enabled) current.auto.set(input.sessionID, Date.now())
+      // Reachable unauthenticated over HTTP. Requiring the session to exist is
+      // not authorization, but it does stop the endpoint from writing rows for
+      // ids that name nothing, which no client could ever show or undo.
+      yield* sessions.get(input.sessionID)
+      const time = Date.now()
+      if (input.enabled) current.auto.set(input.sessionID, time)
       else current.auto.delete(input.sessionID)
       // Inheritance is resolved lazily and memoized, so any change invalidates
       // every descendant's answer.
-      current.autoResolved.clear()
+      invalidate(current)
+      // A delta, not an assignment of the whole map: see `mutate`.
       yield* mutate(current, (stored) => {
-        stored.auto = Array.from(current.auto, ([sessionID, time]) => ({ sessionID, time }))
+        const kept = stored.auto.filter((item) => item.sessionID !== input.sessionID)
+        if (input.enabled) kept.push({ sessionID: input.sessionID, time })
+        if (kept.length === stored.auto.length && !input.enabled) return false
+        stored.auto = kept
         return true
       })
+      // Bounded housekeeping on a rare call: rows whose session was deleted
+      // would otherwise accumulate in the file forever.
+      yield* pruneAuto(current)
       yield* Effect.logInfo("auto mode changed", { sessionID: input.sessionID, enabled: input.enabled })
+
+      // Auto mode suppresses every future prompt for this session and its
+      // descendants, so the change itself is published - a silent switch is
+      // indistinguishable from "nothing needed approval".
+      const changed = yield* resolveAuto(current, input.sessionID)
+      yield* events.publish(Event.AutoChanged, {
+        sessionID: input.sessionID,
+        enabled: changed.enabled,
+        explicit: changed.explicit,
+        source: changed.source,
+      })
 
       // Turning it off leaves nothing behind: no grant was ever written for an
       // auto-approval, so the durable allow list is untouched here by design.
-      if (!input.enabled) return yield* resolveAuto(current, input.sessionID)
+      if (!input.enabled) return changed
 
       // Release anything already waiting in this session tree.
       for (const [id, item] of Array.from(current.pending.entries())) {
@@ -644,7 +929,7 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [EventV2Bridge.node, Storage.node, Config.node, Session.node],
+  deps: [EventV2Bridge.node, Storage.node, Config.node, Session.node, EffectFlock.node],
 })
 
 export * as Permission from "."

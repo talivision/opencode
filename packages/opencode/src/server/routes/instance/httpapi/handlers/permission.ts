@@ -4,7 +4,7 @@ import { SessionID } from "@/session/schema"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { PermissionNotFoundError } from "../errors"
+import { PermissionNotFoundError, SessionNotFoundError } from "../errors"
 
 export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permission", (handlers) =>
   Effect.gen(function* () {
@@ -40,7 +40,16 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
     const setAuto = Effect.fn("PermissionHttpApi.setAuto")(function* (ctx: {
       payload: { sessionID: SessionID; enabled: boolean }
     }) {
-      return yield* svc.setAuto({ sessionID: ctx.payload.sessionID, enabled: ctx.payload.enabled })
+      return yield* svc.setAuto({ sessionID: ctx.payload.sessionID, enabled: ctx.payload.enabled }).pipe(
+        Effect.catchTag("NotFoundError", () =>
+          Effect.fail(
+            new SessionNotFoundError({
+              sessionID: String(ctx.payload.sessionID),
+              message: `Session not found: ${ctx.payload.sessionID}`,
+            }),
+          ),
+        ),
+      )
     })
 
     const getAuto = Effect.fn("PermissionHttpApi.getAuto")(function* (ctx: { params: { sessionID: SessionID } }) {

@@ -6,8 +6,8 @@ name: harness
 # exercise the services; only this catches wiring that is correct in isolation
 # and wrong in the built product.
 #
-# drive.sh always exits 0 and reports through grep-able PASS/FAIL lines, so
-# this job asserts on those lines rather than on the exit code, and fails when
+# drive.sh's exit code is unreliable (it varies by harness), so this job asserts
+# on its grep-able PASS/FAIL lines rather than on the exit code, and fails when
 # an expected PASS is missing as well as when a FAIL appears — a scenario that
 # silently stops emitting assertions must not read as success.
 
@@ -50,7 +50,7 @@ jobs:
         uses: ./.github/actions/setup-bun
 
       - name: Install tmux
-        run: sudo apt-get update && sudo apt-get install -y tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux sqlite3
 
       - name: Build binary
         run: OPENCODE_VERSION=dev ./packages/opencode/script/build.ts --single --skip-install --skip-embed-web-ui
@@ -78,7 +78,14 @@ jobs:
             PORT="$port" \
             SOCK="/tmp/harness-${harness}-${scenario}.sock" \
             WORK="/tmp/harness-${harness}-${scenario}" \
-              bash "script/${harness}/drive.sh" "$scenario" "$watch" 2>&1 | tee "$log"
+              # GitHub invokes the step with `bash -e`, and `set -uo pipefail`
+              # above does NOT clear -e. drive.sh does not always exit 0 (the
+              # subagent harness exits 1 on failure, and the goal harness runs
+              # under `set -e` with an asserting node script last), so without
+              # `|| true` the first failing scenario aborts the step mid-run and
+              # none of the reporting below — the FAIL grep, the assertion
+              # count, the artifact upload — ever executes.
+              bash "script/${harness}/drive.sh" "$scenario" "$watch" 2>&1 | tee "$log" || true
             echo "::endgroup::"
 
             if grep -qE '^(FAIL|not ok)' "$log"; then

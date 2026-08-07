@@ -45,11 +45,14 @@ Auto mode is a property of a **session**, not of the process:
 - Another session in the same OpenCode process is unaffected, so you can leave one session unattended while another still prompts you.
 - It is resolved on the server, so it applies even while no client is attached. A dropped connection can no longer leave a request stranded, and reconnecting does not lose the mode.
 - It survives restart, resume, and continue for the sessions it was turned on for.
+- Deleting the session it was turned on for revokes it, including for any session that outlives it, and drops the stored entry.
 
-Toggle it with `POST /permission/auto` (`{"sessionID": "...", "enabled": true}`), and read the effective status — including which ancestor it was inherited from — with `GET /permission/auto/:sessionID`.
+Toggle it with `POST /permission/auto` (`{"sessionID": "...", "enabled": true}`), and read the effective status — including which ancestor it was inherited from — with `GET /permission/auto/:sessionID`. The session has to exist. Every change emits a `permission.auto.changed` event, so a connected client can show that prompts are being answered for you rather than simply not arriving.
 
-:::note
-The `--auto` flag and the TUI command-palette toggle still drive the older client-side auto-approval, which replies to prompts as they arrive rather than resolving them in the session. Requests raised while the client is disconnected are not covered by that path.
+`opencode run --auto` sets the mode on the session it creates, which is what makes it cover subagents. The TUI command-palette toggle still drives the older client-side auto-approval, which replies to prompts as they arrive: it only answers prompts raised by the session you are looking at, and it cannot answer anything raised while the client is disconnected.
+
+:::caution
+`POST /permission/auto` is not authenticated beyond the server's own credentials, and neither is any other local endpoint. Anything that can reach the server port — which includes any agent that can run shell commands — can therefore turn auto mode on for a session and every session below it, durably, and it stays on across restarts. Unlike replying to a single prompt, nothing has to be pending for this to take effect. If that matters for your setup, do not expose the server beyond loopback, and check `GET /permission/auto-log` after an unattended run.
 :::
 
 ### Auto mode and deny
@@ -60,7 +63,7 @@ Auto mode turns `"ask"` into `"allow"`. It never turns `"deny"` into `"allow"` �
 
 An auto-approval is not remembered as a rule. Nothing is added to the [remembered approvals](#remembering-approvals) list, so turning auto mode off leaves the permission set exactly as it was before you turned it on.
 
-What is recorded instead is an audit trail: for each distinct permission and pattern auto mode approved, OpenCode stores the session and the time so an unattended run can be reviewed afterwards. It lives next to the remembered approvals, in the same project-scoped file described below, under `audit`.
+What is recorded instead is an audit trail: for each distinct permission and pattern auto mode approved, OpenCode stores the session, when it first and last happened, and how many times, so an unattended run can be reviewed afterwards. It lives next to the remembered approvals, in the same project-scoped file described below, under `audit`. The trail is capped at 500 entries; when a run overflows it, the oldest entries are dropped and a warning is logged.
 
 ---
 
@@ -234,6 +237,13 @@ An `always` approval applies to every session in the current project, subagents 
 ### What is stored, and where
 
 Approvals are stored per project, in `permission/<project-id>.json` under your OpenCode data directory (`~/.local/share/opencode/storage` on Linux, `~/Library/Application Support/opencode/storage` on macOS). The project id is derived from the VCS root, so sibling worktrees of one repository share approvals and unrelated checkouts never do. **An approval made in one project is never applied in another.**
+
+Two details of how the id is derived are worth knowing:
+
+- **Outside a repository, nothing is stored at all.** A directory that is not in a VCS checkout has no root to derive an id from, and every such directory on the machine would otherwise share one id — an approval made in `~/scratch` would be in force in `~/finance`. Rather than share, OpenCode persists nothing there: approvals and auto mode last for the run only, exactly as if `permission_persist` were `false`.
+- **A repository with no remote derives its id from its root commit.** Two checkouts that were started from the same template, or forked before their first divergent commit, therefore share an id and share approvals. Add a remote, or keep sensitive work in a repository with its own history, if that is not what you want.
+
+The store is also written by every OpenCode process working on the same project. Writes are guarded by an advisory file lock and merged rather than replaced, so two processes do not silently drop each other's approvals or audit entries.
 
 Only the pattern that was actually shown in the prompt is stored. The broader pattern set a tool suggests for `always` (`task`, for instance, suggests `*`) applies for the rest of the current run only and is never written to disk — a single click cannot leave a wildcard behind permanently.
 

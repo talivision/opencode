@@ -891,6 +891,48 @@ it.instance("active goals are independently reviewed after every provider turn u
   }),
 )
 
+it.instance("active goal requests keep the joined system message byte-identical across turns", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal system cache stability",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "continue after one provider failure" }],
+    })
+    yield* goals.set({
+      sessionID: session.id,
+      objective: "keep the active goal system prefix stable",
+      tokenBudget: 1,
+    })
+    yield* llm.error(400, { error: { message: "first request failed" } })
+    yield* llm.text("Recovered.", { usage: { input: 10, output: 1 } })
+
+    yield* prompt.loop({ sessionID: session.id })
+
+    const systems = (yield* llm.hits).map((hit) => {
+      if (!Array.isArray(hit.body.messages)) throw new Error("expected request messages")
+      const system = hit.body.messages.filter(
+        (message): message is Record<string, unknown> =>
+          typeof message === "object" && message !== null && message.role === "system",
+      )
+      expect(system).toHaveLength(1)
+      if (typeof system[0]?.content !== "string") throw new Error("expected joined system message")
+      return system[0].content
+    })
+    expect(systems).toHaveLength(2)
+    expect(systems[0]).toBe(systems[1])
+  }),
+)
+
 it.instance("a rejected completion review keeps the goal active until a later review accepts it", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -1521,6 +1563,12 @@ it.instance("a goal turn that dies on a provider error is never handed to the re
     expect(yield* sessions.children(session.id)).toHaveLength(0)
     const goal = yield* goals.get(session.id)
     expect(goal?.review).toBeUndefined()
+    const inputs = yield* llm.inputs
+    expect(JSON.stringify(inputs[1])).toContain("Current active-goal status for this turn:")
+    expect(JSON.stringify(inputs[1])).toContain("Consecutive interrupted goal turns: 1")
+    expect(JSON.stringify(inputs[1])).toContain(
+      "The previous turn ended before you completed it (provider exploded). Resume from current state",
+    )
   }),
 )
 
@@ -1675,6 +1723,10 @@ it.instance("a structured rejection feeds unmet requirements into the continuati
     expect(goal?.status).toBe("complete")
     expect(goal?.review?.attempt).toBe(2)
     // The rejection reached the worker as conversation content, verbatim.
+    expect(continuation).toContain("Current active-goal status for this turn:")
+    expect(continuation).toMatch(/Elapsed: .* across 1 completed goal turn\(s\)\./)
+    expect(continuation).toContain("Token budget: 9 used; no total was set.")
+    expect(continuation).toContain("Independent review attempt 1 did not accept completion")
     expect(continuation).toContain("rejected completion attempt #1")
     expect(continuation).toContain("only one lima appears in the transcript")
     // The worker must never see the reviewer's verdict tool.

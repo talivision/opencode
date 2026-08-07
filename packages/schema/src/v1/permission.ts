@@ -63,4 +63,16 @@ const Replied = define({
   type: "permission.replied",
   schema: { sessionID: SessionID, requestID: ID, reply: Reply },
 })
-export const Event = { Asked, Replied, Definitions: inventory(Asked, Replied) }
+// Auto mode silences every future ask for a session and everything it spawns,
+// so the flip itself has to be observable: without this a client has no way to
+// tell that prompts stopped arriving because they are being auto-approved.
+const AutoChanged = define({
+  type: "permission.auto.changed",
+  schema: {
+    sessionID: SessionID,
+    enabled: Schema.Boolean,
+    explicit: Schema.Boolean,
+    source: Schema.optional(SessionID),
+  },
+})
+export const Event = { Asked, Replied, AutoChanged, Definitions: inventory(Asked, Replied, AutoChanged) }

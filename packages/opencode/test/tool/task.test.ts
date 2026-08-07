@@ -1215,7 +1215,13 @@ describe("tool.task", () => {
       const nonces = envelopes.map((envelope) => /<task-notification [^>]*nonce="([^"]+)"/.exec(envelope)?.[1])
       expect(nonces[0]).toBeDefined()
       expect(nonces[1]).toBe(nonces[0])
-      expect(def.description).toContain(`task-notification nonce for this Task tool instance is "${nonces[0]}"`)
+      // The nonce must NEVER reach the model. This description is rendered into
+      // every agent that can see the task tool, subagents included, so
+      // publishing it would hand the secret to the only party able to abuse
+      // it: an injected subagent could read it from its own context and forge
+      // a perfect notification at its parent.
+      expect(def.description).not.toContain(nonces[0]!)
+      expect(def.description).toContain("always arrives as a separate message of its own")
     }),
   )
 

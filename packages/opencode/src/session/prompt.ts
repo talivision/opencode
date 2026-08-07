@@ -1174,8 +1174,39 @@ const layer = Layer.effect(
       // budget pressure — as conversation content the model attends to and that
       // persists in the transcript, instead of a mutated system-prompt block
       // that silently overwrites its own history.
-      const lines: string[] = []
       const review = current.review
+      const seconds = Math.floor(current.time.elapsed / 1000)
+      const minutes = Math.floor(seconds / 60)
+      const duration =
+        seconds < 60
+          ? `${seconds}s`
+          : minutes < 60
+            ? `${minutes}m ${seconds % 60}s`
+            : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+      const format = new Intl.NumberFormat("en-US")
+      const reviewStatus =
+        review?.status === "rejected" || review?.status === "error"
+          ? `Independent review attempt ${review.attempt} did not accept completion: ${review.reason ?? "No valid reviewer verdict was produced."}`
+          : review?.status === "pending" || review?.status === "running"
+            ? `Independent review attempt ${review.attempt} is ${review.status}.`
+            : "No independent completion review is pending."
+      const lines = [
+        "Current active-goal status for this turn:",
+        `Elapsed: ${duration} across ${current.turns} completed goal turn(s).`,
+        current.tokenBudget === undefined
+          ? `Token budget: ${format.format(current.tokensUsed)} used; no total was set.`
+          : `Token budget: ${format.format(current.tokensUsed)} of ${format.format(current.tokenBudget)} used.`,
+        ...(current.blocker
+          ? [
+              `The same blocker has been reported ${current.blocker.count} consecutive goal turn(s): ${current.blocker.reason}`,
+            ]
+          : []),
+        reviewStatus,
+        ...(current.interrupted
+          ? [`Consecutive interrupted goal turns: ${current.interrupted.count}. The latest made no completion claim.`]
+          : []),
+        "",
+      ]
       if (review?.status === "rejected" || review?.status === "error") {
         lines.push(
           review.status === "rejected"
@@ -1384,6 +1415,14 @@ const layer = Layer.effect(
             apply_patch: false,
             task: false,
             goal: false,
+            // The reviewer reads untrusted repository content and is now
+            // allowed to read outside the worktree. Leaving it a network tool
+            // completes an exfiltration chain that needs no human in it:
+            // injected content directs a read of a credential file and then
+            // ships it out. Reviews verify local state; they do not need the
+            // network.
+            webfetch: false,
+            websearch: false,
             question: false,
             todowrite: false,
           },
@@ -1936,7 +1975,7 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, modelMsgs, goalContext] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, modelMsgs, stableGoalContext] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
@@ -1949,7 +1988,7 @@ const layer = Layer.effect(
               ...instructions,
               ...(mcpInstructions ? [mcpInstructions] : []),
               ...(skills ? [skills] : []),
-              ...(goalContext ? [goalContext] : []),
+              ...(stableGoalContext ? [stableGoalContext] : []),
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)

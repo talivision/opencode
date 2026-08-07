@@ -295,20 +295,6 @@ function objective(value: string) {
   return next
 }
 
-function formatNumber(value: number) {
-  return new Intl.NumberFormat("en-US").format(value)
-}
-
-function formatDuration(ms: number) {
-  const seconds = Math.floor(ms / 1000)
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  const rest = seconds % 60
-  if (minutes < 60) return `${minutes}m ${rest}s`
-  const hours = Math.floor(minutes / 60)
-  return `${hours}h ${minutes % 60}m`
-}
-
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -622,37 +608,28 @@ const layer = Layer.effect(
     const context = Effect.fn("SessionGoal.context")(function* (sessionID: SessionID) {
       const info = yield* get(sessionID)
       if (info?.status !== "active") return
-      const budget =
-        info.tokenBudget === undefined
-          ? "No token budget was set."
-          : `Token budget: ${formatNumber(info.tokensUsed)} of ${formatNumber(info.tokenBudget)} used.`
-      const blocker = info.blocker
-        ? `The same blocker has been reported ${info.blocker.count} consecutive goal turn(s): ${info.blocker.reason}`
-        : "No repeated blocker is currently recorded."
-      const review =
-        info.review?.status === "rejected" || info.review?.status === "error"
-          ? `Independent review attempt ${info.review.attempt} did not accept completion: ${info.review.reason ?? "No valid reviewer verdict was produced."}`
-          : info.review?.status === "pending" || info.review?.status === "running"
-            ? `Independent review attempt ${info.review.attempt} is ${info.review.status}.`
-            : "No independent completion review is pending."
-      const interrupted = info.interrupted
-        ? [
-            `The previous goal turn ended before you completed it: ${info.interrupted.reason}`,
-            `That turn made no completion claim, so no independent review was run for it${
-              info.interrupted.count > 1 ? ` (${info.interrupted.count} consecutive interrupted turns)` : ""
-            }.`,
-            "Resume the objective from current state. Re-establish where you were from the transcript and working tree rather than restarting, and do not treat the interruption as a reason to stop or to claim completion.",
-          ]
-        : []
       return [
         "<active-goal>",
         `Status: ${info.status}`,
         `Objective: ${info.objective}`,
-        ...interrupted,
-        `Elapsed: ${formatDuration(info.time.elapsed)} across ${info.turns} completed goal turn(s).`,
-        budget,
-        blocker,
-        review,
+        "",
+        // Review state stays in the system block on purpose. It changes only
+        // at a review boundary, not on every request, so it costs a cache miss
+        // per review rather than per turn — and it MUST be here: when a worker
+        // requests completion via the goal tool the loop continues inside the
+        // same turn, so no continuation message is generated and the
+        // continuation is not a channel the reviewer's feedback can rely on.
+        // Elapsed time, turn and token counts move out because they change on
+        // literally every request and would invalidate the cached prefix
+        // continuously.
+        ...(info.review?.status === "rejected" || info.review?.status === "error"
+          ? [
+              `Independent review attempt ${info.review.attempt} did not accept completion: ${info.review.reason ?? "No valid reviewer verdict was produced."}`,
+            ]
+          : info.review?.status === "pending" || info.review?.status === "running"
+            ? [`Independent review attempt ${info.review.attempt} is ${info.review.status}.`]
+            : []),
+        "Current elapsed time, turn and token accounting, blocker state, and interruption details arrive in each goal continuation turn message.",
         "",
         "Keep the full objective intact and treat it as the task to pursue until it is genuinely achieved.",
         "Work autonomously and verify every explicit requirement against authoritative current-state evidence.",

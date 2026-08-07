@@ -354,6 +354,42 @@ export const RunCommand = effectCmd({
         })
       }
 
+      // Filled in below with whatever transport this run talks to the server
+      // over: the in-process app fetch locally, plain fetch when attached.
+      let transport: { baseUrl: string; fetch: typeof globalThis.fetch } | undefined
+
+      /**
+       * Turn on server-side auto mode for a session.
+       *
+       * `--auto` used to be nothing but a client-side reply loop, and that loop
+       * only answered prompts raised by the root session. Anything a subagent
+       * asked for - a goal reviewer above all - was never answered and simply
+       * blocked. Setting the mode on the root session instead makes the server
+       * resolve every ask in the tree without a client in the loop, and every
+       * descendant inherits it.
+       *
+       * The generated SDK has no binding for this endpoint yet, so the request
+       * goes out over the same transport the SDK itself uses.
+       */
+      const enableServerAuto = async (sessionID: string, dir?: string) => {
+        if (!transport) return false
+        const headers: Record<string, string> = { "content-type": "application/json" }
+        if (attachHeaders) Object.assign(headers, attachHeaders)
+        if (dir) headers["x-opencode-directory"] = encodeURIComponent(dir)
+        try {
+          const response = await transport.fetch(transport.baseUrl.replace(/\/+$/, "") + "/permission/auto", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ sessionID, enabled: true }),
+          })
+          if (response.ok) return true
+          UI.error(`failed to enable auto mode on the server (HTTP ${response.status})`)
+        } catch (error) {
+          UI.error(`failed to enable auto mode on the server: ${error instanceof Error ? error.message : error}`)
+        }
+        return false
+      }
+
       const files: FilePart[] = []
       if (args.file) {
         const list = Array.isArray(args.file) ? args.file : [args.file]
@@ -690,6 +726,37 @@ export const RunCommand = effectCmd({
           return false
         }
 
+        // Which sessions belong to the tree this run owns. The event stream is
+        // instance-wide and an attached server may be serving other clients, so
+        // answering a permission request purely because it arrived would mean
+        // approving or rejecting somebody else's prompt.
+        const ownership = new Map<string, boolean>([[sessionID, true]])
+        async function owned(client: OpencodeClient, id: string): Promise<boolean> {
+          const known = ownership.get(id)
+          if (known !== undefined) return known
+          const chain: string[] = []
+          const seen = new Set<string>()
+          let cursor: string | undefined = id
+          let result = false
+          while (cursor && !seen.has(cursor)) {
+            seen.add(cursor)
+            const cached = ownership.get(cursor)
+            if (cached !== undefined) {
+              result = cached
+              break
+            }
+            chain.push(cursor)
+            const info: { parentID?: string } | undefined = await client.session
+              .get({ sessionID: cursor })
+              .then((res) => res.data)
+              .catch(() => undefined)
+            if (!info) break
+            cursor = info.parentID
+          }
+          for (const item of chain) ownership.set(item, result)
+          return result
+        }
+
         // Consume one subscribed event stream for the active session and mirror it
         // to stdout/UI. `client` is passed explicitly because attach mode may
         // rebind the SDK to the session's directory after the subscription is
@@ -795,9 +862,15 @@ export const RunCommand = effectCmd({
 
             if (event.type === "permission.asked") {
               const permission = event.properties
-              if (permission.sessionID !== sessionID) continue
+              // Subagent prompts are answered too. This is a non-interactive
+              // run: nobody is there to answer them, and leaving one pending
+              // stalls the session that raised it until the process is killed.
+              if (!(await owned(client, permission.sessionID))) continue
 
               if (auto) {
+                // Legacy fallback only. When server-side auto mode is on, the
+                // server resolves these without publishing `permission.asked`
+                // at all, so there is nothing here to double-answer.
                 await client.permission.reply({
                   requestID: permission.id,
                   reply: "once",
@@ -819,6 +892,18 @@ export const RunCommand = effectCmd({
         }
         const cwd = args.attach ? (directory ?? sess.directory ?? (await current(sdk))) : (directory ?? root)
         const client = args.attach ? attachSDK(cwd) : sdk
+
+        // Must happen before the first prompt: from here on the server answers
+        // every ask in this session tree itself, including the ones raised by
+        // subagents the reply loop below cannot see.
+        const serverAuto = auto ? await enableServerAuto(sessionID, args.attach ? cwd : directory) : false
+        if (auto && !serverAuto) {
+          UI.println(
+            UI.Style.TEXT_WARNING_BOLD + "!",
+            UI.Style.TEXT_NORMAL +
+              "server-side auto mode is unavailable; falling back to client-side replies, which cannot answer prompts raised while disconnected",
+          )
+        }
 
         // Validate agent if specified
         const agent = await pickAgent(client)
@@ -937,6 +1022,7 @@ export const RunCommand = effectCmd({
 
       if (args.attach) {
         const sdk = attachSDK(directory)
+        transport = { baseUrl: args.attach, fetch: globalThis.fetch }
         return await execute(sdk)
       }
 
@@ -953,6 +1039,7 @@ export const RunCommand = effectCmd({
         fetch: fetchFn,
         directory,
       })
+      transport = { baseUrl: "http://opencode.internal", fetch: fetchFn }
       await execute(sdk)
     })
   }),

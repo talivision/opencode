@@ -168,10 +168,11 @@ describe("SessionGoal", () => {
     }),
   )
 
-  it.live("records an interrupted turn and tells the worker to resume, then clears it", () =>
+  it.live("records and clears interrupted turns without mutating stable context", () =>
     Effect.gen(function* () {
       const { goal, sessionID } = yield* setup()
       yield* goal.set({ sessionID, objective: "survive a flaky provider" })
+      const stable = yield* goal.context(sessionID)
 
       yield* goal.recordTurn({ sessionID, tokens: 0, interrupted: "Provider is overloaded" })
       const first = yield* goal.get(sessionID)
@@ -179,22 +180,21 @@ describe("SessionGoal", () => {
       expect(first?.interrupted?.count).toBe(1)
 
       const context = yield* goal.context(sessionID)
-      expect(context).toContain("ended before you completed it: Provider is overloaded")
-      expect(context).toContain("no independent review was run")
-      expect(context).toContain("Resume the objective from current state")
-      // A run that never completed must not read as a rejected completion.
-      expect(context).toContain("No independent completion review is pending.")
+      expect(context).toBe(stable)
+      expect(context).toContain("interruption details arrive in each goal continuation turn message")
+      expect(context).not.toContain("Provider is overloaded")
+      expect(context).not.toContain("Elapsed:")
 
       yield* goal.recordTurn({ sessionID, tokens: 0, interrupted: "Provider is overloaded" })
       const second = yield* goal.get(sessionID)
       expect(second?.interrupted?.count).toBe(2)
-      expect(yield* goal.context(sessionID)).toContain("2 consecutive interrupted turns")
+      expect(yield* goal.context(sessionID)).toBe(stable)
 
       // A turn that ends normally clears the note.
       yield* goal.recordTurn({ sessionID, tokens: 12 })
       const recovered = yield* goal.get(sessionID)
       expect(recovered?.interrupted).toBeUndefined()
-      expect(yield* goal.context(sessionID)).not.toContain("ended before you completed it")
+      expect(yield* goal.context(sessionID)).toBe(stable)
     }),
   )
 
@@ -464,6 +464,7 @@ describe("SessionGoal", () => {
     Effect.gen(function* () {
       const { goal, sessionID } = yield* setup()
       yield* goal.set({ sessionID, objective: "ship and independently verify the feature" })
+      const stable = yield* goal.context(sessionID)
 
       const first = yield* goal.requestReview({ sessionID, evidence: "Worker claims the feature is done." })
       expect(first?.status).toBe("active")
@@ -482,7 +483,19 @@ describe("SessionGoal", () => {
       expect(rejected?.status).toBe("active")
       expect(rejected?.review?.status).toBe("rejected")
       expect(rejected?.tokensUsed).toBe(17)
-      expect(yield* goal.context(sessionID)).toContain("The normal TUI has not been verified.")
+      // Review state DOES belong in the stable block, and this is the reason:
+      // when a worker requests completion through the goal tool the loop keeps
+      // going inside the same turn, so no continuation message is produced and
+      // the reviewer's rejection would otherwise reach the model nowhere at
+      // all. It costs one cache miss per review, not one per request — the
+      // turn/token/elapsed counters are what had to move out, and the
+      // stability of the block across those is asserted above.
+      const afterRejection = yield* goal.context(sessionID)
+      expect(afterRejection).toContain("The normal TUI has not been verified.")
+      expect(afterRejection).toContain("did not accept completion")
+      // Still stable across pure accounting churn.
+      yield* goal.recordTurn({ sessionID, tokens: 0 })
+      expect(yield* goal.context(sessionID)).toBe(afterRejection)
 
       const second = yield* goal.requestReview({ sessionID, evidence: "Normal TUI evidence is now attached." })
       expect(second?.review?.attempt).toBe(2)

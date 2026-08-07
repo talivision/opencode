@@ -22,7 +22,12 @@ export function DialogRunningTasks(props: { tasks: ToolPart[] }) {
   const [toStop, setToStop] = createSignal<string>()
   const [stopped, setStopped] = createSignal(new Set<string>())
   const [stopping, setStopping] = createSignal(new Set<string>())
-  const tasks = props.tasks
+  // A memo, not a plain expression: props.tasks is reactive, and evaluating it
+  // once in the component body froze the list at the moment the dialog opened,
+  // so a task that started or finished while it was open never appeared or
+  // disappeared. The pre-extraction version was reactive; this restores that.
+  const tasks = createMemo(() =>
+    props.tasks
     .flatMap((part) => {
       if (part.state.status === "pending") return []
       const sessionID = part.state.metadata?.sessionId
@@ -36,10 +41,11 @@ export function DialogRunningTasks(props: { tasks: ToolPart[] }) {
         },
       ]
     })
-    .filter((task, index, all) => all.findIndex((item) => item.sessionID === task.sessionID) === index)
+    .filter((task, index, all) => all.findIndex((item) => item.sessionID === task.sessionID) === index),
+  )
 
   const options = createMemo<DialogSelectOption<string>[]>(() =>
-    tasks.map((task) => {
+    tasks().map((task) => {
       const isStopped = stopped().has(task.sessionID)
       const busy = !isStopped && sync.data.session_status[task.sessionID]?.type === "busy"
       return {
