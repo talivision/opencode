@@ -23,6 +23,11 @@ const patterns = [
   /request entity too large/i,
   /context length is only \d+ tokens/i,
   /input length.*exceeds.*context length/i,
+  // Anthropic rejects on the combined input + max_tokens budget, e.g.
+  // "input length and `max_tokens` exceed context limit: 199000 + 32000 > 200000".
+  // Note "exceed", not "exceeds", and "context limit", not "context length".
+  /input length and .{0,24}max_tokens.{0,24} exceeds? context limit/i,
+  /exceeds? context limit: [\d,]+ \+ [\d,]+ > [\d,]+/i,
   /prompt too long; exceeded (?:max )?context length/i,
   /too large for model with \d+ maximum context length/i,
   /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,

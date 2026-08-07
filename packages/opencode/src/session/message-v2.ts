@@ -615,6 +615,12 @@ export function fromError(
       ).toObject()
     case OutputLengthError.isInstance(e):
       return e
+    // Already classified upstream. Without this case it falls through to the
+    // generic `e instanceof Error` arm and becomes an UnknownError, which makes
+    // the processor's ContextOverflowError check miss and skips compaction
+    // recovery entirely.
+    case ContextOverflowError.isInstance(e):
+      return e instanceof ContextOverflowError ? e.toObject() : e
     case LoadAPIKeyError.isInstance(e):
       return new AuthError(
         {

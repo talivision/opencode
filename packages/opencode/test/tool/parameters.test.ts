@@ -243,6 +243,17 @@ describe("tool parameters", () => {
       const parsed = parse(Task, { description: "d", prompt: "p", subagent_type: "general", background: true })
       expect(parsed.background).toBe(true)
     })
+    test("accepts optional model and variant", () => {
+      const parsed = parse(Task, {
+        description: "d",
+        prompt: "p",
+        subagent_type: "general",
+        model: "test/fast",
+        variant: "high",
+      })
+      expect(parsed.model).toBe("test/fast")
+      expect(parsed.variant).toBe("high")
+    })
     test("rejects missing prompt", () => {
       expect(accepts(Task, { description: "d", subagent_type: "general" })).toBe(false)
     })

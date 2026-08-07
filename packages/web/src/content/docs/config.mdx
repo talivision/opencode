@@ -745,14 +745,26 @@ You can control context compaction behavior through the `compaction` option.
   "compaction": {
     "auto": true,
     "prune": false,
-    "reserved": 10000
+    "reserved": 10000,
+    "output_floor": 16384,
+    "dynamic_output": true
   }
 }
 ```
 
 - `auto` - Automatically compact the session when context is full (default: `true`).
 - `prune` - Remove old tool outputs to save tokens (default: `false`). Set to `true` to enable pruning.
-- `reserved` - Token buffer for compaction. Leaves enough window to avoid overflow during compaction.
+- `reserved` - Token buffer for compaction. Compaction triggers once the context reaches the model's limit minus this value. Setting it overrides the automatic trigger point entirely.
+- `output_floor` - Smallest output window requested for a response, in tokens. Defaults to the smaller of `16384` and the model's output limit, and is never allowed to exceed half of a shared context window. This is a sizing knob only — it never triggers compaction on its own.
+- `dynamic_output` - Size the requested output window to the room actually left in the context instead of always reserving the model's full output limit (default: `true`). Set to `false` to restore the previous behavior.
+
+#### Dynamic output window
+
+Models that publish a single combined context limit — which includes every Anthropic model — bill input and output against the same budget. opencode used to reserve the model's full output limit (up to 32k tokens) on every request, so that much context was unavailable even when the reply was one line.
+
+opencode now requests only the room that is actually left, never less than `output_floor`. Long sessions get noticeably more usable context, and compaction on these models triggers slightly later than before. If a request still does not fit, the provider rejects it and opencode compacts and retries as it always has.
+
+Models that publish a separate input limit are unaffected: their input and output budgets are independent, so the full output limit is always requested. Set `dynamic_output` to `false` to opt out.
 
 ---
 

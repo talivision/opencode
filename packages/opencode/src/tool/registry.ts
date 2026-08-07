@@ -58,8 +58,19 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpCatalog } from "@/mcp/catalog"
 import { GoalTool } from "./goal"
 import { GoalVerdictTool } from "./goal-verdict"
+import { GoalTranscriptTool } from "./goal-transcript"
+import { GoalChecklistTool } from "./goal-checklist"
 import { SessionGoal } from "@/session/goal"
 import { SessionStatus } from "@/session/status"
+
+// Tools that exist only for the native goal reviewer. Kept as one set so a
+// new reviewer-only tool cannot be added to the registry while silently
+// missing the gate below.
+export const REVIEWER_ONLY_TOOLS: ReadonlySet<string> = new Set([
+  GoalVerdictTool.id,
+  GoalTranscriptTool.id,
+  GoalChecklistTool.id,
+])
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return providerID === ProviderV2.ID.opencode || flags.exa || flags.parallel
@@ -119,6 +130,8 @@ const layer = Layer.effect(
     const skilltool = yield* SkillTool
     const goaltool = yield* GoalTool
     const goalverdicttool = yield* GoalVerdictTool
+    const goaltranscripttool = yield* GoalTranscriptTool
+    const goalchecklisttool = yield* GoalChecklistTool
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
@@ -228,6 +241,8 @@ const layer = Layer.effect(
           skill: Tool.init(skilltool),
           goal: Tool.init(goaltool),
           goalVerdict: Tool.init(goalverdicttool),
+          goalTranscript: Tool.init(goaltranscripttool),
+          goalChecklist: Tool.init(goalchecklisttool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
@@ -255,6 +270,8 @@ const layer = Layer.effect(
             tool.skill,
             tool.goal,
             tool.goalVerdict,
+            tool.goalTranscript,
+            tool.goalChecklist,
             tool.patch,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
@@ -306,11 +323,16 @@ const layer = Layer.effect(
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }
-        // The verdict tool is the reviewer's unforgeable channel: no other
+        // The reviewer-only tools are the reviewer's private channel: no other
         // agent — especially not the worker whose claim is under review — may
-        // ever see it in its tool list. The native check keeps a config agent
-        // that merely renamed itself "goal-reviewer" from qualifying.
-        if (tool.id === GoalVerdictTool.id) return input.agent.name === "goal-reviewer" && input.agent.native === true
+        // ever see them in its tool list. goal_verdict is unforgeable, and
+        // goal_transcript reads the parent session, so both must be gated. The
+        // gate keys on the goalReviewer marker, which is stamped only by the
+        // native reviewer construction and never copied from user config —
+        // config MAY rename a native agent, so keying on the name would let
+        // any renamed native inherit the reviewer's tool surface.
+        if (REVIEWER_ONLY_TOOLS.has(tool.id))
+          return input.agent.goalReviewer === true && input.agent.native === true
 
         const usePatch =
           input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")

@@ -14,6 +14,7 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import { Provider } from "@/provider/provider"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -47,6 +48,13 @@ const ParameterFields = {
   task_id: Schema.optional(Schema.String).annotate({
     description:
       "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
+  }),
+  model: Schema.optional(Schema.String).annotate({
+    description:
+      'Model to use for this subagent in "provider/model" form. Set this per call to fan out the same subagent type across different models',
+  }),
+  variant: Schema.optional(Schema.String).annotate({
+    description: "Model variant to use for this subagent, such as a reasoning effort level",
   }),
   command: Schema.optional(Schema.String).annotate({ description: "The command that triggered this task" }),
 }
@@ -87,6 +95,7 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const provider = yield* Provider.Service
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -115,6 +124,43 @@ export const TaskTool = Tool.define(
         )
       }
 
+      const next = yield* agent.get(params.subagent_type)
+      if (!next) {
+        return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
+      }
+      // Only agents the catalogue actually advertises may be spawned. Without
+      // this, a worker can spawn hidden internal agents — goal-reviewer,
+      // compaction, title, summary — none of which are built to be driven by
+      // another model, and the reviewer of the worker's own goal least of all.
+      if (next.mode === "primary" || next.hidden === true) {
+        return yield* Effect.fail(
+          new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`),
+        )
+      }
+
+      const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.orDie,
+      )
+      if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
+      const parsed = params.model ? Provider.parseModel(params.model) : undefined
+      if (parsed) {
+        yield* provider
+          .getModel(parsed.providerID, parsed.modelID)
+          .pipe(
+            Effect.catchIf(Provider.ModelNotFoundError.isInstance, (error) =>
+              Effect.fail(
+                new Error(
+                  `Unknown model: ${params.model} is not a valid model.${error.suggestions?.length ? ` Did you mean: ${error.suggestions.join(", ")}?` : ""} Run \`opencode models\` to list available models.`,
+                ),
+              ),
+            ),
+          )
+      }
+      const model = parsed ?? next.model ?? { modelID: msg.info.modelID, providerID: msg.info.providerID }
+      const parentVariant = msg.info.variant
+      const variant = params.variant ?? (next.model ? undefined : parentVariant)
+
       if (!ctx.extra?.bypassAgentCheck) {
         yield* ctx.ask({
           permission: id,
@@ -123,13 +169,9 @@ export const TaskTool = Tool.define(
           metadata: {
             description: params.description,
             subagent_type: params.subagent_type,
+            model,
           },
         })
-      }
-
-      const next = yield* agent.get(params.subagent_type)
-      if (!next) {
-        return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
       }
 
       const session = params.task_id
@@ -174,20 +216,11 @@ export const TaskTool = Tool.define(
           ],
         }))
 
-      const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
-        Effect.provideService(Database.Service, database),
-        Effect.orDie,
-      )
-      if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
-      const variant = msg.info.variant
-
-      const model = next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
-      }
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
+        modelID: model.modelID,
+        providerID: model.providerID,
         model,
         ...(runInBackground ? { background: true } : {}),
       }
@@ -209,7 +242,7 @@ export const TaskTool = Tool.define(
             modelID: model.modelID,
             providerID: model.providerID,
           },
-          variant: next.model ? undefined : variant,
+          variant,
           agent: next.name,
           parts,
         })
@@ -231,7 +264,7 @@ export const TaskTool = Tool.define(
           .prompt({
             sessionID: ctx.sessionID,
             agent: currentParent.agent ?? ctx.agent,
-            variant,
+            variant: parentVariant,
             parts: [
               {
                 type: "text",
@@ -277,7 +310,7 @@ export const TaskTool = Tool.define(
               modelID: model.modelID,
               providerID: model.providerID,
             },
-            variant: next.model ? undefined : variant,
+            variant,
             agent: next.name,
             parts,
           })

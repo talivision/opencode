@@ -3,7 +3,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -24,6 +24,7 @@ import { disposeAllInstances } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Provider } from "@/provider/provider"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -32,6 +33,27 @@ afterEach(async () => {
 const ref = {
   providerID: ProviderV2.ID.make("test"),
   modelID: ModelV2.ID.make("test-model"),
+}
+
+const taskModelConfig = {
+  provider: {
+    test: {
+      name: "Task Test",
+      npm: "@ai-sdk/openai-compatible",
+      env: [],
+      models: Object.fromEntries(
+        ["test-model", "agent-model", "call-model", "model-a", "model-b", "model-c"].map((modelID) => [
+          modelID,
+          {
+            name: modelID,
+            limit: { context: 8_000, output: 2_000 },
+            variants: { high: {} },
+          },
+        ]),
+      ),
+      options: { apiKey: "test" },
+    },
+  },
 }
 
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
@@ -51,6 +73,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       Database.node,
       RuntimeFlags.node,
       Ripgrep.node,
+      Provider.node,
     ]),
     [[RuntimeFlags.node, RuntimeFlags.layer(flags)]],
   )
@@ -298,9 +321,183 @@ describe("tool.task", () => {
         metadata: {
           description: "inspect bug",
           subagent_type: "general",
+          model: ref,
         },
       })
     }),
+  )
+
+  it.instance(
+    "rejects an unknown per-call model before creating a child session",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        const exit = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "general",
+              model: "test/missing-model",
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(String(Cause.squash(exit.cause))).toContain("Unknown model: test/missing-model")
+          expect(String(Cause.squash(exit.cause))).toContain("opencode models")
+        }
+        expect(yield* sessions.children(chat.id)).toHaveLength(0)
+      }),
+    { config: taskModelConfig },
+  )
+
+  it.instance(
+    "per-call model overrides the agent model and is included in result metadata",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            model: "test/call-model",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(seen?.model).toEqual({
+          providerID: ProviderV2.ID.make("test"),
+          modelID: ModelV2.ID.make("call-model"),
+        })
+        expect(result.metadata.modelID).toBe(ModelV2.ID.make("call-model"))
+        expect(result.metadata.providerID).toBe(ProviderV2.ID.make("test"))
+        expect(result.metadata.model).toEqual({
+          providerID: ProviderV2.ID.make("test"),
+          modelID: ModelV2.ID.make("call-model"),
+        })
+      }),
+    {
+      config: {
+        ...taskModelConfig,
+        agent: { reviewer: { mode: "subagent", model: "test/agent-model" } },
+      },
+    },
+  )
+
+  it.instance(
+    "per-call variant applies when the agent has a configured model",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+
+        yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            variant: "high",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(seen?.model?.modelID).toBe(ModelV2.ID.make("agent-model"))
+        expect(seen?.variant).toBe("high")
+      }),
+    {
+      config: {
+        ...taskModelConfig,
+        agent: { reviewer: { mode: "subagent", model: "test/agent-model" } },
+      },
+    },
+  )
+
+  it.instance(
+    "resolved model is included in permission and result metadata",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let permission: unknown
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "test/call-model",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: (input) => Effect.sync(() => (permission = input)),
+          },
+        )
+
+        expect(permission).toEqual({
+          permission: "task",
+          patterns: ["general"],
+          always: ["*"],
+          metadata: {
+            description: "inspect bug",
+            subagent_type: "general",
+            model: {
+              providerID: ProviderV2.ID.make("test"),
+              modelID: ModelV2.ID.make("call-model"),
+            },
+          },
+        })
+        expect(result.metadata.modelID).toBe(ModelV2.ID.make("call-model"))
+        expect(result.metadata.providerID).toBe(ProviderV2.ID.make("test"))
+      }),
+    { config: taskModelConfig },
   )
 
   it.instance("execute cancels child session when abort signal fires", () =>
@@ -671,6 +868,63 @@ describe("tool.task", () => {
       expect(result.output).toContain(`state="running"`)
       expect(job?.status).toBe("running")
     }),
+  )
+
+  background.instance(
+    "runs concurrent background children of one agent on different per-call models",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const seen = new Map<SessionID, ModelV2.ID>()
+        const models = ["model-a", "model-b", "model-c"]
+        const context = {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: stubOps({
+              onPrompt: (input) => {
+                if (input.sessionID !== chat.id && input.model) seen.set(input.sessionID, input.model.modelID)
+              },
+            }),
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        }
+
+        const results = yield* Effect.all(
+          models.map((modelID) =>
+            def.execute(
+              {
+                description: `compare ${modelID}`,
+                prompt: "inspect the same problem",
+                subagent_type: "general",
+                model: `test/${modelID}`,
+                background: true,
+              },
+              context,
+            ),
+          ),
+          { concurrency: "unbounded" },
+        )
+        const waited = yield* Effect.all(
+          results.map((result) => jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })),
+          { concurrency: "unbounded" },
+        )
+
+        expect(waited.map((result) => result.info?.status)).toEqual(["completed", "completed", "completed"])
+        results.forEach((result, index) => {
+          expect(result.metadata.modelID).toBe(ModelV2.ID.make(models[index]))
+          expect(result.metadata.providerID).toBe(ProviderV2.ID.make("test"))
+          expect(seen.get(result.metadata.sessionId)).toBe(ModelV2.ID.make(models[index]))
+        })
+      }),
+    { config: taskModelConfig },
   )
 
   background.instance("steering a running background task delivers the message immediately", () =>

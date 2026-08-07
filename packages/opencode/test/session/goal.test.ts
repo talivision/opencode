@@ -174,6 +174,176 @@ describe("SessionGoal", () => {
     }),
   )
 
+  it.live("the requirement checklist is write-once, reviewer-bound, and cleared by an objective edit", () =>
+    Effect.gen(function* () {
+      const { goal, sessionID } = yield* setup()
+      yield* goal.set({ sessionID, objective: "ship two independently verifiable things" })
+      yield* goal.requestReview({ sessionID })
+      const reviewerID = SessionID.create()
+      yield* goal.beginReview(sessionID, reviewerID)
+
+      // A session that is not the running reviewer cannot write the checklist.
+      const forged = yield* goal.recordRequirements({
+        sessionID,
+        reviewerSessionID: SessionID.create(),
+        requirements: [{ id: "R1", text: "forged" }],
+      })
+      expect(forged?.requirements).toBeUndefined()
+
+      const first = yield* goal.recordRequirements({
+        sessionID,
+        reviewerSessionID: reviewerID,
+        requirements: [
+          { id: "R1", text: "the exporter exists" },
+          { id: "R2", text: "the exporter is covered by tests" },
+        ],
+      })
+      expect(first?.requirements?.map((item) => item.id)).toEqual(["R1", "R2"])
+      expect(first?.requirements?.every((item) => item.status === "unverified" && item.attempt === 0)).toBe(true)
+
+      // First write wins, exactly like submitVerdict.
+      const second = yield* goal.recordRequirements({
+        sessionID,
+        reviewerSessionID: reviewerID,
+        requirements: [{ id: "R1", text: "a narrower objective" }],
+      })
+      expect(second?.requirements?.map((item) => item.text)).toEqual([
+        "the exporter exists",
+        "the exporter is covered by tests",
+      ])
+
+      // A new objective invalidates the decomposition of the old one.
+      const edited = yield* goal.edit({ sessionID, objective: "ship something else entirely" })
+      expect(edited?.requirements).toBeUndefined()
+      expect(edited?.review).toBeUndefined()
+    }),
+  )
+
+  it.live("per-requirement verdicts fold into durable state and carry to the next attempt", () =>
+    Effect.gen(function* () {
+      const { goal, sessionID } = yield* setup()
+      yield* goal.set({ sessionID, objective: "two requirements, one attempt each" })
+      yield* goal.requestReview({ sessionID })
+      const firstReviewer = SessionID.create()
+      yield* goal.beginReview(sessionID, firstReviewer)
+      yield* goal.recordRequirements({
+        sessionID,
+        reviewerSessionID: firstReviewer,
+        requirements: [
+          { id: "R1", text: "the exporter exists" },
+          { id: "R2", text: "the exporter is covered by tests" },
+        ],
+      })
+      yield* goal.submitVerdict({
+        sessionID,
+        reviewerSessionID: firstReviewer,
+        met: false,
+        summary: "one of two",
+        unmet: [{ requirement: "tests", evidence: "no test file exists" }],
+        requirements: [
+          { id: "R1", status: "met", evidence: "src/exporter.ts defines it" },
+          { id: "R2", status: "unmet", evidence: "no exporter.test.ts on disk" },
+          // An id that is not on the checklist is dropped, never invented.
+          { id: "R9", status: "met", evidence: "phantom" },
+        ],
+      })
+      const folded = yield* goal.get(sessionID)
+      expect(folded?.requirements).toHaveLength(2)
+      expect(folded?.requirements?.[0]).toMatchObject({
+        id: "R1",
+        status: "met",
+        evidence: "src/exporter.ts defines it",
+        attempt: 1,
+      })
+      expect(folded?.requirements?.[1]).toMatchObject({ id: "R2", status: "unmet", attempt: 1 })
+      // The id-less unmet[] array keeps working alongside it.
+      expect(folded?.review?.verdict?.unmet).toHaveLength(1)
+
+      yield* goal.finishReview({
+        sessionID,
+        reviewerSessionID: firstReviewer,
+        accepted: false,
+        reason: "R2 is unmet",
+        tokens: 5,
+      })
+      // Conclusions, not sessions, are what carries forward.
+      const next = yield* goal.requestReview({ sessionID })
+      expect(next?.requirements?.map((item) => item.status)).toEqual(["met", "unmet"])
+    }),
+  )
+
+  it.live("records measured per-attempt reviewer cost", () =>
+    Effect.gen(function* () {
+      const { goal, sessionID } = yield* setup()
+      yield* goal.set({ sessionID, objective: "measure the reviewer" })
+      yield* goal.requestReview({ sessionID })
+      const reviewerID = SessionID.create()
+      yield* goal.beginReview(sessionID, reviewerID)
+      const finished = yield* goal.finishReview({
+        sessionID,
+        reviewerSessionID: reviewerID,
+        accepted: true,
+        reason: "verified",
+        tokens: 58,
+        stats: {
+          inputTokens: 9_000,
+          cacheReadTokens: 4_000,
+          outputTokens: 58,
+          retrievalCalls: 3,
+          durationMs: 12_345,
+        },
+      })
+      expect(finished?.review?.attemptStats).toHaveLength(1)
+      expect(finished?.review?.attemptStats?.[0]).toMatchObject({
+        attempt: 1,
+        inputTokens: 9_000,
+        cacheReadTokens: 4_000,
+        outputTokens: 58,
+        retrievalCalls: 3,
+      })
+      // The budget stays generated-tokens-only; prompt/cache tokens are stats.
+      expect(finished?.tokensUsed).toBe(58)
+    }),
+  )
+
+  it.live("decodes a goal row written before requirements and attemptStats existed", () =>
+    Effect.gen(function* () {
+      const goal = yield* SessionGoal.Service
+      const storage = yield* Storage.Service
+      const sessionID = SessionID.create()
+      yield* Effect.addFinalizer(() => goal.clear(sessionID).pipe(Effect.ignore))
+      const now = Date.now()
+      // Verbatim shape of a pre-tranche stored row.
+      yield* storage.write(["goal", sessionID], {
+        sessionID,
+        objective: "a goal stored before this tranche",
+        status: "active",
+        tokensUsed: 120,
+        turns: 3,
+        review: {
+          status: "rejected",
+          attempt: 2,
+          requestedAt: now - 1000,
+          updatedAt: now,
+          reason: "not yet",
+          errorStreak: 0,
+          verdict: { met: false, summary: "no", unmet: [{ requirement: "a", evidence: "b" }], at: now },
+          history: [{ attempt: 1, reason: "first rejection", at: now - 500 }],
+        },
+        time: { created: now - 5000, updated: now, running: now, elapsed: 1000 },
+      })
+
+      const loaded = yield* goal.get(sessionID)
+      expect(loaded?.objective).toBe("a goal stored before this tranche")
+      expect(loaded?.requirements).toBeUndefined()
+      expect(loaded?.review?.attemptStats).toBeUndefined()
+      expect(loaded?.review?.history).toHaveLength(1)
+      // And it stays writable through the new code paths.
+      const turned = yield* goal.recordTurn({ sessionID, tokens: 1 })
+      expect(turned?.turns).toBe(4)
+    }),
+  )
+
   it.live("history records substantive rejections but not infrastructure errors", () =>
     Effect.gen(function* () {
       const { goal, sessionID } = yield* setup()

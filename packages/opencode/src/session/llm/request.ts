@@ -5,7 +5,6 @@ import type { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceState } from "@/effect/instance-state"
 import { Permission } from "@/permission"
 import type { Agent } from "@/agent/agent"
-import type { MessageV2 } from "../message-v2"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { SystemPrompt } from "../system"
@@ -14,6 +13,15 @@ import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
 import type { Plugin } from "@/plugin"
 import { mergeDeep } from "remeda"
+import {
+  estimateInput,
+  outputCeiling,
+  outputFloor,
+  requestedOutput,
+  thinkingBudget,
+  THINKING_TEXT_ROOM,
+} from "../output-window"
+import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 
 const USER_AGENT = `opencode/${InstallationVersion}`
 
@@ -32,6 +40,7 @@ type PrepareInput = {
   readonly auth: Auth.Info | undefined
   readonly plugin: Plugin.Interface
   readonly flags: RuntimeFlags.Info
+  readonly cfg?: ConfigV1.Info
   readonly isWorkflow: boolean
 }
 
@@ -111,6 +120,37 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
           ...input.messages,
         ]
 
+  const tools = resolveTools(input)
+
+  // Sizing only. A bad estimate yields a suboptimal max_tokens, never a
+  // compaction: if the request genuinely does not fit, the provider rejects it
+  // and the existing ContextOverflowError -> halt -> needsCompaction path
+  // recovers. Pre-empting that here would also block the compaction call, which
+  // is the one request that must be allowed through on a full context.
+  const budget = thinkingBudget(options)
+  const floor = outputFloor({
+    model: input.model,
+    outputTokenMax: input.flags.outputTokenMax,
+    floor: input.cfg?.compaction?.output_floor,
+  })
+  const dynamic = input.cfg?.compaction?.dynamic_output !== false
+  const maxOutputTokens = requestedOutput({
+    model: input.model,
+    estimatedInputTokens: estimateInput({ system, messages: input.messages, tools }),
+    outputTokenMax: input.flags.outputTokenMax,
+    floor: input.cfg?.compaction?.output_floor,
+    thinkingBudget: budget,
+    dynamic,
+  })
+  const ceiling = dynamic
+    ? outputCeiling(input.model, input.flags.outputTokenMax)
+    : ProviderTransform.maxOutputTokens(input.model, input.flags.outputTokenMax)
+  // Thinking tokens come out of max_tokens and Anthropic requires the two to
+  // differ, so a plugin must not be able to drop the request to the budget.
+  const lowerBound = dynamic
+    ? Math.min(ceiling, Math.max(floor, budget ? budget + Math.min(THINKING_TEXT_ROOM, ceiling - budget) : 0))
+    : 0
+
   const params = yield* input.plugin.trigger(
     "chat.params",
     {
@@ -126,10 +166,12 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
         : undefined,
       topP: input.agent.topP ?? ProviderTransform.topP(input.model),
       topK: ProviderTransform.topK(input.model),
-      maxOutputTokens: ProviderTransform.maxOutputTokens(input.model, input.flags.outputTokenMax),
+      maxOutputTokens,
       options,
     },
   )
+  if (params.maxOutputTokens !== undefined)
+    params.maxOutputTokens = Math.min(ceiling, Math.max(lowerBound, params.maxOutputTokens))
 
   const { headers } = yield* input.plugin.trigger(
     "chat.headers",
@@ -145,7 +187,6 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     },
   )
 
-  const tools = resolveTools(input)
   // Codex parity: OpenAI Responses-family providers hardcode `strict: false`
   // on every function tool so MCP-sourced and dynamic schemas that don't
   // satisfy OpenAI's structured-outputs constraints still register.

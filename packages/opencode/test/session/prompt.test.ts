@@ -874,8 +874,12 @@ it.instance("active goals are independently reviewed after every provider turn u
     const inputs = yield* llm.inputs
     expect(JSON.stringify(inputs[0])).toContain("<active-goal>")
     expect(JSON.stringify(inputs[0])).toContain("continue once, then finish")
-    expect(JSON.stringify(inputs[1])).toContain("<parent-session-transcript>")
+    // The reviewer is seeded with an index of the parent session, not the
+    // parent session itself.
+    expect(JSON.stringify(inputs[1])).not.toContain("<parent-session-transcript>")
+    expect(JSON.stringify(inputs[1])).toContain("<parent-session-index>")
     expect(JSON.stringify(inputs[1])).toContain("First increment complete.")
+    expect(JSON.stringify(inputs[1])).toContain("<goal-requirements>")
 
     const reviewers = yield* sessions.children(session.id)
     expect(reviewers).toHaveLength(2)
@@ -939,6 +943,118 @@ it.instance("a rejected completion review keeps the goal active until a later re
     expect(
       reviewParts.map((part) => (part.state.status === "completed" ? part.state.metadata.verdict : "error")),
     ).toEqual(["rejected", "accepted"])
+  }),
+)
+
+it.instance("reviewers index the parent session, retrieve on demand, and hand conclusions to the next attempt", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal reviewer retrieval",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the retrieval goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "say lima and prove it twice" })
+
+    const flat = (hit: { body: unknown }) => JSON.stringify(hit.body)
+    const isReviewer = (hit: { body: unknown }) => flat(hit).includes("verdict nonce for this review is")
+    const isWorker = (hit: { body: unknown }) => !isReviewer(hit)
+    // Attempts are told apart by which checklist block their seed carries.
+    const first = (hit: { body: unknown }) =>
+      isReviewer(hit) && flat(hit).includes("No requirement checklist has been recorded")
+    const second = (hit: { body: unknown }) =>
+      isReviewer(hit) && flat(hit).includes("Earlier reviewers recorded this checklist")
+    const saw = (hit: { body: unknown }, value: string) => flat(hit).includes(value)
+
+    yield* llm.toolMatch(isWorker, "goal", { status: "complete", reason: "lima was said once" })
+    yield* llm.textMatch(isWorker, "Second proof added.")
+
+    yield* llm.toolMatch((hit) => first(hit) && !saw(hit, "Checklist recorded"), "goal_checklist", {
+      requirements: [
+        { id: "R1", text: "say lima" },
+        { id: "R2", text: "prove it twice" },
+      ],
+    })
+    yield* llm.toolMatch(
+      (hit) => first(hit) && saw(hit, "Checklist recorded") && !saw(hit, "untrusted-parent-transcript"),
+      "goal_transcript",
+      { mode: "search", query: "lima" },
+    )
+    yield* llm.toolMatch(
+      (hit) => first(hit) && saw(hit, "untrusted-parent-transcript") && !saw(hit, "Verdict recorded"),
+      "goal_verdict",
+      {
+        met: false,
+        summary: "only one proof is present",
+        unmet: [{ requirement: "prove it twice", evidence: "only one proof in the worker session" }],
+        requirements: [
+          { id: "R1", status: "met", evidence: "lima appears in the worker session" },
+          { id: "R2", status: "unmet", evidence: "only one proof was retrieved" },
+        ],
+      },
+    )
+    yield* llm.textMatch((hit) => first(hit) && saw(hit, "Verdict recorded"), "Verdict submitted.", {
+      usage: { input: 5_000, output: 7 },
+    })
+
+    yield* llm.toolMatch((hit) => second(hit) && !saw(hit, "Verdict recorded"), "goal_verdict", {
+      met: true,
+      summary: "both proofs verified against current state",
+      requirements: [
+        { id: "R1", status: "met", evidence: "still present" },
+        { id: "R2", status: "met", evidence: "the second proof is now present" },
+      ],
+    })
+    yield* llm.textMatch((hit) => second(hit) && saw(hit, "Verdict recorded"), "Verdict submitted.", {
+      usage: { input: 6_000, output: 9 },
+    })
+
+    yield* prompt.loop({ sessionID: session.id })
+
+    const goal = yield* goals.get(session.id)
+    expect(goal?.status).toBe("complete")
+    expect(goal?.review?.status).toBe("accepted")
+    expect(goal?.review?.attempt).toBe(2)
+    // Conclusions carry across attempts, sessions do not.
+    expect(goal?.requirements).toMatchObject([
+      { id: "R1", text: "say lima", status: "met", attempt: 2 },
+      { id: "R2", text: "prove it twice", status: "met", attempt: 2 },
+    ])
+
+    const stats = goal?.review?.attemptStats ?? []
+    expect(stats.map((entry) => entry.attempt)).toEqual([1, 2])
+    // The first reviewer retrieved once; the second never needed to.
+    expect(stats[0]?.retrievalCalls).toBe(1)
+    expect(stats[1]?.retrievalCalls).toBe(0)
+    expect(stats[0]?.inputTokens).toBeGreaterThan(0)
+    expect(stats[1]?.outputTokens).toBeGreaterThan(0)
+
+    // A fresh reviewer session per attempt: a reused reviewer would re-send its
+    // own stale retrieval output every step.
+    const reviewers = yield* sessions.children(session.id)
+    expect(reviewers).toHaveLength(2)
+
+    const bodies = (yield* llm.inputs).map((body) => JSON.stringify(body))
+    const reviewerBodies = bodies.filter((body) => body.includes("verdict nonce for this review is"))
+    expect(reviewerBodies.length).toBeGreaterThanOrEqual(6)
+    expect(reviewerBodies[0]).toContain("<parent-session-index>")
+    expect(reviewerBodies[0]).toContain("No requirement checklist has been recorded")
+    // The seed is an index, not the transcript: no worker tool output in it.
+    expect(reviewerBodies[0]).not.toContain("Completion is pending independent review")
+    const last = reviewerBodies.at(-1)!
+    expect(last).toContain("Earlier reviewers recorded this checklist")
+    expect(last).toContain("R2 [unmet, attempt 1] prove it twice")
+    expect(last).toContain("prior evidence: only one proof was retrieved")
+    expect(last).not.toContain("Completion is pending independent review")
   }),
 )
 

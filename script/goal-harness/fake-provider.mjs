@@ -11,7 +11,7 @@
 //   WORKER_TEXT           worker reply text (default "Lima")
 //   WORKER_INPUT/OUTPUT   fake worker usage (default 9000 / 4)
 //   REVIEWER_INPUT/OUTPUT fake reviewer usage (default 12000 / 58)
-//   REVIEWER_MODE         met | not_met | met_tool | not_met_tool | invalid | silent | slow | busy | http500
+//   REVIEWER_MODE         met | not_met | met_tool | not_met_tool | retrieval | invalid | silent | slow | busy | http500
 //   REVIEWER_NOT_MET_N    first N reviews return NOT_MET, then MET (default 0)
 import http from "node:http"
 import fs from "node:fs"
@@ -71,6 +71,18 @@ function textReply(res, text, usage) {
   ])
 }
 
+function toolReply(res, name, args, usage = REVIEWER_USAGE, id = `call_${Date.now()}`) {
+  const text = JSON.stringify(args)
+  const split = Math.ceil(text.length / 2)
+  sse(res, [
+    chunk({ delta: { role: "assistant" } }),
+    chunk({ delta: { tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: "" } }] } }),
+    chunk({ delta: { tool_calls: [{ index: 0, function: { arguments: text.slice(0, split) } }] } }),
+    chunk({ delta: { tool_calls: [{ index: 0, function: { arguments: text.slice(split) } }] } }),
+    chunk({ finish: "tool_calls", usage }),
+  ])
+}
+
 async function body(req) {
   const parts = []
   for await (const c of req) parts.push(c)
@@ -90,6 +102,62 @@ const server = http.createServer(async (req, res) => {
   if (req.url?.startsWith("/v1/models")) {
     res.writeHead(200, { "content-type": "application/json" })
     res.end(JSON.stringify({ data: [] }))
+    return
+  }
+
+  if (isReviewer && REVIEWER_MODE === "retrieval") {
+    // Retrieval reviewer: build the checklist, pull evidence through
+    // goal_transcript, then reject with per-requirement verdicts. The second
+    // attempt inherits the persisted checklist and accepts. Every step is
+    // chosen from what the request body already contains, so the mode is
+    // stateless and survives retries.
+    const inherited = flat.includes("Earlier reviewers recorded this checklist")
+    const sawChecklist = flat.includes("Checklist recorded")
+    const sawTranscript = flat.includes("untrusted-parent-transcript")
+    const sawVerdict = flat.includes("Verdict recorded")
+    const isFirstStep = !flat.includes("\"tool_call_id\"") && !flat.includes("\"role\":\"tool\"")
+    if (isFirstStep) reviewCount += 1
+    log({ role: "reviewer", mode: "retrieval", n: reviewCount, nonce, url: req.url, body: parsed })
+    if (sawVerdict) {
+      textReply(res, "Verdict submitted.", REVIEWER_USAGE)
+      return
+    }
+    if (!inherited && !sawChecklist) {
+      toolReply(res, "goal_checklist", {
+        requirements: [
+          { id: "R1", text: "say lima once per turn" },
+          { id: "R2", text: "return control at least twice" },
+        ],
+      })
+      return
+    }
+    if (!inherited && !sawTranscript) {
+      toolReply(res, "goal_transcript", { mode: "search", query: "lima" })
+      return
+    }
+    toolReply(
+      res,
+      "goal_verdict",
+      inherited
+        ? {
+            met: true,
+            summary: "both requirements verified against current state",
+            unmet: [],
+            requirements: [
+              { id: "R1", status: "met", evidence: "lima appears in every worker turn" },
+              { id: "R2", status: "met", evidence: "control returned twice" },
+            ],
+          }
+        : {
+            met: false,
+            summary: "control has only been returned once",
+            unmet: [{ requirement: "return control at least twice", evidence: "only one worker turn is indexed" }],
+            requirements: [
+              { id: "R1", status: "met", evidence: "lima found by goal_transcript search" },
+              { id: "R2", status: "unmet", evidence: "only one worker turn is indexed" },
+            ],
+          },
+    )
     return
   }
 

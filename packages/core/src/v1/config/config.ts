@@ -162,7 +162,16 @@ export const Info = Schema.Struct({
         description: "Maximum number of tokens from recent turns to preserve verbatim after compaction",
       }),
       reserved: Schema.optional(NonNegativeInt).annotate({
-        description: "Token buffer for compaction. Leaves enough window to avoid overflow during compaction.",
+        description:
+          "Token buffer for compaction. Compaction triggers once the context reaches the model limit minus this value. Overrides the automatic trigger point.",
+      }),
+      output_floor: Schema.optional(PositiveInt).annotate({
+        description:
+          "Smallest output window requested for a response, in tokens (default: the smaller of 16384 and the model output limit). Sizing only; it never triggers compaction on its own.",
+      }),
+      dynamic_output: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Size the requested output window to the room actually left in the context, instead of always reserving the model output limit (default: true). Only affects models that publish a combined context limit.",
       }),
     }),
   ),

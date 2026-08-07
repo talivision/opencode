@@ -22,11 +22,30 @@ export const Parameters = Schema.Struct({
       ),
     ),
   ).annotate({ description: "Every unmet requirement, with evidence. Required when met is false." }),
+  requirements: Schema.optional(
+    Schema.mutable(
+      Schema.Array(
+        Schema.Struct({
+          id: Schema.String.annotate({ description: "Checklist requirement id, e.g. R1" }),
+          status: Schema.Literals(["met", "unmet"]).annotate({
+            description: "Whether this specific requirement is satisfied in current state",
+          }),
+          evidence: Schema.optional(Schema.String).annotate({
+            description: "The authoritative artifact you inspected for this requirement",
+          }),
+        }),
+      ),
+    ),
+  ).annotate({
+    description:
+      "Per-requirement roll-up against the goal checklist. Ids must come from the checklist in your first message. Carried forward to the next reviewer.",
+  }),
 })
 
 type Metadata = {
   met?: boolean
   unmet?: number
+  requirements?: number
 }
 
 export const GoalVerdictTool = define<typeof Parameters, Metadata, SessionGoal.Service | Session.Service>(
@@ -79,12 +98,37 @@ export const GoalVerdictTool = define<typeof Parameters, Metadata, SessionGoal.S
               metadata: {},
             }
           }
+          // Per-requirement results are optional and additive: the id-less
+          // unmet[] array and the nonce text fallback both keep working.
+          const checklist = (yield* goal.get(parentID))?.requirements ?? []
+          const requirements = (params.requirements ?? []).filter((item) => item.id.trim().length > 0)
+          const unknown = requirements.filter((item) => !checklist.some((entry) => entry.id === item.id.trim()))
+          if (unknown.length > 0) {
+            return {
+              title: "Unknown requirement ids",
+              output: checklist.length
+                ? `These ids are not on this goal's checklist: ${unknown.map((item) => item.id).join(", ")}. Valid ids: ${checklist
+                    .map((item) => item.id)
+                    .join(", ")}. Call goal_verdict again.`
+                : "This goal has no checklist, so per-requirement results cannot be recorded. Call goal_verdict again without the requirements array.",
+              metadata: {},
+            }
+          }
           const updated = yield* goal.submitVerdict({
             sessionID: parentID,
             reviewerSessionID: ctx.sessionID,
             met: params.met,
             summary: params.summary.trim(),
             ...(unmet.length ? { unmet } : {}),
+            ...(requirements.length
+              ? {
+                  requirements: requirements.map((item) => ({
+                    id: item.id.trim(),
+                    status: item.status,
+                    ...(item.evidence?.trim() ? { evidence: item.evidence.trim() } : {}),
+                  })),
+                }
+              : {}),
           })
           if (updated?.review?.verdict === undefined) {
             return {
@@ -97,7 +141,7 @@ export const GoalVerdictTool = define<typeof Parameters, Metadata, SessionGoal.S
           return {
             title: params.met ? "Verdict recorded: met" : "Verdict recorded: not met",
             output: "Verdict recorded. Finish your final message with a one-line restatement of the decision.",
-            metadata: { met: params.met, unmet: params.unmet?.length ?? 0 },
+            metadata: { met: params.met, unmet: params.unmet?.length ?? 0, requirements: requirements.length },
           }
         }),
     } satisfies DefWithoutID<typeof Parameters, Metadata>

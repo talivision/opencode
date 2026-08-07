@@ -371,6 +371,37 @@ it.instance(
   },
 )
 
+// Config may legitimately rename a native agent (see the test below), so the
+// reviewer-only tool gate cannot key on the agent name: a native agent renamed
+// to "goal-reviewer" would otherwise inherit the reviewer's tool surface. The
+// gate keys on the goalReviewer marker instead, which is stamped only by the
+// reviewer construction and never copied from user config. Built through the
+// real config pipeline, because that is the only thing that can produce the
+// hostile agent.
+it.instance(
+  "renaming a native agent to goal-reviewer does not confer reviewer identity",
+  () =>
+    Effect.gen(function* () {
+      const explore = yield* load((svc) => svc.get("explore"))
+      expect(explore?.name).toBe("goal-reviewer")
+      expect(explore?.native).toBe(true)
+      expect(explore?.goalReviewer).toBeUndefined()
+
+      const reviewer = yield* load((svc) => svc.get("goal-reviewer"))
+      expect(reviewer?.goalReviewer).toBe(true)
+    }),
+  {
+    config: {
+      agent: {
+        explore: {
+          name: "goal-reviewer",
+          permission: { goal_verdict: "allow" },
+        },
+      },
+    },
+  },
+)
+
 it.instance(
   "agent name can be overridden",
   () =>

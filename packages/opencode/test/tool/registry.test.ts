@@ -4,7 +4,7 @@ import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
 import { Effect, Layer, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { ToolRegistry } from "@/tool/registry"
+import { REVIEWER_ONLY_TOOLS, ToolRegistry } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -169,6 +169,128 @@ describe("tool.registry", () => {
 
       expect(task).toBeDefined()
       expect(task?.description).toContain("background")
+    }),
+  )
+
+  it.instance("hides every reviewer-only tool from normal agents", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const build = yield* agents.get("build")
+      if (!build) throw new Error("build agent not found")
+      const ids = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: build,
+      })).map((tool) => tool.id)
+      const reviewerOnly = [...REVIEWER_ONLY_TOOLS]
+
+      expect(reviewerOnly).toContain("goal_verdict")
+      reviewerOnly.forEach((id) => expect(ids).not.toContain(id))
+    }),
+  )
+
+  it.instance("exposes every reviewer-only tool to the native goal reviewer", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const reviewer = yield* agents.get("goal-reviewer")
+      if (!reviewer) throw new Error("goal-reviewer agent not found")
+      const ids = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: reviewer,
+      })).map((tool) => tool.id)
+      const reviewerOnly = [...REVIEWER_ONLY_TOOLS]
+
+      expect(reviewerOnly).toContain("goal_verdict")
+      reviewerOnly.forEach((id) => expect(ids).toContain(id))
+    }),
+  )
+
+  it.instance("does not trust a non-native agent named goal-reviewer", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const reviewer = yield* agents.get("goal-reviewer")
+      if (!reviewer) throw new Error("goal-reviewer agent not found")
+      const ids = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: { ...reviewer, native: false },
+      })).map((tool) => tool.id)
+      const reviewerOnly = [...REVIEWER_ONLY_TOOLS]
+
+      expect(reviewerOnly).toContain("goal_verdict")
+      reviewerOnly.forEach((id) => expect(ids).not.toContain(id))
+    }),
+  )
+
+  // The reviewer-only tools are the goal reviewer's private channel:
+  // goal_verdict is the unforgeable verdict, goal_transcript reads the parent
+  // worker session, goal_checklist writes durable goal state. None of them may
+  // ever appear in another agent's tool list — including a config agent that
+  // merely renamed itself "goal-reviewer".
+  it.instance("exposes reviewer-only tools to the native goal-reviewer and to nobody else", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const model = { providerID: ProviderV2.ID.opencode, modelID: ModelV2.ID.make("test") }
+      const reviewer = yield* agents.get("goal-reviewer")
+      if (!reviewer) throw new Error("goal-reviewer agent not found")
+      const build = yield* agents.get("build")
+      if (!build) throw new Error("build agent not found")
+      const reviewerOnly = ["goal_verdict", "goal_transcript", "goal_checklist"]
+
+      const ids = yield* registry.ids()
+      for (const id of reviewerOnly) expect(ids).toContain(id)
+
+      const forReviewer = (yield* registry.tools({ ...model, agent: reviewer })).map((tool) => tool.id)
+      expect(forReviewer).toEqual(expect.arrayContaining(reviewerOnly))
+
+      const forBuild = (yield* registry.tools({ ...model, agent: build })).map((tool) => tool.id)
+      const forDefault = (yield* registry.tools({ ...model, agent: yield* agents.defaultInfo() })).map(
+        (tool) => tool.id,
+      )
+      // Named goal-reviewer, but not a native agent: a user-supplied config
+      // agent must not be able to reach these by taking the name.
+      const impostor = (yield* registry.tools({ ...model, agent: { ...reviewer, native: false } })).map(
+        (tool) => tool.id,
+      )
+      // A native agent stripped of the marker: identity here is the marker,
+      // not the name. The real reviewer cannot be renamed (the construction
+      // re-stamps its name after config merge), so a name change alone is not
+      // the threat — losing the marker is.
+      const unmarked = (yield* registry.tools({ ...model, agent: { ...reviewer, goalReviewer: false } })).map(
+        (tool) => tool.id,
+      )
+
+      for (const id of reviewerOnly) {
+        expect(forBuild).not.toContain(id)
+        expect(forDefault).not.toContain(id)
+        expect(impostor).not.toContain(id)
+        expect(unmarked).not.toContain(id)
+      }
+    }),
+  )
+
+  // goal_transcript resolves the session it reads from the caller's own parent.
+  // A sessionID parameter would let a reviewer of goal A read session B, so the
+  // absence of one is the security boundary and is asserted, not assumed.
+  it.instance("goal_transcript takes no session parameter", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const reviewer = yield* agents.get("goal-reviewer")
+      if (!reviewer) throw new Error("goal-reviewer agent not found")
+      const tool = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: reviewer,
+      })).find((item) => item.id === "goal_transcript")
+      if (!tool) throw new Error("goal_transcript was not exposed to the reviewer")
+      const schema = ToolJsonSchema.fromTool(tool) as { properties?: Record<string, unknown> }
+      expect(Object.keys(schema.properties ?? {})).toEqual(["mode", "start_id", "end_id", "call_id", "query", "max_chars"])
     }),
   )
 

@@ -18,6 +18,22 @@ describe("provider error classification", () => {
     expect(messages.every(isContextOverflow)).toBe(true)
   })
 
+  test("classifies Anthropic's combined input + max_tokens rejection as context overflow", () => {
+    // Anthropic rejects on input + max_tokens against the shared window. The
+    // wording matches none of the "context length"/"context window" patterns:
+    // it says "exceed context limit". Left unclassified it is a plain
+    // non-retryable 400, so the session hard-stops instead of compacting --
+    // on the largest provider class, and on exactly the requests the dynamic
+    // output window is meant to size.
+    const messages = [
+      "input length and `max_tokens` exceed context limit: 199000 + 32000 > 200000, decrease input length or `max_tokens` and try again",
+      '{"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 214523 + 64000 > 200000, decrease input length or `max_tokens` and try again"}}',
+      "input length and max_tokens exceed context limit: 1048576 + 32000 > 1000000",
+    ]
+
+    expect(messages.every(isContextOverflow)).toBe(true)
+  })
+
   test("does not classify rate limits as context overflow", () => {
     const messages = [
       "Throttling error: Too many tokens, please wait before trying again.",

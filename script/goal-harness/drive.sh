@@ -13,6 +13,9 @@
 #   not_met   reviewer rejects once, then accepts     -> "Goal not yet met... continuing"
 #   met_tool      reviewer accepts via goal_verdict tool  -> Goal achieved
 #   not_met_tool  reviewer rejects via tool, then accepts -> "Goal not yet met... continuing"
+#   retrieval reviewer builds a checklist, pulls evidence through goal_transcript,
+#             rejects with per-requirement verdicts, then inherits the checklist
+#             on attempt 2 and accepts. Asserted by assert-retrieval.mjs.
 #   invalid   verdict carries the wrong nonce         -> forged verdict must be refused
 #   http500   provider fails the reviewer request     -> reviewer failure inline
 #   silent    reviewer never responds                 -> inactivity timeout
@@ -116,3 +119,12 @@ echo "==> durable goal state"
 cat "$WORK/home/.local/share/opencode/storage/goal/"*.json 2>/dev/null || echo "(none)"
 echo "==> snapshots: $WORK/snaps"
 echo "==> provider request log: $WORK/provider.log"
+
+if [ "$SCENARIO" = "retrieval" ]; then
+  echo "==> retrieval assertions"
+  DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
+  node "$HERE/assert-retrieval.mjs" \
+    "$WORK/provider.log" \
+    "${DB:-}" \
+    "$WORK/home/.local/share/opencode/storage/goal"
+fi

@@ -1504,6 +1504,25 @@ describe("session.message-v2.fromError", () => {
     expect(SessionV1.APIError.isInstance(result)).toBe(true)
   })
 
+  test("preserves an already-classified ContextOverflowError", () => {
+    // Regression: NamedError subclasses fell through to the generic
+    // `e instanceof Error` arm and became UnknownError. That made the
+    // processor's ContextOverflowError.isInstance check miss, so
+    // needsCompaction was never set and compaction recovery never ran.
+    const result = MessageV2.fromError(new SessionV1.ContextOverflowError({ message: "boom" }), { providerID })
+
+    expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
+    expect(result).toStrictEqual({
+      name: "ContextOverflowError",
+      data: { message: "boom" },
+    })
+  })
+
+  test("preserves a ContextOverflowError already in object form", () => {
+    const input = new SessionV1.ContextOverflowError({ message: "boom" }).toObject()
+    expect(MessageV2.fromError(input, { providerID })).toStrictEqual(input)
+  })
+
   test("serializes unknown inputs", () => {
     const result = MessageV2.fromError(123, { providerID })
 

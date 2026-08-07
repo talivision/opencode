@@ -38,6 +38,11 @@ export const Info = Schema.Struct({
   description: Schema.optional(Schema.String),
   mode: Schema.Literals(["subagent", "primary", "all"]),
   native: Schema.optional(Schema.Boolean),
+  // Set only by the goal-reviewer construction below and never copied from
+  // user config, so it cannot be forged. The reviewer-only tool gate keys on
+  // this rather than on the agent name: config may legitimately rename a
+  // native agent, and a rename must not confer the reviewer's tool surface.
+  goalReviewer: Schema.optional(Schema.Boolean),
   hidden: Schema.optional(Schema.Boolean),
   topP: Schema.optional(Schema.Finite),
   temperature: Schema.optional(Schema.Finite),
@@ -269,6 +274,7 @@ const layer = Layer.effect(
             mode: "primary",
             options: {},
             native: true,
+            goalReviewer: true,
             hidden: true,
             prompt: PROMPT_GOAL_REVIEWER,
             permission: Permission.merge(
@@ -282,6 +288,8 @@ const layer = Layer.effect(
                 webfetch: "allow",
                 websearch: "allow",
                 goal_verdict: "allow",
+                goal_transcript: "allow",
+                goal_checklist: "allow",
                 external_directory: readonlyExternalDirectory,
               }),
             ),
@@ -330,6 +338,7 @@ const layer = Layer.effect(
         reviewer.name = "goal-reviewer"
         reviewer.mode = "primary"
         reviewer.native = true
+        reviewer.goalReviewer = true
         reviewer.hidden = true
         reviewer.prompt = PROMPT_GOAL_REVIEWER
         reviewer.permission = Permission.merge(
@@ -343,6 +352,8 @@ const layer = Layer.effect(
             webfetch: "allow",
             websearch: "allow",
             goal_verdict: "allow",
+            goal_transcript: "allow",
+            goal_checklist: "allow",
             external_directory: readonlyExternalDirectory,
           }),
         )

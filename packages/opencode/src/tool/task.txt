@@ -1,6 +1,8 @@
 Launch a new agent to handle complex, multistep tasks autonomously.
 
 When using the Task tool, you must specify a subagent_type parameter to select which agent type to use.
+Use model in "provider/model" form to select a model for one call, and variant to select that model's reasoning effort.
+Fan-out example: call task(subagent_type="general", model="provider-a/model-a", background=true), task(subagent_type="general", model="provider-b/model-b", background=true), and task(subagent_type="general", model="provider-c/model-c", background=true) concurrently.
 
 When NOT to use the Task tool:
 - If you want to read a specific file path, use the Read or Glob tool instead of the Task tool, to find the match more quickly

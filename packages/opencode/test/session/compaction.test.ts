@@ -33,6 +33,18 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import {
+  estimateInput,
+  MEDIA_TOKENS,
+  outputCeiling,
+  outputFloor,
+  requestedOutput,
+  thinkingBudget,
+} from "@/session/output-window"
+import { usable } from "@/session/overflow"
+import { jsonSchema } from "ai"
+import { LLMRequestPrep } from "@/session/llm/request"
+import { Agent } from "@/agent/agent"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -62,6 +74,7 @@ function createModel(opts: {
   input?: number
   cost?: Provider.Model["cost"]
   npm?: string
+  variants?: Provider.Model["variants"]
 }): Provider.Model {
   return {
     id: "test-model",
@@ -81,14 +94,15 @@ function createModel(opts: {
       input: { text: true, image: false, audio: false, video: false },
       output: { text: true, image: false, audio: false, video: false },
     },
-    api: { npm: opts.npm ?? "@ai-sdk/anthropic" },
+    api: { id: "test-model", url: "https://example.com", npm: opts.npm ?? "@ai-sdk/anthropic" },
     options: {},
+    variants: opts.variants,
   } as Provider.Model
 }
 
 const wide = () => ProviderTest.fake({ model: createModel({ context: 100_000, output: 32_000 }) })
 
-function createUserMessage(sessionID: SessionID, text: string) {
+function createUserMessage(sessionID: SessionID, text: string, variant?: string) {
   return Effect.gen(function* () {
     const ssn = yield* SessionNs.Service
     const msg = yield* ssn.updateMessage({
@@ -96,7 +110,7 @@ function createUserMessage(sessionID: SessionID, text: string) {
       role: "user",
       sessionID,
       agent: "build",
-      model: ref,
+      model: variant ? { ...ref, variant } : ref,
       time: { created: Date.now() },
     })
     yield* ssn.updatePart({
@@ -196,6 +210,7 @@ function createCompactionMarker(sessionID: SessionID) {
 function fake(
   input: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0],
   result: "continue" | "compact",
+  capture?: (streamInput: LLM.StreamInput) => void,
 ) {
   const msg = input.assistantMessage
   return {
@@ -204,15 +219,18 @@ function fake(
     },
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
-    process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
+    process: Effect.fn("TestSessionProcessor.process")((streamInput) => {
+      capture?.(streamInput)
+      return Effect.succeed(result)
+    }),
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }
 
-function processorLayer(result: "continue" | "compact") {
+function processorLayer(result: "continue" | "compact", capture?: (streamInput: LLM.StreamInput) => void) {
   return Layer.succeed(
     SessionProcessorModule.SessionProcessor.Service,
     SessionProcessorModule.SessionProcessor.Service.of({
-      create: Effect.fn("TestSessionProcessor.create")((input) => Effect.succeed(fake(input, result))),
+      create: Effect.fn("TestSessionProcessor.create")((input) => Effect.succeed(fake(input, result, capture))),
     }),
   )
 }
@@ -234,7 +252,7 @@ const compactionTestNode = LayerNode.group([
 const env = AppNodeBuilder.build(compactionTestNode, [
   [Provider.node, defaultProvider.layer],
   [SessionProcessorModule.SessionProcessor.node, processorLayer("continue")],
-  [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+  [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true, outputTokenMax: 64_000 })],
 ])
 
 const it = testEffect(env)
@@ -250,6 +268,7 @@ type CompactionProcessOptions = {
   plugin?: Layer.Layer<Plugin.Service>
   provider?: ReturnType<typeof wide>
   config?: Layer.Layer<Config.Service>
+  capture?: (streamInput: LLM.StreamInput) => void
 }
 
 function withCompaction(options?: CompactionProcessOptions) {
@@ -265,7 +284,7 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
   if (!options?.llm) {
     return AppNodeBuilder.build(compactionTestNode, [
       ...replacements,
-      [SessionProcessorModule.SessionProcessor.node, processorLayer(options?.result ?? "continue")],
+      [SessionProcessorModule.SessionProcessor.node, processorLayer(options?.result ?? "continue", options?.capture)],
       ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
       ...(options?.config ? ([[Config.node, options.config]] as const) : []),
     ])
@@ -365,14 +384,111 @@ function autocontinue(enabled: boolean) {
   })
 }
 
+const passthroughPlugin = Plugin.Service.of({
+  trigger: <Name extends string, Input, Output>(_name: Name, _input: Input, output: Output) => Effect.succeed(output),
+  list: () => Effect.succeed([]),
+  init: () => Effect.void,
+})
+
+function prepareRequest(input: {
+  model: Provider.Model
+  messages: LLM.StreamInput["messages"]
+  variant?: string
+  cfg?: ConfigV1.Info
+  tools?: LLM.StreamInput["tools"]
+}) {
+  return LLMRequestPrep.prepare({
+    user: {
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: SessionID.create(),
+      agent: "build",
+      model: { providerID: ref.providerID, modelID: ref.modelID, variant: input.variant },
+      time: { created: Date.now() },
+    },
+    sessionID: SessionID.create(),
+    model: input.model,
+    agent: {
+      name: "build",
+      mode: "primary",
+      permission: [],
+      prompt: "test",
+      options: {},
+    } satisfies Agent.Info,
+    system: [],
+    messages: input.messages,
+    tools: input.tools ?? {},
+    provider: ProviderTest.info({}, input.model),
+    auth: undefined,
+    plugin: passthroughPlugin,
+    flags: { client: "test", outputTokenMax: input.model.limit.output || undefined } as RuntimeFlags.Info,
+    cfg: input.cfg,
+    isWorkflow: false,
+  })
+}
+
+const cfgOf = (compaction?: ConfigV1.Info["compaction"]) => ({ compaction }) as ConfigV1.Info
+
+const captured: LLM.StreamInput[] = []
+afterEach(() => {
+  captured.length = 0
+})
+
 describe("session.compaction.isOverflow", () => {
+  it.live(
+    "keeps a 200k context open at 150k input and shrinks the requested output window",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 200_000, output: 64_000 })
+        const tokens = { input: 150_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+
+        expect(yield* compact.isOverflow({ tokens, model })).toBe(false)
+        // 200k context - 150k input - safety(200k)=4k
+        expect(requestedOutput({ model, estimatedInputTokens: 150_000, outputTokenMax: 64_000 })).toBe(46_000)
+      }),
+    ),
+  )
+
+  it.live(
+    "compacts when the remaining context is below the output floor",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 200_000, output: 64_000 })
+        const tokens = { input: 195_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+
+        expect(yield* compact.isOverflow({ tokens, model })).toBe(true)
+      }),
+    ),
+  )
+
+  it.live(
+    "keeps input-limit behavior and requests the provider output ceiling",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 200_000, input: 200_000, output: 64_000 })
+        const tokens = { input: 181_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+
+        expect(yield* compact.isOverflow({ tokens, model })).toBe(true)
+        expect(requestedOutput({ model, estimatedInputTokens: 181_000, outputTokenMax: 64_000 })).toBe(64_000)
+      }),
+    ),
+  )
+
+  test("requested output never exceeds the configured provider ceiling", () => {
+    const model = createModel({ context: 200_000, output: 64_000 })
+    expect(requestedOutput({ model, estimatedInputTokens: 100_000, outputTokenMax: 20_000 })).toBe(20_000)
+  })
+
   it.live(
     "returns true when token count exceeds usable context",
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const compact = yield* SessionCompaction.Service
         const model = createModel({ context: 100_000, output: 32_000 })
-        const tokens = { input: 75_000, output: 5_000, reasoning: 0, cache: { read: 0, write: 0 } }
+        const tokens = { input: 86_000, output: 5_000, reasoning: 0, cache: { read: 0, write: 0 } }
         expect(yield* compact.isOverflow({ tokens, model })).toBe(true)
       }),
     ),
@@ -396,7 +512,7 @@ describe("session.compaction.isOverflow", () => {
       Effect.gen(function* () {
         const compact = yield* SessionCompaction.Service
         const model = createModel({ context: 100_000, output: 32_000 })
-        const tokens = { input: 60_000, output: 10_000, reasoning: 0, cache: { read: 10_000, write: 0 } }
+        const tokens = { input: 75_000, output: 10_000, reasoning: 0, cache: { read: 10_000, write: 0 } }
         expect(yield* compact.isOverflow({ tokens, model })).toBe(true)
       }),
     ),
@@ -438,66 +554,36 @@ describe("session.compaction.isOverflow", () => {
     ),
   )
 
-  // ─── Bug reproduction tests ───────────────────────────────────────────
-  // These tests demonstrate that when limit.input is set, isOverflow()
-  // does not subtract any headroom for the next model response. This means
-  // compaction only triggers AFTER we've already consumed the full input
-  // budget, leaving zero room for the next API call's output tokens.
-  //
-  // Compare: without limit.input, usable = context - output (reserves space).
-  // With limit.input, usable = limit.input (reserves nothing).
-  //
-  // Related issues: #10634, #8089, #11086, #12621
-  // Open PRs: #6875, #12924
-
   it.live(
-    "BUG: no headroom when limit.input is set — compaction should trigger near boundary but does not",
+    "reserves the existing compaction buffer when limit.input is set",
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const compact = yield* SessionCompaction.Service
         // Simulate Claude with prompt caching: input limit = 200K, output limit = 32K
         const model = createModel({ context: 200_000, input: 200_000, output: 32_000 })
 
-        // We've used 198K tokens total. Only 2K under the input limit.
-        // On the next turn, the full conversation (198K) becomes input,
-        // plus the model needs room to generate output — this WILL overflow.
         const tokens = { input: 180_000, output: 15_000, reasoning: 0, cache: { read: 3_000, write: 0 } }
-        // count = 180K + 3K + 15K = 198K
-        // usable = limit.input = 200K (no output subtracted!)
-        // 198K > 200K = false → no compaction triggered
-
-        // WITHOUT limit.input: usable = 200K - 32K = 168K, and 198K > 168K = true ✓
-        // WITH limit.input: usable = 200K, and 198K > 200K = false ✗
-
-        // With 198K used and only 2K headroom, the next turn will overflow.
-        // Compaction MUST trigger here.
+        // count = 198K; usable = limit.input - 20K = 180K
         expect(yield* compact.isOverflow({ tokens, model })).toBe(true)
       }),
     ),
   )
 
   it.live(
-    "BUG: without limit.input, same token count correctly triggers compaction",
+    "uses the output floor and safety margin without limit.input",
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const compact = yield* SessionCompaction.Service
-        // Same model but without limit.input — uses context - output instead
         const model = createModel({ context: 200_000, output: 32_000 })
 
-        // Same token usage as above
         const tokens = { input: 180_000, output: 15_000, reasoning: 0, cache: { read: 3_000, write: 0 } }
-        // count = 198K
-        // usable = context - output = 200K - 32K = 168K
-        // 198K > 168K = true → compaction correctly triggered
-
-        const result = yield* compact.isOverflow({ tokens, model })
-        expect(result).toBe(true) // ← Correct: headroom is reserved
+        expect(yield* compact.isOverflow({ tokens, model })).toBe(true)
       }),
     ),
   )
 
   it.live(
-    "BUG: asymmetry — limit.input model allows 30K more usage before compaction than equivalent model without it",
+    "keeps the input-limit reserve while context-only models use the output floor",
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const compact = yield* SessionCompaction.Service
@@ -505,15 +591,17 @@ describe("session.compaction.isOverflow", () => {
         const withInputLimit = createModel({ context: 200_000, input: 200_000, output: 32_000 })
         const withoutInputLimit = createModel({ context: 200_000, output: 32_000 })
 
-        // 170K total tokens — well above context-output (168K) but below input limit (200K)
-        const tokens = { input: 166_000, output: 10_000, reasoning: 0, cache: { read: 5_000, write: 0 } }
+        // The two branches now sit ~400 tokens apart: the input-limit branch
+        // reserves a flat 20k, the context-only branch reserves
+        // max(floor 16,384, 4,096) + safety(200k)=4,000 = 20,384.
+        // 179,800 is inside the input-limit window but past the context-only one.
+        const tokens = { input: 169_800, output: 5_000, reasoning: 0, cache: { read: 5_000, write: 0 } }
 
         const withLimit = yield* compact.isOverflow({ tokens, model: withInputLimit })
         const withoutLimit = yield* compact.isOverflow({ tokens, model: withoutInputLimit })
 
-        // Both models have identical real capacity — they should agree:
-        expect(withLimit).toBe(true) // should compact (170K leaves no room for 32K output)
-        expect(withoutLimit).toBe(true) // correctly compacts (170K > 168K)
+        expect(withLimit).toBe(false)
+        expect(withoutLimit).toBe(true)
       }),
     ),
   )
@@ -919,6 +1007,40 @@ describe("session.compaction.process", () => {
         expect(last.parts[0].text).toContain("Continue if you have next steps")
       }
     }),
+  )
+
+  itCompaction.instance(
+    "summary call does not inherit the user's thinking variant",
+    Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      // "max" maps to a ~31,999 token thinking budget on pre-4.6 Claude, which
+      // max_tokens must then exceed. Inheriting it makes the compaction call the
+      // largest request in the session and can lock a full context into a
+      // compact-fail loop.
+      yield* createUserMessage(session.id, "first", "max")
+      yield* createUserMessage(session.id, "second", "max")
+      yield* createSummaryCompaction(session.id)
+
+      const msgs = yield* ssn.messages({ sessionID: session.id })
+      const parent = msgs.at(-1)?.info.id
+      expect(parent).toBeTruthy()
+      yield* SessionCompaction.use.process({
+        parentID: parent!,
+        messages: msgs,
+        sessionID: session.id,
+        auto: false,
+      })
+
+      expect(captured.length).toBeGreaterThan(0)
+      expect(captured.at(-1)?.user.model.variant).toBeUndefined()
+
+      // The persisted summary message records the stripped variant too.
+      const after = yield* ssn.messages({ sessionID: session.id })
+      const summaryMsg = after.map((m) => m.info).findLast((i) => i.role === "assistant" && i.summary)
+      expect(summaryMsg).toBeTruthy()
+      expect((summaryMsg as SessionV1.Assistant).variant).toBeUndefined()
+    }).pipe(withCompaction({ capture: (streamInput) => captured.push(streamInput) })),
   )
 
   itCompaction.instance(
@@ -1520,6 +1642,172 @@ describe("session.compaction.process", () => {
       expect(part?.tail_start_id).toBe(keep.id)
     }).pipe(withCompaction({ config: cfg({ tail_turns: 2, preserve_recent_tokens: 500 }) })),
   )
+})
+
+describe("session.output-window", () => {
+  const ANTHROPIC_LIKE = { context: 200_000, output: 64_000 }
+
+  test("no pre-flight rejection: a nearly-full context still prepares a request", async () => {
+    const model = createModel(ANTHROPIC_LIKE)
+    // ~1M estimated tokens against a 200k window. Sizing must clamp to the
+    // floor and hand the request to the provider, which is what makes the
+    // existing ContextOverflowError -> needsCompaction recovery reachable.
+    const exit = await Effect.runPromiseExit(
+      prepareRequest({ model, messages: [{ role: "user", content: "x".repeat(4_000_000) }] }),
+    )
+    expect(Exit.isSuccess(exit)).toBe(true)
+    if (Exit.isSuccess(exit)) expect(exit.value.params.maxOutputTokens).toBe(16_384)
+  })
+
+  test("model with limit.input is untouched: full ceiling, legacy trigger", () => {
+    const model = createModel({ context: 200_000, input: 200_000, output: 64_000 })
+    expect(requestedOutput({ model, estimatedInputTokens: 190_000, outputTokenMax: 64_000 })).toBe(64_000)
+    expect(outputCeiling(model, 64_000)).toBe(64_000)
+    // Legacy formula: limit.input - min(COMPACTION_BUFFER, ceiling)
+    expect(usable({ cfg: cfgOf(), model, outputTokenMax: 64_000 })).toBe(200_000 - 20_000)
+  })
+
+  test("limit.output === 0 derives a floor from the ceiling guard, never 0", () => {
+    const model = createModel({ context: 128_000, output: 0 })
+    expect(outputFloor({ model, outputTokenMax: 32_000 })).toBe(16_384)
+    // Would collapse toward max_tokens:1 if the floor came from limit.output.
+    expect(requestedOutput({ model, estimatedInputTokens: 127_500, outputTokenMax: 32_000 })).toBe(16_384)
+    expect(usable({ cfg: cfgOf(), model, outputTokenMax: 32_000 })).toBe(128_000 - 16_384 - 2_560)
+  })
+
+  test("8k-context fan-out target stays workable and never over-reserves", () => {
+    // Reachable at LLM whim now that subagents pick a model per call. The
+    // limit.output:0 guard resolves to 32k, which is larger than this entire
+    // window, so both the ceiling and the reserve have to be clamped.
+    const model = createModel({ context: 8_000, output: 0 })
+    expect(outputCeiling(model, 32_000)).toBe(8_000)
+    expect(outputFloor({ model, outputTokenMax: 32_000 })).toBe(4_000)
+
+    const room = usable({ cfg: cfgOf(), model, outputTokenMax: 32_000 })
+    expect(room).toBeGreaterThan(0)
+    expect(room).toBe(4_000)
+
+    const requested = requestedOutput({ model, estimatedInputTokens: 3_000, outputTokenMax: 32_000 })
+    expect(requested).toBe(4_000)
+    expect(requested).toBeLessThanOrEqual(model.limit.context)
+  })
+
+  test("a large base64 image costs a flat rate instead of its payload length", () => {
+    const image = "A".repeat(1_000_000)
+    const messages = [
+      { role: "user" as const, content: [{ type: "file" as const, mediaType: "image/png", data: image }] },
+    ]
+    // The old estimator counted the base64 string: ~250k tokens for ~1.6k of real cost.
+    expect(Token.estimate(JSON.stringify(messages))).toBeGreaterThan(200_000)
+    expect(estimateInput({ messages })).toBeLessThan(MEDIA_TOKENS + 100)
+  })
+
+  test("an image on an otherwise-empty session does not trigger compaction", async () => {
+    const model = createModel(ANTHROPIC_LIKE)
+    const prepared = await Effect.runPromise(
+      prepareRequest({
+        model,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "what is in this screenshot?" },
+              { type: "file", mediaType: "image/png", data: "A".repeat(1_000_000) },
+            ],
+          },
+        ],
+      }),
+    )
+    // Full window still available: nothing about one attachment shrinks it.
+    expect(prepared.params.maxOutputTokens).toBe(64_000)
+  })
+
+  test("estimateInput counts the system prompt and tool schemas", () => {
+    const messages = [{ role: "user" as const, content: "hi" }]
+    const bare = estimateInput({ messages })
+    const withSystem = estimateInput({ messages, system: ["s".repeat(40_000)] })
+    const withTools = estimateInput({
+      messages,
+      tools: {
+        big: {
+          description: "d".repeat(4_000),
+          inputSchema: jsonSchema({ type: "object", properties: { q: { type: "string", description: "x".repeat(4_000) } } }),
+        } as any,
+      },
+    })
+    expect(withSystem - bare).toBeGreaterThan(9_000)
+    expect(withTools - bare).toBeGreaterThan(1_900)
+  })
+
+  test("estimateInput treats a measured count as a lower bound", () => {
+    const messages = [{ role: "user" as const, content: "hi" }]
+    expect(estimateInput({ messages, measuredInputTokens: 120_000 })).toBe(120_000)
+    expect(estimateInput({ messages, measuredInputTokens: 1 })).toBeGreaterThan(1)
+  })
+
+  test("thinkingBudget finds real budgets and ignores max_tokens", () => {
+    expect(thinkingBudget({ anthropic: { thinking: { type: "enabled", budgetTokens: 16_000 } } })).toBe(16_000)
+    expect(thinkingBudget({ thinking: { type: "enabled", budget_tokens: 31_999 } })).toBe(31_999)
+    expect(thinkingBudget({ thinkingConfig: { includeThoughts: true, thinkingBudget: 8_000 } })).toBe(8_000)
+    // A provider option literally named max_tokens is not a thinking budget.
+    expect(thinkingBudget({ reasoning: { max_tokens: 8_000 } })).toBe(0)
+    expect(thinkingBudget({ modelParams: { max_tokens: 4_000 } })).toBe(0)
+    // Effort/adaptive reasoning has no numeric budget to find.
+    expect(thinkingBudget({ thinking: { type: "adaptive" }, effort: "max" })).toBe(0)
+    expect(thinkingBudget({ reasoning_effort: "high" })).toBe(0)
+  })
+
+  test("requested output clears a thinking budget by the text room", async () => {
+    const model = createModel({
+      ...ANTHROPIC_LIKE,
+      variants: { max: { thinking: { type: "enabled", budgetTokens: 31_999 } } },
+    })
+    // Anthropic 400s when max_tokens <= thinking.budget_tokens.
+    expect(
+      requestedOutput({ model, estimatedInputTokens: 199_000, outputTokenMax: 64_000, thinkingBudget: 31_999 }),
+    ).toBe(31_999 + 4_096)
+
+    const prepared = await Effect.runPromise(
+      prepareRequest({ model, messages: [{ role: "user", content: "x".repeat(4_000_000) }], variant: "max" }),
+    )
+    expect(prepared.params.maxOutputTokens).toBe(36_095)
+    expect(prepared.params.maxOutputTokens!).toBeGreaterThan(31_999)
+  })
+
+  test("compaction.reserved is an exact trigger override on both branches", () => {
+    const contextOnly = createModel(ANTHROPIC_LIKE)
+    const withInput = createModel({ context: 200_000, input: 180_000, output: 64_000 })
+    const cfg = cfgOf({ reserved: 10_000 })
+    expect(usable({ cfg, model: contextOnly, outputTokenMax: 64_000 })).toBe(190_000)
+    expect(usable({ cfg, model: withInput, outputTokenMax: 64_000 })).toBe(170_000)
+  })
+
+  test("compaction.output_floor sizes the window without triggering on its own", () => {
+    const model = createModel(ANTHROPIC_LIKE)
+    const cfg = cfgOf({ output_floor: 32_000 })
+    expect(outputFloor({ model, outputTokenMax: 64_000, floor: 32_000 })).toBe(32_000)
+    expect(usable({ cfg, model, outputTokenMax: 64_000 })).toBe(200_000 - 32_000 - 4_000)
+    // Reserving more only moves the trigger earlier; it never shrinks a request
+    // below what the remaining room supports.
+    expect(requestedOutput({ model, estimatedInputTokens: 100_000, outputTokenMax: 64_000, floor: 32_000 })).toBe(
+      64_000,
+    )
+  })
+
+  test("dynamic_output:false restores the previous behavior exactly", async () => {
+    const model = createModel(ANTHROPIC_LIKE)
+    const cfg = cfgOf({ dynamic_output: false })
+    // Old trigger: context - maxOutputTokens
+    expect(usable({ cfg, model, outputTokenMax: 64_000 })).toBe(200_000 - 64_000)
+    expect(
+      requestedOutput({ model, estimatedInputTokens: 150_000, outputTokenMax: 64_000, dynamic: false }),
+    ).toBe(64_000)
+
+    const prepared = await Effect.runPromise(
+      prepareRequest({ model, messages: [{ role: "user", content: "x".repeat(600_000) }], cfg }),
+    )
+    expect(prepared.params.maxOutputTokens).toBe(64_000)
+  })
 })
 
 describe("util.token.estimate", () => {

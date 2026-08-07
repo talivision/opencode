@@ -353,6 +353,15 @@ const layer = Layer.effect(
         toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
       })
       const ctx = yield* InstanceState.context
+      // Summarizing does not need extended thinking, and inheriting the user's
+      // variant is actively dangerous: on pre-4.6 Claude the "max" variant sets
+      // a ~32k thinking budget, which max_tokens must exceed. That makes the
+      // compaction call the largest request in the session -- the one request
+      // that has to succeed on an already-full context.
+      const summaryUser: SessionV1.User = {
+        ...userMessage,
+        model: { ...userMessage.model, variant: undefined },
+      }
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
         role: "assistant",
@@ -360,7 +369,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         mode: "compaction",
         agent: "compaction",
-        variant: userMessage.model.variant,
+        variant: summaryUser.model.variant,
         summary: true,
         path: {
           cwd: ctx.directory,
@@ -386,7 +395,7 @@ const layer = Layer.effect(
         model,
       })
       const result = yield* processor.process({
-        user: userMessage,
+        user: summaryUser,
         agent,
         sessionID: input.sessionID,
         tools: {},
