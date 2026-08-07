@@ -85,7 +85,7 @@ import { LocationProvider } from "../../context/location"
 import { useGoal } from "../../context/goal"
 import { DialogGoal } from "../../component/dialog-goal"
 import { GoalIndicator } from "../../component/goal-indicator"
-import { DialogSelect, type DialogSelectOption } from "../../ui/dialog-select"
+import { DialogRunningTasks } from "../../component/dialog-running-tasks"
 
 addDefaultParsers(parsers.parsers)
 
@@ -1437,42 +1437,6 @@ export function Session() {
   )
 }
 
-function DialogRunningTasks(props: { tasks: ToolPart[] }) {
-  const sync = useSync()
-  const route = useRoute()
-  const dialog = useDialog()
-  const theme = useTheme().theme
-  const options = createMemo<DialogSelectOption<string>[]>(() =>
-    props.tasks
-      .flatMap((part) => {
-        if (part.state.status === "pending") return []
-        const sessionID = stringValue(part.state.metadata?.sessionId)
-        if (!sessionID) return []
-        const busy = sync.data.session_status[sessionID]?.type === "busy"
-        return [
-          {
-            title: sync.session.get(sessionID)?.title ?? stringValue(part.state.input.description) ?? "Subagent",
-            value: sessionID,
-            description: busy ? "busy" : "idle",
-            gutter: busy ? () => <Spinner /> : () => <text fg={theme.success}>✓</text>,
-          },
-        ]
-      })
-      .filter((option, index, all) => all.findIndex((item) => item.value === option.value) === index),
-  )
-
-  return (
-    <DialogSelect
-      title="Running tasks"
-      options={options()}
-      onSelect={(option) => {
-        route.navigate({ type: "session", sessionID: option.value })
-        dialog.clear()
-      }}
-    />
-  )
-}
-
 function UserMessage(props: {
   message: UserMessage
   parts: Part[]
@@ -2432,6 +2396,9 @@ function Task(props: ToolProps) {
 
   const sessionID = createMemo(() => stringValue(props.metadata.sessionId))
   const messages = createMemo(() => sync.data.message[sessionID() ?? ""] ?? [])
+  const lastAssistant = createMemo(() =>
+    messages().findLast((message): message is AssistantMessage => message.role === "assistant"),
+  )
 
   const tools = createMemo(() => {
     return messages().flatMap((msg) =>
@@ -2461,10 +2428,25 @@ function Task(props: ToolProps) {
 
   const duration = createMemo(() => {
     const first = messages().find((x) => x.role === "user")?.time.created
-    const assistant = messages().findLast((x) => x.role === "assistant")?.time.completed
-    if (!first || !assistant) return 0
-    return assistant - first
+    const completed = lastAssistant()?.time.completed
+    if (!first || !completed) return 0
+    return completed - first
   })
+
+  const tokens = createMemo(() =>
+    messages().reduce(
+      (total, message) =>
+        message.role === "assistant"
+          ? total +
+            message.tokens.input +
+            message.tokens.output +
+            message.tokens.reasoning +
+            message.tokens.cache.read +
+            message.tokens.cache.write
+          : total,
+      0,
+    ),
+  )
 
   const content = createMemo(() => {
     const description = stringValue(props.input.description)
@@ -2489,7 +2471,15 @@ function Task(props: ToolProps) {
     }
 
     if (!isRunning() && props.part.state.status === "completed") {
-      content.push(`↳ ${formatCompletedSubagentDetail(tools().length, Locale.duration(duration()))}`)
+      content.push(
+        `↳ ${formatCompletedSubagentDetail(
+          tools().length,
+          Locale.duration(duration()),
+          stringValue(props.metadata.modelID) ?? lastAssistant()?.modelID,
+          tokens(),
+          lastAssistant()?.variant ?? stringValue(props.input.variant),
+        )}`,
+      )
     }
 
     return content.join("\n")
@@ -2529,9 +2519,21 @@ export function formatSubagentRetry(attempt: number, message: string) {
   return `Retrying (attempt ${attempt}) · ${message}`
 }
 
-export function formatCompletedSubagentDetail(toolcalls: number, duration: string) {
-  if (toolcalls === 0) return duration
-  return `${formatSubagentToolcalls(toolcalls)} · ${duration}`
+export function formatCompletedSubagentDetail(
+  toolcalls: number,
+  duration: string,
+  modelID?: string,
+  tokens?: number,
+  variant?: string,
+) {
+  return [
+    modelID ? `${modelID}${variant ? ` (${variant})` : ""}` : undefined,
+    tokens === undefined ? undefined : `${Locale.number(tokens)} tokens`,
+    toolcalls > 0 ? formatSubagentToolcalls(toolcalls) : undefined,
+    duration,
+  ]
+    .filter((item) => item !== undefined)
+    .join(" · ")
 }
 
 type ExecuteCall = { tool: string; status: "running" | "completed" | "error"; input?: Record<string, unknown> }

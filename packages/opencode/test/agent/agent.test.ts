@@ -1,6 +1,7 @@
 import { afterEach, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
+import os from "os"
 import path from "path"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -212,6 +213,78 @@ it.instance(
             write: "allow",
             task: "allow",
             goal: "allow",
+          },
+        },
+      },
+    },
+  },
+)
+
+// The reviewer is told to verify authoritative current state, so it is the
+// agent most likely to read outside the worktree. Every such read used to raise
+// an external_directory prompt, and an unanswered prompt used to kill the
+// review. Reads are now allowed by default for this agent only; the mutation
+// denials and the credential carve-out must survive both construction paths.
+const reviewerReadScope = (reviewer: Agent.Info | undefined) => {
+  expect(reviewer).toBeDefined()
+  const outside = path.join(path.sep, "somewhere", "outside", "the", "worktree", "*")
+  expect(Permission.evaluate("external_directory", outside, reviewer!.permission).action).toBe("allow")
+  // The whitelist that predates the widening still resolves to allow.
+  expect(Permission.evaluate("external_directory", Truncate.GLOB, reviewer!.permission).action).toBe("allow")
+  expect(Permission.evaluate("external_directory", path.join(Global.Path.tmp, "*"), reviewer!.permission).action).toBe(
+    "allow",
+  )
+  // Credential stores stay behind a human. Wildcard's "*" crosses separators,
+  // so the nested case is covered by the same rule.
+  for (const dir of [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".password-store"]) {
+    expect(
+      Permission.evaluate("external_directory", path.join(os.homedir(), dir, "*"), reviewer!.permission).action,
+    ).toBe("ask")
+  }
+  expect(
+    Permission.evaluate("external_directory", path.join(os.homedir(), ".config", "gcloud", "*"), reviewer!.permission)
+      .action,
+  ).toBe("ask")
+  expect(
+    Permission.evaluate("external_directory", path.join(os.homedir(), ".ssh", "nested", "*"), reviewer!.permission)
+      .action,
+  ).toBe("ask")
+  // Widening reads must not have widened anything else.
+  expect(evalPerm(reviewer, "bash")).toBe("deny")
+  expect(evalPerm(reviewer, "edit")).toBe("deny")
+  expect(evalPerm(reviewer, "write")).toBe("deny")
+  expect(evalPerm(reviewer, "patch")).toBe("deny")
+  expect(evalPerm(reviewer, "apply_patch")).toBe("deny")
+}
+
+it.instance("goal reviewer reads outside the worktree without prompting (native path)", () =>
+  Effect.gen(function* () {
+    reviewerReadScope(yield* load((svc) => svc.get("goal-reviewer")))
+    // The shared read-only ruleset is unchanged: only the reviewer was widened.
+    const explore = yield* load((svc) => svc.get("explore"))
+    expect(
+      Permission.evaluate("external_directory", path.join(path.sep, "elsewhere", "*"), explore!.permission).action,
+    ).toBe("ask")
+  }),
+)
+
+it.instance(
+  "goal reviewer read scope survives the config merge and config cannot re-narrow it",
+  () =>
+    Effect.gen(function* () {
+      reviewerReadScope(yield* load((svc) => svc.get("goal-reviewer")))
+    }),
+  {
+    config: {
+      agent: {
+        "goal-reviewer": {
+          permission: {
+            bash: "allow",
+            edit: "allow",
+            write: "allow",
+            patch: "allow",
+            apply_patch: "allow",
+            external_directory: { "*": "deny" },
           },
         },
       },

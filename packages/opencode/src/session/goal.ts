@@ -3,8 +3,12 @@ export * as SessionGoal from "./goal"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { Context, Effect, Layer, Schema } from "effect"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { Storage } from "@/storage/storage"
+import { SessionGoalEvent } from "@opencode-ai/schema/session-goal-event"
 import { SessionID } from "./schema"
+
+export const Event = SessionGoalEvent
 
 export const Status = Schema.Literals(["active", "paused", "complete", "blocked"])
 export type Status = Schema.Schema.Type<typeof Status>
@@ -309,6 +313,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const storage = yield* Storage.Service
+    const events = yield* EventV2Bridge.Service
     const decode = Schema.decodeUnknownEffect(Info)
 
     const get = Effect.fn("SessionGoal.get")(function* (sessionID: SessionID) {
@@ -403,7 +408,8 @@ const layer = Layer.effect(
     const block = Effect.fn("SessionGoal.block")(function* (sessionID: SessionID, reason: string) {
       const text = reason.trim()
       if (!text) return yield* get(sessionID)
-      return yield* update(sessionID, (draft, now) => {
+      const transition = { blocked: false }
+      const result = yield* update(sessionID, (draft, now) => {
         if (draft.status !== "active") return
         const turn = draft.turns + 1
         const same = draft.blocker?.reason === text
@@ -417,7 +423,10 @@ const layer = Layer.effect(
         stopClock(draft, now)
         draft.status = "blocked"
         draft.time.completed = now
+        transition.blocked = true
       })
+      if (transition.blocked) yield* events.publish(Event.Blocked, { sessionID, reason: text })
+      return result
     })
 
     const requestReview = Effect.fn("SessionGoal.requestReview")(function* (input: ReviewRequestInput) {
@@ -526,7 +535,8 @@ const layer = Layer.effect(
     })
 
     const finishReview = Effect.fn("SessionGoal.finishReview")(function* (input: ReviewFinishInput) {
-      return yield* update(input.sessionID, (draft, now) => {
+      const transition = { completed: false }
+      const result = yield* update(input.sessionID, (draft, now) => {
         if (draft.review?.status !== "running") return
         if (draft.review.reviewerSessionID !== input.reviewerSessionID) return
         draft.tokensUsed += input.tokens
@@ -557,7 +567,10 @@ const layer = Layer.effect(
         draft.blocker = undefined
         draft.pauseReason = undefined
         draft.time.completed = now
+        transition.completed = true
       })
+      if (transition.completed) yield* events.publish(Event.Completed, { sessionID: input.sessionID })
+      return result
     })
 
     const clear = Effect.fn("SessionGoal.clear")(function* (sessionID: SessionID) {
@@ -568,7 +581,8 @@ const layer = Layer.effect(
     })
 
     const recordTurn = Effect.fn("SessionGoal.recordTurn")(function* (input: RecordTurnInput) {
-      return yield* update(input.sessionID, (draft, now) => {
+      const transition = { paused: false, tokenBudget: 0, tokensUsed: 0 }
+      const result = yield* update(input.sessionID, (draft, now) => {
         if (input.completed !== false) draft.turns += 1
         draft.tokensUsed += input.tokens
         if (input.interrupted) {
@@ -590,8 +604,19 @@ const layer = Layer.effect(
           stopClock(draft, now)
           draft.status = "paused"
           draft.pauseReason = "budget"
+          transition.paused = true
+          transition.tokenBudget = draft.tokenBudget
+          transition.tokensUsed = draft.tokensUsed
         }
       })
+      if (transition.paused)
+        yield* events.publish(Event.Paused, {
+          sessionID: input.sessionID,
+          reason: "budget",
+          tokenBudget: transition.tokenBudget,
+          tokensUsed: transition.tokensUsed,
+        })
+      return result
     })
 
     const context = Effect.fn("SessionGoal.context")(function* (sessionID: SessionID) {
@@ -662,4 +687,4 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer, deps: [Storage.node] })
+export const node = LayerNode.make({ service: Service, layer, deps: [Storage.node, EventV2Bridge.node] })

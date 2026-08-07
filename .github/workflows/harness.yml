@@ -1,0 +1,119 @@
+name: harness
+
+# The tmux harnesses are the only end-to-end coverage for goal mode and
+# subagents: they drive a real compiled binary through the TUI against an
+# isolated fake provider and assert against the session database. Unit tests
+# exercise the services; only this catches wiring that is correct in isolation
+# and wrong in the built product.
+#
+# drive.sh always exits 0 and reports through grep-able PASS/FAIL lines, so
+# this job asserts on those lines rather than on the exit code, and fails when
+# an expected PASS is missing as well as when a FAIL appears — a scenario that
+# silently stops emitting assertions must not read as success.
+
+on:
+  push:
+    branches:
+      - dev
+      - goal-mode
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  drive:
+    name: tui harness
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Build binary
+        run: OPENCODE_VERSION=dev ./packages/opencode/script/build.ts --single --skip-install --skip-embed-web-ui
+
+      - name: Locate binary
+        id: bin
+        run: |
+          # --single builds for the host platform, so the dist directory name
+          # differs from the darwin default baked into drive.sh.
+          path="$(ls packages/opencode/dist/*/bin/opencode | head -1)"
+          test -x "$path" || { echo "no executable binary under packages/opencode/dist"; exit 1; }
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Drive scenarios
+        env:
+          BIN: ${{ github.workspace }}/${{ steps.bin.outputs.path }}
+        run: |
+          set -uo pipefail
+          fail=0
+
+          run_scenario() {
+            local harness="$1" scenario="$2" watch="$3" port="$4" expected="$5"
+            local log="/tmp/harness-${harness}-${scenario}.log"
+            echo "::group::${harness} ${scenario}"
+            PORT="$port" \
+            SOCK="/tmp/harness-${harness}-${scenario}.sock" \
+            WORK="/tmp/harness-${harness}-${scenario}" \
+              bash "script/${harness}/drive.sh" "$scenario" "$watch" 2>&1 | tee "$log"
+            echo "::endgroup::"
+
+            if grep -qE '^(FAIL|not ok)' "$log"; then
+              echo "::error::${harness}/${scenario} reported a failing assertion"
+              grep -E '^(FAIL|not ok)' "$log"
+              fail=1
+            fi
+            local seen
+            seen="$(grep -cE '^(PASS|ok)' "$log" || true)"
+            if [ "$seen" -lt "$expected" ]; then
+              echo "::error::${harness}/${scenario} emitted ${seen} passing assertions, expected at least ${expected} — the scenario stopped short"
+              fail=1
+            fi
+          }
+
+          # Only self-asserting scenarios run here. goal-harness scenarios other
+          # than `retrieval` report by printing durable state for a human to
+          # read rather than emitting assertions, so they would pass vacuously.
+          # Ports and sockets are distinct so a leaked process from one
+          # scenario cannot poison the next.
+          run_scenario goal-harness retrieval 70 4901 12
+          run_scenario subagent-harness notify 45 4902 1
+          run_scenario subagent-harness inspect 50 4903 2
+
+          exit "$fail"
+
+      - name: Upload harness artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: harness-logs
+          path: |
+            /tmp/harness-*.log
+            /tmp/harness-*/snaps
+            /tmp/harness-*/provider.log
+            /tmp/harness-*/tui.log
+          if-no-files-found: ignore
+          retention-days: 7

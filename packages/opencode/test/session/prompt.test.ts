@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import os from "os"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -1167,6 +1168,140 @@ reviewerTimeout.instance("a hanging reviewer times out, remains inspectable, and
   }),
 )
 
+// The reviewer's only remaining prompt path: everything outside the worktree is
+// readable without a human except the enumerated credential stores, which stay
+// "ask". A pending ask is a real, reachable state, not a synthetic one, and this
+// probe path is never expected to exist on any machine.
+const credentialProbe = path.join(os.homedir(), ".password-store", "opencode-goal-review-probe")
+
+// Poll for the pending permission raised by whichever reviewer child session the
+// goal loop created.
+const pendingForReviewer = (sessionID: SessionID) =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const permission = yield* Permission.Service
+      const children = new Set((yield* sessions.children(sessionID)).map((child) => child.id))
+      return (yield* permission.list()).find((request) => children.has(request.sessionID))
+    }),
+    "reviewer never raised a permission request",
+    "10 seconds",
+  )
+
+reviewerTimeout.instance("a reviewer blocked on an unanswered permission is not killed for inactivity", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const permission = yield* Permission.Service
+    const session = yield* sessions.create({
+      title: "Goal reviewer waiting on a human",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the away-from-keyboard goal" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "verify a reviewer that stops on a human, not on a stall" })
+    yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    // The reviewer's first act blocks on a permission nobody is there to answer.
+    yield* llm.tool("read", { filePath: credentialProbe })
+    yield* llm.textFrom((hit) => {
+      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+      return `VERDICT: MET ${nonce} verified once the human answered`
+    })
+    // Safety net so a regression fails an assertion instead of hanging the loop.
+    yield* llm.text("Follow-up worker turn.")
+    yield* llm.textFrom((hit) => {
+      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+      return `VERDICT: MET ${nonce} second attempt`
+    })
+
+    const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+    const request = yield* pendingForReviewer(session.id)
+
+    // Sit on the prompt for many multiples of the 100ms inactivity window. The
+    // pre-fix watchdog killed the review on the first tick past 100ms.
+    yield* Effect.sleep("1200 millis")
+    const during = yield* goals.get(session.id)
+    expect(during?.review?.status).toBe("running")
+    const waiting = yield* sessions.messages({ sessionID: session.id })
+    const waitingPart = waiting
+      .flatMap((message) => message.parts)
+      .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "goal-review")
+    expect(waitingPart?.state.status).toBe("running")
+    // The indefinite wait is legible rather than silent.
+    expect(waitingPart?.state.status === "running" ? waitingPart.state.metadata?.["activity"] : undefined).toBe(
+      "Waiting for permission approval",
+    )
+
+    yield* permission.reply({ requestID: request.id, reply: "once" })
+    yield* awaitWithTimeout(
+      Fiber.join(fiber),
+      "goal loop never finished after the permission was answered",
+      "20 seconds",
+    )
+
+    const goal = yield* goals.get(session.id)
+    expect(goal?.review?.status).toBe("accepted")
+    expect(goal?.status).toBe("complete")
+    // A killed reviewer would have forced a second attempt.
+    expect(goal?.review?.attempt).toBe(1)
+    expect(goal?.review?.reason).toContain("verified once the human answered")
+    expect(yield* sessions.children(session.id)).toHaveLength(1)
+  }),
+)
+
+reviewerTimeout.instance("the inactivity timer resumes once the permission is answered", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const permission = yield* Permission.Service
+    const session = yield* sessions.create({
+      title: "Goal reviewer resumes after the answer",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the answered-then-stalled goal" }],
+    })
+    yield* goals.set({
+      sessionID: session.id,
+      objective: "verify the inactivity window is suspended, not disabled",
+      tokenBudget: 1,
+    })
+    yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    yield* llm.tool("read", { filePath: credentialProbe })
+    // Answered, then genuinely stalls: the suspended window has to start ticking
+    // again, otherwise one permission would buy immunity for the whole review.
+    yield* llm.hang
+    yield* llm.text("Worker resumed after the reviewer timeout.", { usage: { input: 10, output: 1 } })
+
+    const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+    const request = yield* pendingForReviewer(session.id)
+    yield* Effect.sleep("600 millis")
+    expect((yield* goals.get(session.id))?.review?.status).toBe("running")
+
+    yield* permission.reply({ requestID: request.id, reply: "once" })
+    yield* awaitWithTimeout(Fiber.join(fiber), "goal loop never finished after the reviewer stalled", "20 seconds")
+
+    const goal = yield* goals.get(session.id)
+    expect(goal?.review?.status).toBe("error")
+    expect(goal?.review?.reason).toContain("without activity")
+    const reviewers = yield* sessions.children(session.id)
+    expect(reviewers[0]?.title).toContain("timed out")
+  }),
+)
+
 it.instance("goal review limits fall back to config when the env override is unset", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(goalReviewCfg({ timeout: 100 }))
@@ -1389,39 +1524,41 @@ it.instance("a goal turn that dies on a provider error is never handed to the re
   }),
 )
 
-it.instance("a second consecutive provider failure delays the next goal turn", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const goals = yield* SessionGoal.Service
-    const sessions = yield* Session.Service
-    const session = yield* sessions.create({
-      title: "Goal backoff",
-      permission: [{ permission: "*", pattern: "*", action: "allow" }],
-    })
+it.instance(
+  "a second consecutive provider failure delays the next goal turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const goals = yield* SessionGoal.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Goal backoff",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
 
-    yield* prompt.prompt({
-      sessionID: session.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "start the outage goal" }],
-    })
-    yield* goals.set({ sessionID: session.id, objective: "outlast a provider outage", tokenBudget: 1 })
-    yield* llm.error(400, { error: { message: "provider exploded" } })
-    yield* llm.error(400, { error: { message: "provider exploded" } })
-    yield* llm.text("Recovered.", { usage: { input: 10, output: 4 } })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "start the outage goal" }],
+      })
+      yield* goals.set({ sessionID: session.id, objective: "outlast a provider outage", tokenBudget: 1 })
+      yield* llm.error(400, { error: { message: "provider exploded" } })
+      yield* llm.error(400, { error: { message: "provider exploded" } })
+      yield* llm.text("Recovered.", { usage: { input: 10, output: 4 } })
 
-    const startedAt = Date.now()
-    yield* prompt.loop({ sessionID: session.id })
+      const startedAt = Date.now()
+      yield* prompt.loop({ sessionID: session.id })
 
-    // Second consecutive failure must wait goalContinueBackoffMs(2) = 5s before
-    // the third turn; the first failure continues immediately.
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(5_000)
-    const goal = yield* goals.get(session.id)
-    expect(goal?.turns).toBe(3)
-    expect(goal?.interrupted).toBeUndefined()
-    expect(yield* sessions.children(session.id)).toHaveLength(0)
-  }),
+      // Second consecutive failure must wait goalContinueBackoffMs(2) = 5s before
+      // the third turn; the first failure continues immediately.
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(5_000)
+      const goal = yield* goals.get(session.id)
+      expect(goal?.turns).toBe(3)
+      expect(goal?.interrupted).toBeUndefined()
+      expect(yield* sessions.children(session.id)).toHaveLength(0)
+    }),
   15_000,
 )
 

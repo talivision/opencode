@@ -37,6 +37,31 @@ Explicit `"deny"` rules are still enforced. Auto mode only changes requests that
 
 In the TUI, open the command palette and select **Enable auto-approve permissions** or **Disable auto-approve permissions** to change modes. When auto mode is active, the prompt displays a muted `auto` indicator next to the current agent.
 
+### How auto mode is scoped
+
+Auto mode is a property of a **session**, not of the process:
+
+- Turning it on for a session also turns it on for every session spawned from it, however deep. A subagent — a goal reviewer included — never re-asks for something its parent session is running in auto for.
+- Another session in the same OpenCode process is unaffected, so you can leave one session unattended while another still prompts you.
+- It is resolved on the server, so it applies even while no client is attached. A dropped connection can no longer leave a request stranded, and reconnecting does not lose the mode.
+- It survives restart, resume, and continue for the sessions it was turned on for.
+
+Toggle it with `POST /permission/auto` (`{"sessionID": "...", "enabled": true}`), and read the effective status — including which ancestor it was inherited from — with `GET /permission/auto/:sessionID`.
+
+:::note
+The `--auto` flag and the TUI command-palette toggle still drive the older client-side auto-approval, which replies to prompts as they arrive rather than resolving them in the session. Requests raised while the client is disconnected are not covered by that path.
+:::
+
+### Auto mode and deny
+
+Auto mode turns `"ask"` into `"allow"`. It never turns `"deny"` into `"allow"` — an explicit deny rule is still enforced for every session, auto or not.
+
+### Auto mode grants nothing permanent
+
+An auto-approval is not remembered as a rule. Nothing is added to the [remembered approvals](#remembering-approvals) list, so turning auto mode off leaves the permission set exactly as it was before you turned it on.
+
+What is recorded instead is an audit trail: for each distinct permission and pattern auto mode approved, OpenCode stores the session and the time so an unattended run can be reviewed afterwards. It lives next to the remembered approvals, in the same project-scoped file described below, under `audit`.
+
 ---
 
 ## Configuration
@@ -193,10 +218,59 @@ If you don’t specify anything, OpenCode starts from permissive defaults:
 When OpenCode prompts for approval, the UI offers three outcomes:
 
 - `once` — approve just this request
-- `always` — approve future requests matching the suggested patterns (for the rest of the current OpenCode session)
+- `always` — approve future requests matching the suggested patterns
 - `reject` — deny the request
 
 The set of patterns that `always` would approve is provided by the tool (for example, bash approvals typically whitelist a safe command prefix like `git status*`).
+
+An `always` approval applies to every session in the current project, subagents included — approve something once in your main session and a goal reviewer spawned from it will not ask again.
+
+---
+
+## Remembering Approvals
+
+`always` approvals are remembered across restarts, so reconnecting after a dropped connection does not make you re-approve everything you already approved.
+
+### What is stored, and where
+
+Approvals are stored per project, in `permission/<project-id>.json` under your OpenCode data directory (`~/.local/share/opencode/storage` on Linux, `~/Library/Application Support/opencode/storage` on macOS). The project id is derived from the VCS root, so sibling worktrees of one repository share approvals and unrelated checkouts never do. **An approval made in one project is never applied in another.**
+
+Only the pattern that was actually shown in the prompt is stored. The broader pattern set a tool suggests for `always` (`task`, for instance, suggests `*`) applies for the rest of the current run only and is never written to disk — a single click cannot leave a wildcard behind permanently.
+
+### Denies always win
+
+A stored approval can only upgrade an `"ask"` to an `"allow"`. An explicit `"deny"` in your config outranks every stored approval, so adding a deny rule is a reliable way to take an approval back:
+
+```json title="opencode.json"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "git push *": "deny"
+    }
+  }
+}
+```
+
+### Reviewing and revoking
+
+The stored file is plain JSON: read it to see what is remembered, and delete entries (or the whole file) to revoke them. Revoking also has an API surface — `GET /permission/grant` lists what is in effect and `POST /permission/grant/revoke` removes entries by permission and/or pattern.
+
+### Turning it off
+
+Set `permission_persist` to `false` to keep approvals for the current run only. Nothing permission-related is then written to disk — no approvals, no auto-mode state, no audit trail — and anything a previous run stored is ignored rather than silently still in force.
+
+```json title="opencode.json"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission_persist": false
+}
+```
+
+### Security note
+
+A remembered approval outlives the task it was granted for: a broad approval made for one job is still in force for the next one. That is why the scope is deliberately narrow — one project, and only the exact pattern you were shown — and why an explicit `deny` always outranks it. If you work on sensitive code in the same repository as routine work, prefer explicit `allow`/`deny` rules in config over remembered approvals, or turn persistence off.
 
 ---
 

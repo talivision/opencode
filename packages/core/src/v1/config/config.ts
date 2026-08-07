@@ -126,6 +126,10 @@ export const Info = Schema.Struct({
   }),
   layout: Schema.optional(ConfigLayoutV1.Layout).annotate({ description: "@deprecated Always uses stretch layout." }),
   permission: Schema.optional(ConfigPermissionV1.Info),
+  permission_persist: Schema.optional(Schema.Boolean).annotate({
+    description:
+      'Remember "always" permission approvals across restarts, scoped to the current project. Only the pattern shown in the prompt is stored, and an explicit "deny" rule still wins. Defaults to true; set to false to keep approvals for the current run only.',
+  }),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
   attachment: Schema.optional(ConfigAttachmentV1.Info).annotate({
     description: "Attachment processing configuration, including image size limits and resizing behavior",

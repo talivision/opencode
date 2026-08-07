@@ -87,6 +87,9 @@ export type ResolveOptions = Schema.Schema.Type<typeof ResolveOptions>
 
 export function resolve(input: Info, options: ResolveOptions): Resolved {
   const keybinds: TuiKeybind.KeybindOverrides = { ...input.keybinds }
+  if (hasShiftTab(input.keybinds?.agent_cycle_reverse) && input.keybinds?.permission_cycle === undefined) {
+    keybinds.permission_cycle = "none"
+  }
   if (!options.terminalSuspend) {
     keybinds.terminal_suspend = "none"
     if (keybinds.input_undo === undefined) {
@@ -114,6 +117,17 @@ export function resolve(input: Info, options: ResolveOptions): Resolved {
     leader_timeout: input.leader_timeout ?? LeaderTimeoutDefault,
     mouse: input.mouse ?? true,
   }
+}
+
+function hasShiftTab(value: unknown): boolean {
+  if (!value || value === "none") return false
+  if (Array.isArray(value)) return value.some(hasShiftTab)
+  if (typeof value === "string") return value.split(",").some((item) => item.trim().toLowerCase() === "shift+tab")
+  if (typeof value !== "object") return false
+  const key = "key" in value ? value.key : value
+  if (typeof key === "string") return key.toLowerCase() === "shift+tab"
+  if (!key || typeof key !== "object" || !("name" in key) || typeof key.name !== "string") return false
+  return key.name.toLowerCase() === "tab" && "shift" in key && key.shift === true
 }
 
 const ConfigContext = createContext<Resolved>()

@@ -33,6 +33,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
+import { Question } from "@/question"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
@@ -208,6 +209,7 @@ const layer = Layer.effect(
     const commands = yield* Command.Service
     const config = yield* Config.Service
     const permission = yield* Permission.Service
+    const questions = yield* Question.Service
     const fsys = yield* FSUtil.Service
     const mcp = yield* MCP.Service
     const lsp = yield* LSP.Service
@@ -1315,9 +1317,7 @@ const layer = Layer.effect(
       // Both limits are configurable, so the reason has to describe whatever the
       // operator actually set: a sub-minute cap must not report "1 minute".
       const reviewMaxLabel =
-        reviewMaxMs < 60_000
-          ? `${Math.ceil(reviewMaxMs / 1000)} second`
-          : `${Math.round(reviewMaxMs / 60_000)} minute`
+        reviewMaxMs < 60_000 ? `${Math.ceil(reviewMaxMs / 1000)} second` : `${Math.round(reviewMaxMs / 60_000)} minute`
       const reviewStartedAt = Date.now()
       // Measurement, not assumption. The budget charged to the goal stays
       // "generated tokens only" (output + reasoning, mirroring Claude), but the
@@ -1433,21 +1433,34 @@ const layer = Layer.effect(
         // it while its progress never reaches the parent transcript.
         const buffers = new Map<string, string>()
         let streamed: string | undefined
-        yield* events
-          .subscribe(MessageV2.Event.PartDelta)
-          .pipe(
-            Stream.runForEach((event) =>
-              Effect.gen(function* () {
-                if (event.data.sessionID !== child.id) return
-                if (event.data.field !== "text") return
-                const next = (buffers.get(event.data.partID) ?? "") + event.data.delta
-                buffers.set(event.data.partID, next)
-                streamed = goalReviewActivity(next)
-                lastActivityAt = yield* Clock.currentTimeMillis
-              }),
-            ),
-            Effect.forkChild,
-          )
+        // Waiting on a human is not inactivity. A reviewer parked on an
+        // unanswered permission request (or question) produces no parts and no
+        // deltas, so the fingerprint stops moving and the watchdog used to kill
+        // it for idleness — turning "the operator stepped away" into a review
+        // error, an error streak, and continuation backoff. Nothing can happen
+        // until a person answers, so both clocks stop for that span: the
+        // inactivity window is suspended, and the blocked span is subtracted
+        // from the hard cap so an unattended run does not silently burn its
+        // multi-hour budget sitting on a prompt. The hard cap still charges for
+        // every millisecond the reviewer was actually able to work, which is the
+        // only time it was meant to bound. Consequence, deliberately accepted: a
+        // prompt nobody ever answers means a review that never times out, so the
+        // wait is published as activity instead of being silent.
+        let blockedSince: number | undefined
+        let blockedTotal = 0
+        yield* events.subscribe(MessageV2.Event.PartDelta).pipe(
+          Stream.runForEach((event) =>
+            Effect.gen(function* () {
+              if (event.data.sessionID !== child.id) return
+              if (event.data.field !== "text") return
+              const next = (buffers.get(event.data.partID) ?? "") + event.data.delta
+              buffers.set(event.data.partID, next)
+              streamed = goalReviewActivity(next)
+              lastActivityAt = yield* Clock.currentTimeMillis
+            }),
+          ),
+          Effect.forkChild,
+        )
         const interval = Math.max(10, Math.min(250, Math.floor(reviewTimeoutMs / 4)))
         while (true) {
           yield* Effect.sleep(`${interval} millis`)
@@ -1460,7 +1473,29 @@ const layer = Layer.effect(
             fingerprint = progress.fingerprint
             lastActivityAt = now
           }
-          const activity = progress.tool ? progress.activity : (streamed ?? progress.activity)
+          // Read the pending maps rather than subscribing to Permission/Question
+          // events: Permission.ask deletes its pending entry inside an `ensuring`
+          // finalizer without publishing Event.Replied, so an interrupted or
+          // scope-cancelled request emits Asked with no matching terminator. An
+          // event-only tracker would latch "blocked" forever and never time out
+          // again — the same bug inverted. list() is authoritative, and one Map
+          // scan per tick is free next to the message read already happening here.
+          const blocked =
+            (yield* permission.list()).some((request) => request.sessionID === child.id) ||
+            (yield* questions.list()).some((request) => request.sessionID === child.id)
+          if (blocked && blockedSince === undefined) blockedSince = now
+          if (!blocked && blockedSince !== undefined) {
+            blockedTotal += now - blockedSince
+            blockedSince = undefined
+            // A freshly answered prompt earns a full inactivity window; the
+            // reviewer has to be given time to act on the answer.
+            lastActivityAt = now
+          }
+          const activity = blocked
+            ? "Waiting for permission approval"
+            : progress.tool
+              ? progress.activity
+              : (streamed ?? progress.activity)
           if (activity && activity !== published && reviewPart.state.status === "running") {
             published = activity
             reviewPart = yield* sessions.updatePart({
@@ -1474,13 +1509,14 @@ const layer = Layer.effect(
               },
             })
           }
-          if (now - reviewStartedAt >= reviewMaxMs) {
+          const workingMs = now - reviewStartedAt - blockedTotal - (blockedSince === undefined ? 0 : now - blockedSince)
+          if (workingMs >= reviewMaxMs) {
             return {
               type: "timeout" as const,
               reason: `Independent reviewer timed out at the ${reviewMaxLabel} safety limit`,
             }
           }
-          if (now - lastActivityAt >= reviewTimeoutMs) {
+          if (!blocked && now - lastActivityAt >= reviewTimeoutMs) {
             return {
               type: "timeout" as const,
               reason: `Independent reviewer timed out after ${Math.ceil(reviewTimeoutMs / 1000)}s without activity`,
@@ -1572,7 +1608,8 @@ const layer = Layer.effect(
         ? {
             accepted: submitted.met,
             reason: [
-              submitted.summary.trim() || (submitted.met ? "All goal requirements verified." : "Goal requirements unmet."),
+              submitted.summary.trim() ||
+                (submitted.met ? "All goal requirements verified." : "Goal requirements unmet."),
               ...(submitted.unmet ?? []).map((item) => `Unmet — ${item.requirement}: ${item.evidence}`),
             ].join("\n"),
           }
@@ -2315,6 +2352,7 @@ export const node = LayerNode.make({
     Command.node,
     Config.node,
     Permission.node,
+    Question.node,
     FSUtil.node,
     MCP.node,
     LSP.node,

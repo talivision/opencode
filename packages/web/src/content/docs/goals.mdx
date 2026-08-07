@@ -1,0 +1,107 @@
+---
+title: Goals
+description: Long-running objectives that keep working until an independent reviewer verifies them.
+---
+
+A goal is a long-running objective. Instead of ending its turn and waiting for
+you, the agent keeps taking turns until the objective is achieved — and it
+cannot decide for itself that it is done. Completion is verified by a separate,
+read-only reviewer that inspects current state before the goal can close.
+
+```bash frame="none"
+/goal Ship a reserved-tool-id guard in the tool registry, with tests, and quote the passing output as evidence
+```
+
+---
+
+## How a goal runs
+
+1. You set an objective. The agent works toward it, turn after turn, without
+   needing you to prompt it again.
+2. When the agent believes it is finished, it requests completion. That request
+   is never self-certifying.
+3. An independent reviewer starts in its own session. It is read-only: it cannot
+   edit files, run commands, install anything, or change the state it is judging.
+4. The reviewer inspects current state and returns a verdict. If it rejects, its
+   concrete reasons are handed back to the agent, which keeps working.
+5. Only an accepted verdict completes the goal.
+
+The reviewer also runs when a turn simply ends while a goal is active, so the
+model cannot avoid verification by declining to ask for it.
+
+---
+
+## Writing a good objective
+
+The reviewer evaluates the *whole* objective against current state, so the
+objective is effectively a specification. Objectives that verify well are
+explicit about what "done" means:
+
+- **Enumerate the requirements.** The reviewer decomposes the objective into a
+  checklist on its first pass, and every later pass inherits it. Vague
+  objectives produce vague checklists.
+- **Say what counts as evidence.** The reviewer cannot execute anything, so ask
+  for verification output to be quoted into the transcript where it can read it.
+- **State the exclusions.** "Do not refactor unrelated files" is checkable.
+
+---
+
+## Reviews
+
+Each review runs in its own session, visible in the TUI, and starts from a
+bounded index of the worker's session rather than the whole transcript — it
+retrieves the specific messages, tool calls and files it needs. This keeps
+reviews fast and stops long goals from pushing the earliest work out of view.
+
+Findings carry across attempts even though the sessions do not: the requirement
+checklist and each requirement's verdict persist on the goal, so a later
+reviewer starts from what an earlier one established instead of re-deriving it.
+
+A review that times out or fails to produce a verdict never accepts a goal.
+Completion is recorded as unverified and the agent keeps working, so an
+infrastructure problem can only cost you an attempt, never a false success.
+
+---
+
+## Limits
+
+Reviews are bounded by two timers, both configurable:
+
+```json title="opencode.json"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "goal": {
+    "review": {
+      "timeout": 1200000,
+      "max_duration": 18000000
+    }
+  }
+}
+```
+
+- `timeout` — milliseconds the reviewer may go without any activity before it is
+  cancelled (default `1200000`, 20 minutes). This is an inactivity timer, not a
+  wall clock: it resets on streamed text, reasoning and tool calls, so it only
+  fires on a reviewer that has genuinely stalled.
+- `max_duration` — the maximum total time one review may take regardless of
+  activity (default `18000000`, 5 hours). This is the only bound on what a
+  single review can spend, so lower it if you want a tighter budget.
+
+`OPENCODE_GOAL_REVIEW_TIMEOUT_MS` and `OPENCODE_GOAL_REVIEW_MAX_MS` override
+both for a single run.
+
+A goal can also carry a token budget. When it is exhausted the goal pauses
+rather than stopping, and you can resume it.
+
+---
+
+## When a turn dies
+
+Providers fail. A turn that ends on a provider error or an exhausted retry never
+claimed completion, so it is not handed to the reviewer — running a review
+against the provider that just failed would only double the load while you are
+being rate limited. The agent is told what happened and resumes from current
+state instead.
+
+Repeated failures back off progressively rather than spinning, and the goal
+survives: it is waiting, not broken.

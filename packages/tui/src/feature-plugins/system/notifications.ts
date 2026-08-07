@@ -6,6 +6,17 @@ const id = "internal:notifications"
 
 type SessionError = Extract<Event, { type: "session.error" }>["properties"]["error"]
 
+type GoalEvent =
+  | { type: "session.goal.completed"; properties: { sessionID: string } }
+  | { type: "session.goal.blocked"; properties: { sessionID: string; reason: string } }
+
+type GoalEventBus = {
+  on: <Type extends GoalEvent["type"]>(
+    type: Type,
+    handler: (event: Extract<GoalEvent, { type: Type }>) => void,
+  ) => () => void
+}
+
 function notify(api: TuiPluginApi, sessionID: string | undefined, message: string, sound: TuiAttentionSoundName) {
   const session = sessionID ? api.state.session.get(sessionID) : undefined
   const isSubagent = session?.parentID !== undefined
@@ -27,6 +38,7 @@ function sessionErrorMessage(error: SessionError) {
 }
 
 const tui: TuiPlugin = async (api) => {
+  const goalEvents = api.event as unknown as GoalEventBus
   const active = new Set<string>()
   const errored = new Set<string>()
   const questions = new Set<string>()
@@ -83,6 +95,21 @@ const tui: TuiPlugin = async (api) => {
     if (!active.has(sessionID)) return
     errored.add(sessionID)
     notify(api, sessionID, sessionErrorMessage(event.properties.error), "error")
+  })
+
+  goalEvents.on("session.goal.completed", (event) => {
+    const sessionID = event.properties.sessionID
+    active.delete(sessionID)
+    errored.delete(sessionID)
+    const session = api.state.session.get(sessionID)
+    notify(api, sessionID, "Goal complete", session?.parentID ? "subagent_done" : "done")
+  })
+
+  goalEvents.on("session.goal.blocked", (event) => {
+    const sessionID = event.properties.sessionID
+    active.delete(sessionID)
+    errored.delete(sessionID)
+    notify(api, sessionID, "Goal blocked", "error")
   })
 }
 

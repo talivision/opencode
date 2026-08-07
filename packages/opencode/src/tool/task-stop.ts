@@ -3,6 +3,7 @@ import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { Effect, Schema } from "effect"
+import { NotFoundError } from "@/storage/storage"
 import { type TaskPromptOps } from "./task"
 import { define, type DefWithoutID } from "./tool"
 
@@ -74,7 +75,11 @@ const requireOwnership = Effect.fnUntraced(function* (
   let current = task
   while (current.parentID) {
     if (current.parentID === parentID) return
-    current = yield* sessions.get(current.parentID)
+    const parent = yield* sessions
+      .get(current.parentID)
+      .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
+    if (!parent) return yield* Effect.fail(new Error(`Task ${task.id} is not owned by session ${parentID}`))
+    current = parent
   }
   return yield* Effect.fail(new Error(`Task ${task.id} is not owned by session ${parentID}`))
 })

@@ -1,5 +1,6 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Permission } from "@/permission"
+import { SessionID } from "@/session/schema"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
@@ -36,6 +37,37 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       return true
     })
 
-    return handlers.handle("list", list).handle("reply", reply)
+    const setAuto = Effect.fn("PermissionHttpApi.setAuto")(function* (ctx: {
+      payload: { sessionID: SessionID; enabled: boolean }
+    }) {
+      return yield* svc.setAuto({ sessionID: ctx.payload.sessionID, enabled: ctx.payload.enabled })
+    })
+
+    const getAuto = Effect.fn("PermissionHttpApi.getAuto")(function* (ctx: { params: { sessionID: SessionID } }) {
+      return yield* svc.getAuto(ctx.params.sessionID)
+    })
+
+    const autoLog = Effect.fn("PermissionHttpApi.autoLog")(function* () {
+      return yield* svc.autoLog()
+    })
+
+    const grants = Effect.fn("PermissionHttpApi.grants")(function* () {
+      return yield* svc.grants()
+    })
+
+    const revoke = Effect.fn("PermissionHttpApi.revoke")(function* (ctx: {
+      payload: { permission?: string; pattern?: string }
+    }) {
+      return yield* svc.revoke({ permission: ctx.payload.permission, pattern: ctx.payload.pattern })
+    })
+
+    return handlers
+      .handle("list", list)
+      .handle("reply", reply)
+      .handle("setAuto", setAuto)
+      .handle("getAuto", getAuto)
+      .handle("autoLog", autoLog)
+      .handle("grants", grants)
+      .handle("revoke", revoke)
   }),
 )

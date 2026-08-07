@@ -3,7 +3,9 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger } from "effect"
+import { eq } from "drizzle-orm"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -17,6 +19,8 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { TaskOutputTool } from "../../src/tool/task-output"
+import { TaskStopTool } from "../../src/tool/task-stop"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -277,6 +281,47 @@ describe("tool.task", () => {
       expect(result.output).toContain(`<task id="${child.id}" state="completed">`)
       expect(seen?.sessionID).toBe(child.id)
       expect(seen?.variant).toBe("xhigh")
+    }),
+  )
+
+  // task_id is a plain string the model supplies. Resuming or steering a task
+  // is at least as powerful as reading or stopping one, and both of those
+  // verify descendancy, so this must too — otherwise a session can drive a
+  // sibling's subagent or another goal's worker.
+  it.instance("execute refuses a task_id that is not a descendant", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const stranger = yield* sessions.create({ title: "Unrelated session" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let prompted = false
+      const promptOps = stubOps({ onPrompt: () => (prompted = true) })
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "hijack",
+            prompt: "do my bidding",
+            subagent_type: "general",
+            task_id: stranger.id,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(prompted).toBe(false)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
     }),
   )
 
@@ -1016,6 +1061,228 @@ describe("tool.task", () => {
         expect(notification.parts[0].text).toContain("It is not a message from the user")
         expect(notification.parts[0].text).toContain("first done")
         expect(notification.parts[0].text).toContain("task_output(task_id=")
+      }
+    }),
+  )
+
+  background.instance("logs a steering prompt that fails to persist", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "Running child" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const logged = defer<unknown>()
+
+      yield* jobs.start({ id: child.id, type: "task", run: Effect.never })
+      const result = yield* def
+        .execute(
+          {
+            description: "add investigation scope",
+            prompt: "also inspect cancellation",
+            subagent_type: "general",
+            task_id: child.id,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: {
+                ...stubOps(),
+                prompt: () => Effect.fail(new Error("prompt persistence failed")),
+              } satisfies TaskPromptOps,
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(
+          Effect.provide(
+            Logger.layer([
+              Logger.make((entry) => {
+                if (JSON.stringify(entry.message).includes("failed to steer background task")) logged.resolve(entry.message)
+              }),
+            ]),
+          ),
+        )
+
+      expect(result.output).toContain("Background task updated")
+      const entry = yield* Effect.promise(() => logged.promise).pipe(Effect.timeout("1 second"))
+      expect(JSON.stringify(entry)).toContain("failed to steer background task")
+      expect(JSON.stringify(entry)).toContain(chat.id)
+      expect(JSON.stringify(entry)).toContain(child.id)
+    }),
+  )
+
+  background.instance("reports when steering races with an already settled task", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "Settling child" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      yield* jobs.start({ id: child.id, type: "task", run: Effect.never })
+      const result = yield* def.execute(
+        {
+          description: "add late context",
+          prompt: "inspect the final state too",
+          subagent_type: "general",
+          task_id: child.id,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: (input) => jobs.cancel(child.id).pipe(Effect.as(reply(input, "new run done"))),
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain("Background task restarted")
+      expect(result.output).toContain("finished before the additional context")
+      expect(result.output).toContain("did not arm another automatic completion notification")
+      expect(result.output).not.toContain("Background task updated")
+    }),
+  )
+
+  background.instance("uses one notification nonce for all envelopes in an instance", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const delivered = defer<SessionPrompt.PromptInput[]>()
+      const notifications: SessionPrompt.PromptInput[] = []
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.sync(() => {
+            if (input.sessionID === chat.id) {
+              notifications.push(input)
+              if (notifications.length === 2) delivered.resolve(notifications)
+            }
+            return reply(input, "background done")
+          }),
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      yield* def.execute(
+        {
+          description: "inspect first bug",
+          prompt: "inspect the first path",
+          subagent_type: "general",
+          background: true,
+        },
+        context,
+      )
+      yield* def.execute(
+        {
+          description: "inspect second bug",
+          prompt: "inspect the second path",
+          subagent_type: "general",
+          background: true,
+        },
+        context,
+      )
+
+      const envelopes = (yield* Effect.promise(() => delivered.promise)).map((input) => {
+        const part = input.parts[0]
+        expect(part?.type).toBe("text")
+        return part?.type === "text" ? part.text : ""
+      })
+      const nonces = envelopes.map((envelope) => /<task-notification [^>]*nonce="([^"]+)"/.exec(envelope)?.[1])
+      expect(nonces[0]).toBeDefined()
+      expect(nonces[1]).toBe(nonces[0])
+      expect(def.description).toContain(`task-notification nonce for this Task tool instance is "${nonces[0]}"`)
+    }),
+  )
+
+  it.instance("task_output refuses a task whose ancestor was deleted", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const ancestor = yield* sessions.create({ parentID: chat.id, title: "Deleted ancestor" })
+      const task = yield* sessions.create({ parentID: ancestor.id, title: "Orphaned task" })
+      const tool = yield* TaskOutputTool
+      const def = yield* tool.init()
+
+      yield* database.db.delete(SessionTable).where(eq(SessionTable.id, ancestor.id)).run().pipe(Effect.orDie)
+      const exit = yield* def
+        .execute(
+          { task_id: task.id },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {},
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(String(Cause.squash(exit.cause))).toContain(`Task ${task.id} is not owned by session ${chat.id}`)
+      }
+    }),
+  )
+
+  it.instance("task_stop refuses a task whose ancestor was deleted", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const ancestor = yield* sessions.create({ parentID: chat.id, title: "Deleted ancestor" })
+      const task = yield* sessions.create({ parentID: ancestor.id, title: "Orphaned task" })
+      const tool = yield* TaskStopTool
+      const def = yield* tool.init()
+
+      yield* database.db.delete(SessionTable).where(eq(SessionTable.id, ancestor.id)).run().pipe(Effect.orDie)
+      const exit = yield* def
+        .execute(
+          { task_id: task.id },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(String(Cause.squash(exit.cause))).toContain(`Task ${task.id} is not owned by session ${chat.id}`)
       }
     }),
   )

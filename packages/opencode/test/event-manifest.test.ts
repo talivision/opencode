@@ -3,14 +3,18 @@ import { SessionEvent } from "@opencode-ai/core/session/event"
 import { EventManifest as SchemaEventManifest } from "@opencode-ai/schema/event-manifest"
 import { Todo } from "@/session/todo"
 import { EventManifest } from "@/event-manifest"
+import { SessionGoal } from "@/session/goal"
 
 describe("public event manifest", () => {
   test("contains every latest public wire type once", () => {
     expect(EventManifest.Definitions).toBe(SchemaEventManifest.Definitions)
     expect(EventManifest.Latest).toBe(SchemaEventManifest.Latest)
     expect(EventManifest.Durable).toBe(SchemaEventManifest.Durable)
-    expect(EventManifest.Latest.size).toBe(88)
+    expect(EventManifest.Latest.size).toBe(91)
     expect(EventManifest.Latest.get("session.next.step.ended")).toBe(SessionEvent.Step.Ended)
+    expect(EventManifest.Latest.get("session.goal.completed")).toBe(SessionGoal.Event.Completed)
+    expect(EventManifest.Latest.get("session.goal.blocked")).toBe(SessionGoal.Event.Blocked)
+    expect(EventManifest.Latest.get("session.goal.paused")).toBe(SessionGoal.Event.Paused)
     expect(EventManifest.Latest.get("todo.updated")).toBe(Todo.Event.Updated)
     expect(EventManifest.Latest.has("ide.installed")).toBe(false)
     expect(EventManifest.Latest.has("server.connected")).toBe(true)

@@ -39,7 +39,7 @@ import { SyncProvider, useSync } from "./context/sync"
 import { DataProvider } from "./context/data"
 import { LocationProvider } from "./context/location"
 import { LocalProvider, useLocal } from "./context/local"
-import { PermissionProvider } from "./context/permission"
+import { PermissionProvider, type PermissionMode } from "./context/permission"
 import { DialogModel } from "./component/dialog-model"
 import { useConnected } from "./component/use-connected"
 import { DialogMcp } from "./component/dialog-mcp"
@@ -115,6 +115,7 @@ const appBindingCommands = [
   "mcp.list",
   "agent.cycle",
   "agent.cycle.reverse",
+  "permission.cycle",
   "variant.cycle",
   "variant.list",
   "provider.connect",
@@ -387,6 +388,58 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   const pluginRuntime = usePluginRuntime()
   const attention = createTuiAttention({ renderer, config: tuiConfig, kv })
   const clipboard = useClipboard()
+  const permissionMode = {
+    get(_sessionID: string | undefined) {
+      return local.permission.mode
+    },
+    set(_sessionID: string | undefined, mode: PermissionMode) {
+      local.permission.set(mode)
+    },
+  }
+  let lastAgent: string | undefined
+
+  function currentSessionID() {
+    return route.data.type === "session" ? route.data.sessionID : undefined
+  }
+
+  function cyclePermission(sessionID: string | undefined) {
+    const agents = local.agent.list()
+    const current = local.agent.current()
+    const plan = agents.find((agent) => agent.name === "plan")
+    const mode = permissionMode.get(sessionID)
+
+    if (!plan) {
+      const next = mode === "normal" ? "auto" : "normal"
+      permissionMode.set(sessionID, next)
+      if (next === "auto") showAutoPermissionToast()
+      return
+    }
+
+    if (current?.name === plan.name) {
+      permissionMode.set(sessionID, "normal")
+      const next = agents.find((agent) => agent.name === lastAgent) ?? agents.at(0)
+      if (next) local.agent.set(next.name)
+      return
+    }
+
+    if (mode === "normal") {
+      permissionMode.set(sessionID, "auto")
+      showAutoPermissionToast()
+      return
+    }
+
+    permissionMode.set(sessionID, "normal")
+    if (current) lastAgent = current.name
+    local.agent.set(plan.name)
+  }
+
+  function showAutoPermissionToast() {
+    toast.show({
+      variant: "warning",
+      title: "Auto-approve on",
+      message: "opencode will act without asking. Explicit denies still apply. shift+tab to cycle.",
+    })
+  }
 
   const api = createTuiApi(
     createTuiApiAdapters({
@@ -947,12 +1000,20 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         },
       },
       {
+        name: "permission.cycle",
+        title: "Cycle permission mode",
+        category: "System",
+        hidden: true,
+        run: () => {
+          cyclePermission(currentSessionID())
+        },
+      },
+      {
         name: "permission.mode",
-        title:
-          local.permission.mode === "auto" ? "Disable auto-approve permissions" : "Enable auto-approve permissions",
+        title: "Cycle permission mode (normal, auto, plan)",
         category: "System",
         run: () => {
-          local.permission.toggle()
+          cyclePermission(currentSessionID())
           dialog.clear()
         },
       },

@@ -122,6 +122,51 @@ const layer = Layer.effect(
           ...Object.fromEntries(whitelistedDirs.map((dir) => [dir, "allow"])),
         } satisfies Record<string, "allow" | "ask" | "deny">
 
+        // Well-known credential stores. Patterns are matched against the parent
+        // directory glob that external_directory asks with, and Wildcard's "*"
+        // crosses path separators, so each entry also covers everything nested
+        // beneath it. Mirrors the ".env" carve-out under `read` below: a narrow,
+        // enumerated list of paths that are never legitimate evidence, left as
+        // "ask" (never "deny" — a denial is an error that kills the turn, while
+        // an ask now merely pauses it).
+        const credentialDirs = [
+          "~/.ssh/*",
+          "~/.gnupg/*",
+          "~/.aws/*",
+          "~/.azure/*",
+          "~/.kube/*",
+          "~/.docker/*",
+          "~/.config/gcloud/*",
+          "~/.config/gh/*",
+          "~/.password-store/*",
+          "~/.local/share/keyrings/*",
+          "~/Library/Keychains/*",
+        ]
+        // The goal reviewer is instructed to verify authoritative current state,
+        // so it is the agent most likely to read outside the worktree — sibling
+        // repos, build output, installed artifacts. Under the shared read-only
+        // ruleset every one of those reads raised a prompt, and an unanswered
+        // prompt is what killed unattended reviews. Reads outside the worktree
+        // are therefore allowed by default for this agent only.
+        //
+        // Security tradeoff, stated plainly. The reviewer consumes untrusted
+        // repository content and its prompt already treats everything it
+        // retrieves as data, never instructions, so a wider read scope grants it
+        // no new authority: it cannot mutate anything (bash/edit/write/patch are
+        // denied in the ruleset below and disabled again at the reviewGoal call
+        // site) and its only channel back to the worker is the structured
+        // verdict. That channel is not nothing, though — the verdict text lands
+        // in the context of a worker that CAN write and run commands, so injected
+        // content that talks the reviewer into quoting a secret has somewhere to
+        // go. Hence the credential denylist above rather than a blanket allow:
+        // everything a review could plausibly need is readable without a human,
+        // and the handful of paths that are only ever secrets still stop for one.
+        const reviewerExternalDirectory = {
+          "*": "allow",
+          ...Object.fromEntries(credentialDirs.map((dir) => [dir, "ask"])),
+          ...Object.fromEntries(whitelistedDirs.map((dir) => [dir, "allow"])),
+        } satisfies Record<string, "allow" | "ask" | "deny">
+
         const defaults = Permission.fromConfig({
           "*": "allow",
           doom_loop: "ask",
@@ -290,7 +335,7 @@ const layer = Layer.effect(
                 goal_verdict: "allow",
                 goal_transcript: "allow",
                 goal_checklist: "allow",
-                external_directory: readonlyExternalDirectory,
+                external_directory: reviewerExternalDirectory,
               }),
             ),
           },
@@ -354,7 +399,7 @@ const layer = Layer.effect(
             goal_verdict: "allow",
             goal_transcript: "allow",
             goal_checklist: "allow",
-            external_directory: readonlyExternalDirectory,
+            external_directory: reviewerExternalDirectory,
           }),
         )
 

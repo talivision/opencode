@@ -59,6 +59,7 @@ import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
 import { parseGoalCommand, useGoal } from "../../context/goal"
 import { DialogGoal } from "../dialog-goal"
+import { PermissionBadge } from "./permission-badge"
 
 registerOpencodeSpinner()
 
@@ -1477,9 +1478,7 @@ export function Prompt(props: PromptProps) {
                       <text fg={fadeColor(highlight(), agentMetaAlpha())}>
                         {store.mode === "shell" ? "Shell" : Locale.titlecase(agent().name)}
                       </text>
-                      <Show when={store.mode === "normal" && local.permission.mode === "auto"}>
-                        <text fg={fadeColor(theme.textMuted, agentMetaAlpha())}>auto</text>
-                      </Show>
+                      <PermissionBadge mode={store.mode} />
                       <Show when={store.mode === "normal"}>
                         <box flexDirection="row" gap={1}>
                           <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>

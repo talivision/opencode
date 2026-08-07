@@ -128,7 +128,8 @@ export const Definitions = {
   console_org_switch: keybind("none", "Switch console organization"),
   agent_list: keybind("<leader>a", "List agents"),
   agent_cycle: keybind("tab", "Next agent"),
-  agent_cycle_reverse: keybind("shift+tab", "Previous agent"),
+  agent_cycle_reverse: keybind("none", "Previous agent"),
+  permission_cycle: keybind("shift+tab", "Cycle permission mode (normal, auto, plan)"),
   variant_cycle: keybind("ctrl+t", "Cycle model variants"),
   variant_list: keybind("none", "List model variants"),
 
@@ -225,6 +226,7 @@ export const Definitions = {
   tips_toggle: keybind("<leader>h", "Toggle tips on home screen"),
   plugin_manager: keybind("none", "Open plugin manager dialog"),
   plugin_install: keybind("none", "Install plugin"),
+  task_stop: keybind("ctrl+d", "Stop selected running task"),
 
   which_key_toggle: keybind("ctrl+alt+k", "Toggle which-key panel"),
   which_key_layout_toggle: keybind("ctrl+alt+shift+k", "Switch which-key layout"),
@@ -335,6 +337,7 @@ export const CommandMap = {
   agent_list: "agent.list",
   agent_cycle: "agent.cycle",
   agent_cycle_reverse: "agent.cycle.reverse",
+  permission_cycle: "permission.cycle",
   variant_cycle: "variant.cycle",
   variant_list: "variant.list",
   messages_page_up: "session.page.up",
@@ -406,6 +409,7 @@ export const CommandMap = {
   tips_toggle: "tips.toggle",
   plugin_manager: "plugins.list",
   plugin_install: "plugins.install",
+  task_stop: "task.stop",
   which_key_toggle: "which-key.toggle",
   which_key_layout_toggle: "which-key.layout.toggle",
   which_key_pending_toggle: "which-key.pending.toggle",

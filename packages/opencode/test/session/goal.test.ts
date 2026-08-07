@@ -3,13 +3,16 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect } from "effect"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionGoal } from "@/session/goal"
 import { SessionID } from "@/session/schema"
 import { Storage } from "@/storage/storage"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(
-  LayerNode.compile(LayerNode.group([SessionGoal.node, Storage.node, FSUtil.node, CrossSpawnSpawner.node])),
+  LayerNode.compile(
+    LayerNode.group([SessionGoal.node, Storage.node, EventV2Bridge.node, FSUtil.node, CrossSpawnSpawner.node]),
+  ),
 )
 
 const setup = Effect.fnUntraced(function* () {
@@ -20,6 +23,65 @@ const setup = Effect.fnUntraced(function* () {
 })
 
 describe("SessionGoal", () => {
+  it.live("publishes terminal and budget lifecycle transitions once", () =>
+    Effect.gen(function* () {
+      const goal = yield* SessionGoal.Service
+      const events = yield* EventV2Bridge.Service
+      const seen: { type: string; data: unknown }[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type.startsWith("session.goal.")) seen.push({ type: event.type, data: event.data })
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const completedID = SessionID.create()
+      yield* Effect.addFinalizer(() => goal.clear(completedID).pipe(Effect.ignore))
+      yield* goal.set({ sessionID: completedID, objective: "complete with an event" })
+      yield* goal.requestReview({ sessionID: completedID })
+      const reviewerID = SessionID.create()
+      yield* goal.beginReview(completedID, reviewerID)
+      yield* goal.finishReview({
+        sessionID: completedID,
+        reviewerSessionID: reviewerID,
+        accepted: true,
+        reason: "verified",
+        tokens: 0,
+      })
+      yield* goal.finishReview({
+        sessionID: completedID,
+        reviewerSessionID: reviewerID,
+        accepted: true,
+        reason: "duplicate",
+        tokens: 0,
+      })
+
+      const blockedID = SessionID.create()
+      yield* Effect.addFinalizer(() => goal.clear(blockedID).pipe(Effect.ignore))
+      yield* goal.set({ sessionID: blockedID, objective: "block with an event" })
+      yield* goal.block(blockedID, "missing credential")
+      yield* goal.recordTurn({ sessionID: blockedID, tokens: 0 })
+      yield* goal.block(blockedID, "missing credential")
+      yield* goal.recordTurn({ sessionID: blockedID, tokens: 0 })
+      yield* goal.block(blockedID, "missing credential")
+      yield* goal.block(blockedID, "missing credential")
+
+      const pausedID = SessionID.create()
+      yield* Effect.addFinalizer(() => goal.clear(pausedID).pipe(Effect.ignore))
+      yield* goal.set({ sessionID: pausedID, objective: "pause with an event", tokenBudget: 10 })
+      yield* goal.recordTurn({ sessionID: pausedID, tokens: 10 })
+      yield* goal.recordTurn({ sessionID: pausedID, tokens: 10 })
+
+      expect(seen).toEqual([
+        { type: "session.goal.completed", data: { sessionID: completedID } },
+        { type: "session.goal.blocked", data: { sessionID: blockedID, reason: "missing credential" } },
+        {
+          type: "session.goal.paused",
+          data: { sessionID: pausedID, reason: "budget", tokenBudget: 10, tokensUsed: 10 },
+        },
+      ])
+    }),
+  )
+
   it.live("persists lifecycle state and preserves usage across edits", () =>
     Effect.gen(function* () {
       const { goal, sessionID } = yield* setup()
