@@ -212,7 +212,9 @@ export function createGoalController(input: Input) {
     }
 
     const next = parseBudget(args)
-    if (!next.objective) throw new Error("Usage: /goal [--tokens <positive number>] <objective>")
+    if (next.objective.split(/\s+/).length < 2) {
+      throw new Error("Usage: /goal [--tokens <positive number>] <objective with multiple words>")
+    }
     const response = await input.sdk.session.goal.set(
       {
         sessionID,
