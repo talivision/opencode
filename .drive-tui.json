@@ -1,0 +1,37 @@
+{
+  // How the generic ~/.claude/skills/drive-tui skill launches THIS app.
+  // The skill knows nothing about opencode; everything opencode-specific is
+  // here and in .drive-tui/.
+  //
+  // Two layers of isolation, both deliberate:
+  //   * tmux: a dedicated server socket, invisible to your own tmux sessions
+  //   * opencode: a scratch HOME/XDG tree, its own git-backed project, and a
+  //     fake OpenAI-compatible provider on localhost. It never reads your real
+  //     config, credentials or sessions, and never contacts a real model.
+
+  "socket": "claude-dt-oc",
+  "session": "tui-test",
+  "cols": 170,
+  "rows": 48,
+
+  "setup": "./.drive-tui/setup.sh",
+
+  // $BIN and $PORT come from the setup hook's stdout.
+  "cmd": "\"$BIN\" --pure",
+  "cwd": "$DRIVE_TUI_WORK/proj",
+
+  "env": {
+    "HOME": "$DRIVE_TUI_WORK/home",
+    "XDG_DATA_HOME": "$DRIVE_TUI_WORK/home/.local/share",
+    "XDG_CONFIG_HOME": "$DRIVE_TUI_WORK/home/.config",
+    "XDG_CACHE_HOME": "$DRIVE_TUI_WORK/home/.cache",
+    "OPENCODE_DISABLE_AUTOUPDATE": "1"
+  },
+
+  // Wait for the prompt to actually render. A fixed sleep is what made the
+  // older harnesses flaky on a loaded machine.
+  "ready": { "text": "Ask anything", "timeout": 30, "interval": 0.5 },
+
+  "teardown": "./.drive-tui/teardown.sh",
+  "log": true
+}
