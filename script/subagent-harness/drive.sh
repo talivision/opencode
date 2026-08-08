@@ -110,6 +110,7 @@ tmux -S "$SOCK" new-session -d -x 160 -y 45 -s subagent -c "$WORK/proj" \
    XDG_CONFIG_HOME=$WORK/home/.config \
    XDG_CACHE_HOME=$WORK/home/.cache \
    OPENCODE_DISABLE_AUTOUPDATE=1 \
+   OPENCODE_DISABLE_CHANNEL_DB=1 \
    '$BIN' --pure 2>&1 | tee $WORK/tui.log"
 
 send_prompt() {

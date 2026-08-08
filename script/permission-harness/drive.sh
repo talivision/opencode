@@ -99,6 +99,7 @@ start_tui() {
      XDG_CONFIG_HOME='$WORK/home/.config' \
      XDG_CACHE_HOME='$WORK/home/.cache' \
      OPENCODE_DISABLE_AUTOUPDATE=1 \
+     OPENCODE_DISABLE_CHANNEL_DB=1 \
      '$BIN' --pure 2>&1 | tee '$output'"
 }
 
