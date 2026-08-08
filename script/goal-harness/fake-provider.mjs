@@ -16,8 +16,10 @@
 //   WORKER_INPUT/OUTPUT   fake worker usage (default 9000 / 4)
 //   REVIEWER_INPUT/OUTPUT fake reviewer usage (default 12000 / 58)
 //   REVIEWER_MODE         met | not_met | not_met_history | turns | interrupted | cache-stable | goal-events |
-//                         met_tool | not_met_tool | retrieval | invalid | silent | slow | busy | http500
+//                         met_tool | not_met_tool | retrieval | permission_blocked | goal_check | invalid |
+//                         silent | slow | busy | http500
 //   REVIEWER_NOT_MET_N    first N reviews return NOT_MET, then MET (default 0)
+//   REVIEWER_READ_PATH    controlled absolute path read by permission_blocked
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
 import http from "node:http"
 import fs from "node:fs"
@@ -32,6 +34,7 @@ const REVIEWER_USAGE = {
 }
 const REVIEWER_MODE = process.env.REVIEWER_MODE ?? "not_met"
 const REVIEWER_NOT_MET_N = Number(process.env.REVIEWER_NOT_MET_N ?? 0)
+const REVIEWER_READ_PATH = process.env.REVIEWER_READ_PATH ?? "/etc/hosts"
 
 let reviewCount = 0
 let workerCount = 0
@@ -126,6 +129,10 @@ function hasTool(parsed, name) {
   return parsed.tools?.some((item) => item.function?.name === name)
 }
 
+function toolResult(parsed, callID) {
+  return parsed.messages?.find((message) => message.role === "tool" && message.tool_call_id === callID)
+}
+
 export function classifyRequest(parsed) {
   const flat = JSON.stringify(parsed)
   const nonce = /The verdict nonce for this review is ([A-Za-z0-9-]+)\./.exec(flat)?.[1]
@@ -164,7 +171,7 @@ const server = http.createServer(async (req, res) => {
     const sawVerdict = flat.includes("Verdict recorded")
     const isFirstStep = !flat.includes('"tool_call_id"') && !flat.includes('"role":"tool"')
     if (isFirstStep) reviewCount += 1
-    log({ role: "reviewer", mode: "retrieval", n: reviewCount, nonce, url: req.url, body: parsed })
+    log({ role: "reviewer", mode: "retrieval", n: reviewCount, nonce, at: Date.now(), url: req.url, body: parsed })
     if (sawVerdict) {
       textReply(res, "Verdict submitted.", REVIEWER_USAGE)
       return
@@ -208,14 +215,86 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (isReviewer && REVIEWER_MODE === "permission_blocked") {
+    const read = toolResult(parsed, "call_permission_read")
+    const verdict = toolResult(parsed, "call_permission_verdict")
+    if (!read && !verdict) reviewCount += 1
+    log({ role: "reviewer", mode: REVIEWER_MODE, n: reviewCount, nonce, at: Date.now(), url: req.url, body: parsed })
+    if (verdict) {
+      textReply(res, "Verdict submitted.", { input: 100, output: 3 })
+      return
+    }
+    if (read) {
+      toolReply(
+        res,
+        "goal_verdict",
+        {
+          met: true,
+          summary: "permission was approved and the controlled external evidence was read",
+          unmet: [],
+        },
+        REVIEWER_USAGE,
+        "call_permission_verdict",
+      )
+      return
+    }
+    toolReply(res, "read", { filePath: REVIEWER_READ_PATH }, REVIEWER_USAGE, "call_permission_read")
+    return
+  }
+
+  if (isReviewer && REVIEWER_MODE === "goal_check") {
+    const exact = toolResult(parsed, "call_goal_check_exact")
+    const refused = toolResult(parsed, "call_goal_check_refused")
+    const verdict = toolResult(parsed, "call_goal_check_verdict")
+    if (!exact && !refused && !verdict) reviewCount += 1
+    log({ role: "reviewer", mode: REVIEWER_MODE, n: reviewCount, nonce, at: Date.now(), url: req.url, body: parsed })
+    if (verdict) {
+      textReply(res, "Verdict submitted.", { input: 100, output: 3 })
+      return
+    }
+    if (refused) {
+      toolReply(
+        res,
+        "goal_verdict",
+        {
+          met: true,
+          summary:
+            "goal_check exact command produced goal-check-ok; the near-miss was refused and named the allowed command",
+          unmet: [],
+        },
+        REVIEWER_USAGE,
+        "call_goal_check_verdict",
+      )
+      return
+    }
+    if (exact) {
+      toolReply(
+        res,
+        "goal_check",
+        { command: "printf goal-check-ok-extra" },
+        REVIEWER_USAGE,
+        "call_goal_check_refused",
+      )
+      return
+    }
+    toolReply(
+      res,
+      "goal_check",
+      { command: "printf goal-check-ok" },
+      REVIEWER_USAGE,
+      "call_goal_check_exact",
+    )
+    return
+  }
+
   if (isReviewer) {
     if (flat.includes('"tool_call_id"') || flat.includes('"role":"tool"')) {
-      log({ role: "reviewer", n: reviewCount, nonce, url: req.url, body: parsed })
+      log({ role: "reviewer", n: reviewCount, nonce, at: Date.now(), url: req.url, body: parsed })
       textReply(res, "Verdict submitted.", { input: 100, output: 3 })
       return
     }
     reviewCount += 1
-    log({ role: "reviewer", n: reviewCount, nonce, url: req.url, body: parsed })
+    log({ role: "reviewer", n: reviewCount, nonce, at: Date.now(), url: req.url, body: parsed })
     if (REVIEWER_MODE === "silent") {
       // never respond, never close: exercises the inactivity watchdog
       return

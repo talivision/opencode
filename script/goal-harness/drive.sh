@@ -27,6 +27,10 @@
 #   invalid   verdict carries the wrong nonce         -> forged verdict must be refused
 #   http500   provider fails the reviewer request     -> reviewer failure inline
 #   silent    reviewer never responds                 -> inactivity timeout
+#   permission_blocked reviewer waits on an external-directory permission beyond
+#             both 5s watchdog limits, then accepts after the UI grants it
+#   goal_check reviewer runs one exact configured command, refuses a prefix
+#             near-miss, sees both results, and submits an accepted verdict
 #   busy      reviewer streams forever                -> must survive inactivity, hit hard max
 #   slow      reviewer streams every 20s, then MET    -> must survive inactivity
 #
@@ -50,9 +54,9 @@ WORK="${WORK:-${TMPDIR:-/tmp}/opencode-goal-harness}"
 SOCK="${SOCK:-/tmp/opencode-goal-harness.sock}"
 
 case "$SCENARIO" in
-  met | not_met | met_tool | not_met_tool | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | busy | slow) ;;
+  met | not_met | met_tool | not_met_tool | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow) ;;
   *)
-    echo "usage: $0 <met|not_met|met_tool|not_met_tool|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|busy|slow> [seconds]" >&2
+    echo "usage: $0 <met|not_met|met_tool|not_met_tool|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -75,12 +79,42 @@ trap cleanup EXIT
 rm -rf "$WORK"
 mkdir -p "$WORK/home" "$WORK/proj" "$WORK/snaps"
 cp "$HERE/opencode.json" "$WORK/proj/opencode.json"
-if [ "$PORT" != "4599" ]; then
-  node -e 'const f=process.argv[1],p=process.argv[2],fs=require("fs");fs.writeFileSync(f,fs.readFileSync(f,"utf8").replace("4599",p))' \
-    "$WORK/proj/opencode.json" "$PORT"
-fi
+REVIEWER_READ_PATH="$(cd "$WORK" && pwd)/reviewer-outside.txt"
+printf '%s\n' 'GOAL_HARNESS_PERMISSION_APPROVED' >"$REVIEWER_READ_PATH"
+node -e '
+const fs = require("fs")
+const file = process.argv[1]
+const port = process.argv[2]
+const scenario = process.argv[3]
+const config = JSON.parse(fs.readFileSync(file, "utf8"))
+config.provider.fake.options.baseURL = `http://127.0.0.1:${port}/v1`
+if (["permission_blocked", "silent"].includes(scenario)) {
+  config.goal = { ...config.goal, review: { ...config.goal?.review, timeout: 5000 } }
+}
+if (scenario === "permission_blocked") {
+  config.goal.review.max_duration = 5000
+  config.agent = {
+    ...config.agent,
+    "goal-reviewer": {
+      ...config.agent?.["goal-reviewer"],
+      permission: {
+        ...config.agent?.["goal-reviewer"]?.permission,
+        external_directory: { "*": "ask" },
+      },
+    },
+  }
+}
+if (scenario === "silent") config.goal.review.max_duration = 20000
+if (scenario === "goal_check") {
+  config.goal = {
+    ...config.goal,
+    review: { ...config.goal?.review, commands: ["printf goal-check-ok"] },
+  }
+}
+fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n")
+' "$WORK/proj/opencode.json" "$PORT" "$SCENARIO"
 if [ -n "${REVIEW_CONFIG:-}" ]; then
-  node -e 'const f=process.argv[1],fs=require("fs");const c=JSON.parse(fs.readFileSync(f,"utf8"));c.goal={review:JSON.parse(process.argv[2])};fs.writeFileSync(f,JSON.stringify(c,null,2))' \
+  node -e 'const f=process.argv[1],fs=require("fs");const c=JSON.parse(fs.readFileSync(f,"utf8"));c.goal={...c.goal,review:{...c.goal?.review,...JSON.parse(process.argv[2])}};fs.writeFileSync(f,JSON.stringify(c,null,2)+"\n")' \
     "$WORK/proj/opencode.json" "$REVIEW_CONFIG"
   echo "==> goal.review config: $REVIEW_CONFIG"
 fi
@@ -95,6 +129,7 @@ REVIEWER_INPUT="${REVIEWER_INPUT:-12000}" \
 REVIEWER_OUTPUT="${REVIEWER_OUTPUT:-58}" \
 REVIEWER_MODE="$SCENARIO" \
 REVIEWER_NOT_MET_N="${REVIEWER_NOT_MET_N:-1}" \
+REVIEWER_READ_PATH="$REVIEWER_READ_PATH" \
   node "$HERE/fake-provider.mjs" >"$WORK/provider.out" 2>&1 &
 echo $! >"$WORK/provider.pid"
 sleep 1
@@ -133,16 +168,60 @@ if [ "$SCENARIO" = "interrupted" ]; then
   done
 fi
 
-elapsed=0
-while [ "$elapsed" -lt "$WATCH" ]; do
-  sleep 5
-  elapsed=$((elapsed + 5))
-  tmux -S "$SOCK" capture-pane -p -t goal >"$WORK/snaps/$(printf %03d $elapsed).txt"
-  echo "--- +${elapsed}s"
-  tmux -S "$SOCK" capture-pane -p -t goal \
-    | grep -E "Independent review|Goal (achieved|not yet met|active|complete|paused|blocked)|could not finish" \
-    | head -6 || true
-done
+if [ "$SCENARIO" = "permission_blocked" ]; then
+  echo "==> wait for reviewer permission block"
+  blocked=0
+  for ((attempt = 0; attempt < WATCH; attempt++)); do
+    DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
+    state="$(ls "$WORK/home/.local/share/opencode/storage/goal/"*.json 2>/dev/null | head -1 || true)"
+    tmux -S "$SOCK" capture-pane -p -t goal >"$WORK/snaps/permission-current.txt"
+    if [ -n "$DB" ] && [ -n "$state" ] && \
+      node -e 'const fs=require("fs");const goal=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.exit(goal.review?.status==="running"?0:1)' "$state" && \
+      [ "$(sqlite3 "$DB" "SELECT count(*) FROM part WHERE json_extract(data, '$.tool') = 'goal-review' AND json_extract(data, '$.state.status') = 'running' AND json_extract(data, '$.state.metadata.activity') = 'Waiting for permission approval';" 2>/dev/null || echo 0)" -gt 0 ] && \
+      grep -Fq "Permission required" "$WORK/snaps/permission-current.txt"; then
+      blocked=1
+      break
+    fi
+    sleep 1
+  done
+
+  # Eight seconds is beyond both configured 5s limits. If either clock keeps
+  # charging blocked time, the durable running part below becomes an error and
+  # permission_blocked_pending fails before the UI approval is sent.
+  sleep 8
+  tmux -S "$SOCK" capture-pane -p -t goal >"$WORK/snaps/permission-after-window.txt"
+  state="$(ls "$WORK/home/.local/share/opencode/storage/goal/"*.json 2>/dev/null | head -1 || true)"
+  [ -z "$state" ] || cp "$state" "$WORK/permission-blocked-goal.json"
+  echo "==> permission_blocked pending assertions (permission prompt reached: $blocked)"
+  node "$HERE/assert-scenarios.mjs" \
+    permission_blocked_pending \
+    "$WORK/provider.log" \
+    "${DB:-}" \
+    "$WORK/permission-blocked-goal.json" \
+    "$WORK/snaps"
+
+  echo "==> Allow once"
+  tmux -S "$SOCK" send-keys -t goal Enter
+  for ((attempt = 0; attempt < WATCH; attempt++)); do
+    state="$(ls "$WORK/home/.local/share/opencode/storage/goal/"*.json 2>/dev/null | head -1 || true)"
+    if [ -n "$state" ] && node -e 'const fs=require("fs");const goal=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.exit(goal.status==="complete"&&goal.review?.status==="accepted"?0:1)' "$state"; then
+      break
+    fi
+    sleep 1
+  done
+  tmux -S "$SOCK" capture-pane -p -t goal >"$WORK/snaps/permission-approved.txt"
+else
+  elapsed=0
+  while [ "$elapsed" -lt "$WATCH" ]; do
+    sleep 5
+    elapsed=$((elapsed + 5))
+    tmux -S "$SOCK" capture-pane -p -t goal >"$WORK/snaps/$(printf %03d $elapsed).txt"
+    echo "--- +${elapsed}s"
+    tmux -S "$SOCK" capture-pane -p -t goal \
+      | grep -E "Independent review|Goal (achieved|not yet met|active|complete|paused|blocked)|could not finish" \
+      | head -6 || true
+  done
+fi
 
 echo
 echo "==> durable goal state"
@@ -160,7 +239,7 @@ if [ "$SCENARIO" = "retrieval" ]; then
 fi
 
 case "$SCENARIO" in
-  not_met_history | turns | interrupted | cache-stable | goal-events)
+  not_met_history | turns | interrupted | cache-stable | goal-events | permission_blocked | goal_check | silent | http500)
     echo "==> $SCENARIO assertions"
     DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
     node "$HERE/assert-scenarios.mjs" \

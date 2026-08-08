@@ -17,7 +17,7 @@ const notes = []
 
 function check(name, ok, detail) {
   if (ok) notes.push(`ok   ${name}`)
-  else failures.push(`FAIL ${name}${detail ? ` — ${detail}` : ""}`)
+  else failures.push(`not ok ${name}${detail ? ` — ${detail}` : ""}`)
 }
 
 function readJsonLines(file) {
@@ -43,6 +43,25 @@ function reviewState(system) {
   return /Independent review attempt \d+ did not accept completion:/.exec(system)?.[0] ??
     /Independent review attempt \d+ is (?:pending|running)\./.exec(system)?.[0] ??
     "no-review"
+}
+
+function partRows(tool) {
+  return db
+    .prepare("SELECT session_id, data FROM part WHERE json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.tool') = ?")
+    .all(tool)
+    .map((row) => ({ sessionID: row.session_id, data: JSON.parse(row.data) }))
+}
+
+function messageText(message) {
+  return typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "")
+}
+
+function reviewerToolResults(callID) {
+  return reviewers.flatMap((entry) =>
+    (entry.body.messages ?? [])
+      .filter((message) => message.role === "tool" && message.tool_call_id === callID)
+      .map((message) => messageText(message)),
+  )
 }
 
 if (!logPath || !fs.existsSync(logPath)) {
@@ -105,11 +124,171 @@ if (scenario === "interrupted") {
   )
   check(
     "no reviewer ran for the failed turn",
-    reviewers.length === 1 && firstReviewIndex > resumedIndex,
-    `${reviewers.length} reviewer requests, resumed index ${resumedIndex}, review index ${firstReviewIndex}`,
+    firstReviewIndex > resumedIndex,
+    `resumed index ${resumedIndex}, first review request index ${firstReviewIndex}`,
   )
   check("only the recovered clean turn created a reviewer child session", reviewRows.length === 1, `${reviewRows.length} rows`)
   notes.push("note first consecutive interruption intentionally has 0ms outer backoff; no delay assertion applies")
+}
+
+if (scenario === "permission_blocked_pending") {
+  const reviews = partRows("goal-review")
+  const running = reviews.find((part) => part.data.state.status === "running")
+  const reads = partRows("read")
+  const panes = fs.existsSync(snapDir)
+    ? fs
+        .readdirSync(snapDir)
+        .filter((name) => name.startsWith("permission-") && name.endsWith(".txt"))
+        .map((name) => fs.readFileSync(path.join(snapDir, name), "utf8"))
+        .join("\n")
+    : ""
+  // Each predicate has an opposing observable failure: a charged watchdog
+  // changes the durable attempt/part to error, a missing gate leaves no running
+  // read or waiting activity, and a UI regression removes the permission pane.
+  check("the same durable review attempt is still running", goal?.review?.status === "running" && goal.review.attempt === 1)
+  check(
+    "the running review part is older than the configured 5s limits",
+    running?.data.state.time?.start && Date.now() - running.data.state.time.start >= 7000,
+    `age=${running?.data.state.time?.start ? Date.now() - running.data.state.time.start : "missing"}ms`,
+  )
+  check(
+    "the durable review part publishes the permission wait",
+    running?.data.state.metadata?.activity === "Waiting for permission approval",
+    `activity=${running?.data.state.metadata?.activity}`,
+  )
+  check(
+    "the reviewer read remains blocked on the controlled external file",
+    reads.some(
+      (part) =>
+        part.data.state.status === "running" &&
+        part.data.state.input?.filePath?.endsWith("/reviewer-outside.txt"),
+    ),
+  )
+  check(
+    "no timeout error was recorded while permission was pending",
+    !reviews.some(
+      (part) =>
+        part.data.state.status === "error" &&
+        String(part.data.state.error ?? "").includes("timed out"),
+    ) &&
+      !goal?.review?.errorStreak &&
+      !String(goal?.review?.reason ?? "").includes("timed out"),
+  )
+  check(
+    "the pane shows the external-directory permission waiting state",
+    panes.includes("Permission required") && panes.includes("Access external directory"),
+  )
+}
+
+if (scenario === "permission_blocked") {
+  const reviews = partRows("goal-review")
+  const readResults = reviewerToolResults("call_permission_read")
+  // These fail respectively if approval did not resume the child, if it timed
+  // out/retried, if the read result never reached the reviewer, or if the parent
+  // transcript did not receive the accepted verdict.
+  check("permission approval lets the review reach completion", goal?.status === "complete" && goal.review?.status === "accepted")
+  check("permission approval completes the original durable attempt", goal?.review?.attempt === 1, `attempt=${goal?.review?.attempt}`)
+  check(
+    "the approved read result reached the reviewer as a tool result",
+    readResults.some((output) => output.includes("GOAL_HARNESS_PERMISSION_APPROVED")),
+  )
+  check(
+    "the parent transcript records the accepted permission-blocked review",
+    reviews.some(
+      (part) =>
+        part.sessionID === goal?.sessionID &&
+        part.data.state.status === "completed" &&
+        part.data.state.metadata?.verdict === "accepted" &&
+        part.data.state.output?.includes("controlled external evidence was read"),
+    ),
+  )
+  check(
+    "the completed permission-blocked review has no timeout part",
+    !reviews.some((part) => part.data.state.status === "error" && String(part.data.state.error ?? "").includes("timed out")),
+  )
+}
+
+if (scenario === "goal_check") {
+  const checks = partRows("goal_check")
+  const exact = checks.find((part) => part.data.state.input?.command === "printf goal-check-ok")
+  const near = checks.find((part) => part.data.state.input?.command === "printf goal-check-ok-extra")
+  const exactResults = reviewerToolResults("call_goal_check_exact")
+  const refusedResults = reviewerToolResults("call_goal_check_refused")
+  const parentReviews = partRows("goal-review").filter((part) => part.sessionID === goal?.sessionID)
+  // The provider-log checks are deliberately scoped to role=tool plus the
+  // exact call id. The near-miss command also appears in an assistant tool-call
+  // input, so an unscoped substring assertion would pass even if refusal broke.
+  check(
+    "the exact configured goal_check command ran successfully",
+    exact?.data.state.status === "completed" &&
+      exact.data.state.metadata?.exit === 0 &&
+      exact.data.state.output?.includes("goal-check-ok"),
+  )
+  check(
+    "the exact command output reached the reviewer tool-result message",
+    exactResults.some((output) => output.includes("Exit code: 0") && output.includes("goal-check-ok")),
+  )
+  check(
+    "the near-miss was refused before execution",
+    near?.data.state.status === "completed" &&
+      near.data.state.metadata?.refused === true &&
+      !("exit" in (near.data.state.metadata ?? {})) &&
+      !near.data.state.output?.includes("Exit code:"),
+  )
+  check(
+    "the refusal tool result names the configured allowed command",
+    refusedResults.some(
+      (output) =>
+        output.includes("Command refused: it does not exactly match") &&
+        output.includes("Allowed commands:") &&
+        output.includes("- printf goal-check-ok"),
+    ),
+  )
+  check(
+    "the parent transcript receives the reviewer's command/refusal verdict",
+    parentReviews.some(
+      (part) =>
+        part.data.state.status === "completed" &&
+        part.data.state.metadata?.verdict === "accepted" &&
+        part.data.state.output?.includes("exact command produced goal-check-ok") &&
+        part.data.state.output?.includes("near-miss was refused"),
+    ),
+  )
+}
+
+if (scenario === "silent") {
+  const reviews = partRows("goal-review")
+  const timedOut = reviews.filter(
+    (part) =>
+      part.data.state.status === "error" &&
+      String(part.data.state.error ?? "").includes("timed out after 5s without activity"),
+  )
+  // A broken control leaves no inactivity error; using durable attempt rather
+  // than reviewer HTTP count also prevents SDK retries from masquerading as
+  // separate goal-level review attempts.
+  check("the silent reviewer still hits the inactivity watchdog", timedOut.length > 0)
+  check("silent-review continuation advances the durable attempt", goal?.review?.attempt >= 2, `attempt=${goal?.review?.attempt}`)
+  check(
+    "the silent timeout is durably costed as a finished attempt",
+    goal?.review?.attemptStats?.some((stat) => stat.durationMs >= 5000),
+  )
+}
+
+if (scenario === "http500") {
+  const reviewSessions = db
+    .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL AND title LIKE 'Goal review #%'")
+    .all()
+  // One child session is created per durable attempt; several timestamped HTTP
+  // requests may belong to that one child because the SDK retries a 500.
+  check(
+    "HTTP retries do not inflate the durable review-attempt count",
+    goal?.review?.attempt === reviewSessions.length,
+    `attempt=${goal?.review?.attempt}, child sessions=${reviewSessions.length}`,
+  )
+  check(
+    "reviewer request log lines carry timestamps for retry/backoff analysis",
+    reviewers.length > 0 && reviewers.every((entry) => Number.isFinite(entry.at)),
+  )
 }
 
 if (scenario === "cache-stable") {
