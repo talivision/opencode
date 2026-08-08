@@ -19,6 +19,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { ToolJsonSchema } from "../../src/tool/json-schema"
 import { TaskOutputTool } from "../../src/tool/task-output"
 import { TaskStopTool } from "../../src/tool/task-stop"
 import { Truncate } from "@/tool/truncate"
@@ -780,8 +781,17 @@ describe("tool.task", () => {
     },
   )
 
-  backgroundDisabled.instance("rejects background execution when the experiment is disabled", () =>
+  backgroundDisabled.instance("hides and rejects background execution when the experiment is disabled", () =>
     Effect.gen(function* () {
+      const agents = yield* Agent.Service
+      const build = yield* agents.get("build")
+      const registry = yield* ToolRegistry.Service
+      const visible = (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)
+      if (!visible) throw new Error("task tool not found")
+      const schema = ToolJsonSchema.fromTool(visible) as { properties?: Record<string, unknown> }
+
+      expect(schema.properties).not.toHaveProperty("background")
+
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -808,6 +818,11 @@ describe("tool.task", () => {
         .pipe(Effect.exit)
 
       expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(String(Cause.squash(exit.cause))).toContain(
+          "Background subagents are disabled (OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false)",
+        )
+      }
     }),
   )
 

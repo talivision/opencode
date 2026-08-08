@@ -1,5 +1,6 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./task.txt"
+import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
@@ -66,6 +67,8 @@ const ParameterFields = {
   command: Schema.optional(Schema.String).annotate({ description: "The command that triggered this task" }),
 }
 
+const BaseParameters = Schema.Struct(ParameterFields)
+
 export const Parameters = Schema.Struct({
   ...ParameterFields,
   background: Schema.optional(Schema.Boolean).annotate({
@@ -116,7 +119,7 @@ export const TaskTool = Tool.define(
       const runInBackground = params.background === true
       if (runInBackground && !flags.experimentalBackgroundSubagents) {
         return yield* Effect.fail(
-          new Error("Background subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"),
+          new Error("Background subagents are disabled (OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false)"),
         )
       }
 
@@ -492,6 +495,7 @@ export const TaskTool = Tool.define(
         BACKGROUND_DESCRIPTION,
       ].join("\n\n"),
       parameters: Parameters,
+      jsonSchema: flags.experimentalBackgroundSubagents ? undefined : ToolJsonSchema.fromSchema(BaseParameters),
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         run(params, ctx).pipe(Effect.orDie),
     }
