@@ -330,7 +330,23 @@ const server = http.createServer(async (req, res) => {
   }
 
   workerCount += 1
-  log({ role: "worker", mode: REVIEWER_MODE, n: workerCount, at: Date.now(), url: req.url, body: parsed })
+  log({
+    role: "worker",
+    mode: REVIEWER_MODE,
+    n: workerCount,
+    ...(REVIEWER_MODE === "cache-stable" ? { turn: workerCount === 1 ? 1 : 2 } : {}),
+    at: Date.now(),
+    url: req.url,
+    body: parsed,
+  })
+  if (REVIEWER_MODE === "cache-stable" && workerCount === 1) {
+    // End one goal turn before any review. The continuation must carry the
+    // interruption in its user message without perturbing the cached system
+    // message on the next worker turn.
+    res.writeHead(400, { "content-type": "application/json" })
+    res.end(JSON.stringify({ error: { message: "GOAL_HARNESS_CACHE_TURN_BOUNDARY" } }))
+    return
+  }
   if (REVIEWER_MODE === "interrupted" && workerCount === 1) {
     res.writeHead(400, { "content-type": "application/json" })
     res.end(JSON.stringify({ error: { message: "GOAL_HARNESS_PROVIDER_400" } }))
@@ -342,11 +358,19 @@ const server = http.createServer(async (req, res) => {
     slowTextReply(req, res, "worker resumed after the provider error", 4_000)
     return
   }
-  if (["turns", "cache-stable"].includes(REVIEWER_MODE) && workerCount <= 2) {
+  if (
+    (REVIEWER_MODE === "turns" && workerCount <= 2) ||
+    (REVIEWER_MODE === "cache-stable" && workerCount >= 2 && workerCount <= 3)
+  ) {
     toolReply(
       res,
       "glob",
-      { pattern: workerCount === 1 ? "script/goal-harness/*" : "script/subagent-harness/*" },
+      {
+        pattern:
+          workerCount === 1 || (REVIEWER_MODE === "cache-stable" && workerCount === 2)
+            ? "script/goal-harness/*"
+            : "script/subagent-harness/*",
+      },
       WORKER_USAGE,
       `call_goal_glob_${workerCount}`,
     )

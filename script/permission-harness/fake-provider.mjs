@@ -22,6 +22,7 @@ const COMPACTION_USAGE = { input: 900, output: 180 }
 const COMPACTION_FILL = "context-fill ".repeat(320)
 
 const COMPACTION_MARKER = "anchored context summarization assistant"
+const COMPACTION_SUMMARY_MARKER = "PERMISSION_HARNESS_COMPACTION_SUMMARY_V1"
 const COMPACTION_SYSTEM = `You are an anchored context summarization assistant for coding sessions.
 
 Summarize only the conversation history you are given. The newest turns may be kept verbatim outside your summary, so focus on the older context that still matters for continuing the work.
@@ -365,7 +366,7 @@ const server = http.createServer(async (req, res) => {
     summarySeen = true
     textReply(
       res,
-      "## Objective\n- Continue the permission harness compaction run.\n\n## Important Details\n- Preserve the exact turn markers.\n\n## Work State\n### Completed\n- Earlier turns completed.\n\n### Active\n- Continue after compaction.\n\n### Blocked\n- (none)\n\n## Next Move\n1. Continue the session.\n2. Complete a later user turn.\n\n## Relevant Files\n- script/permission-harness/: harness files.",
+      `## Objective\n- Continue the permission harness compaction run.\n\n## Important Details\n- ${COMPACTION_SUMMARY_MARKER}\n- Preserve the exact turn markers.\n\n## Work State\n### Completed\n- Earlier turns completed.\n\n### Active\n- Continue after compaction.\n\n### Blocked\n- (none)\n\n## Next Move\n1. Continue the session.\n2. Complete a later user turn.\n\n## Relevant Files\n- script/permission-harness/: harness files.`,
       COMPACTION_USAGE,
     )
     return

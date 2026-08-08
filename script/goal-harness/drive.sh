@@ -20,8 +20,9 @@
 #             asserts both reasons reach worker request 3 under the anti-cycling heading
 #   turns    one worker turn calls glob twice, then answers; durable turns must be 1
 #   interrupted worker request 1 gets a non-retryable 400, is not reviewed, and resumes
-#   cache-stable two glob steps plus the final answer share a byte-identical system message
-#             (comparisons stop at review boundaries because review state legitimately changes it)
+#   cache-stable one interrupted worker turn is followed before any review by a recovered
+#             turn with two glob steps; system messages stay byte-identical across that
+#             turn boundary and within the recovered turn
 #   goal-events reviewer accepts; asserts the rendered Goal achieved indication and durable completion
 #   invalid   verdict carries the wrong nonce         -> forged verdict must be refused
 #   http500   provider fails the reviewer request     -> reviewer failure inline
@@ -171,3 +172,28 @@ case "$SCENARIO" in
       "$WORK/interrupted-goal.json"
     ;;
 esac
+
+if [ "$SCENARIO" = "cache-stable" ]; then
+  echo "==> cache-stable cross-turn assertion"
+  node -e '
+const fs = require("fs")
+const entries = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
+const workers = entries.filter((entry) => entry.role === "worker")
+const before = workers.find((entry) => entry.turn === 1)
+const after = workers.find((entry) => entry.turn === 2)
+const beforeAt = entries.indexOf(before)
+const afterAt = entries.indexOf(after)
+const system = (entry) => JSON.stringify(entry?.body?.messages?.filter((message) => message.role === "system") ?? [])
+const continuation = JSON.stringify(after?.body ?? {})
+const noReviewBetween = beforeAt >= 0 && afterAt > beforeAt && !entries.slice(beforeAt + 1, afterAt).some((entry) => entry.role === "reviewer")
+const ok =
+  before &&
+  after &&
+  noReviewBetween &&
+  continuation.includes("Current active-goal status for this turn:") &&
+  continuation.includes("GOAL_HARNESS_CACHE_TURN_BOUNDARY") &&
+  system(before) === system(after)
+console.log(`${ok ? "ok  " : "not ok"} the system message is byte-identical across the no-review worker-turn boundary`)
+process.exit(ok ? 0 : 1)
+' "$WORK/provider.log"
+fi

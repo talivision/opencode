@@ -435,6 +435,36 @@ process.exit(control?.classification === "worker" && control.summarySystemMatche
 const fs = require("fs")
 const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
 const summaryAt = lines.findIndex((item) => item.classification === "summary")
+const firstWorker = lines.slice(summaryAt + 1).find((item) => item.classification === "worker" && item.scenario === "compaction")
+process.exit(summaryAt >= 0 && JSON.stringify(firstWorker?.body ?? {}).includes("PERMISSION_HARNESS_COMPACTION_SUMMARY_V1") ? 0 : 1)
+' "$WORK/provider.log"; then
+    pass "compaction first post-summary worker request contains the injected summary"
+  else
+    fail "compaction first post-summary worker request contains the injected summary"
+  fi
+  if node -e '
+const fs = require("fs")
+const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
+const summaryAt = lines.findIndex((item) => item.classification === "summary")
+const firstWorker = lines.slice(summaryAt + 1).find((item) => item.classification === "worker" && item.scenario === "compaction")
+const body = JSON.stringify(firstWorker?.body ?? {})
+process.exit(
+  summaryAt >= 0 &&
+    firstWorker &&
+    !body.includes("PERMISSION_HARNESS_COMPACTION_TURN_1") &&
+    !body.includes("compaction turn 1 completed")
+    ? 0
+    : 1,
+)
+' "$WORK/provider.log"; then
+    pass "compaction first post-summary worker request replaced the earliest pre-compaction turn"
+  else
+    fail "compaction first post-summary worker request replaced the earliest pre-compaction turn"
+  fi
+  if node -e '
+const fs = require("fs")
+const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
+const summaryAt = lines.findIndex((item) => item.classification === "summary")
 const later = lines.findIndex((item) => item.phase === "compaction-turn-8")
 process.exit(summaryAt >= 0 && later > summaryAt ? 0 : 1)
 ' "$WORK/provider.log" && grep -q 'compaction turn 8 completed' <(

@@ -9,13 +9,15 @@
 #
 # Scenarios:
 #   notify  child completes while parent is idle; notification re-invokes parent
-#   steer   a second parent prompt redirects a child whose first request is hung
+#   steer   a second parent prompt redirects its own child whose first request is hung;
+#           rightful-owner control for ownership, so both scenarios must be run together
 #   inspect task_output observes a running child, then task_stop stops it
 #   fanout  three background children use distinct per-call models and variants;
 #           all three completion notifications must reach the parent
 #   stop-one two children remain busy; the running-tasks dialog's two-press
 #           ctrl+d action stops only the selected row and renders its stopped state
-#   ownership parent A owns A1; a fresh parent B is refused when it calls task(task_id=A1)
+#   ownership parent A owns A1; a fresh parent B is refused when it calls task(task_id=A1);
+#           foreign-owner half of steer, so both scenarios must be run together
 #
 # Useful overrides:
 #   BIN=...     path to the compiled binary
@@ -246,6 +248,8 @@ SQL
 fi
 
 if [ "$SCENARIO" = "steer" ]; then
+  # OWNERSHIP INVARIANT PAIR: this scenario proves the rightful parent can
+  # resume via task_id. Run both `steer` and `ownership`; neither is complete alone.
   steer_persisted="$(sqlite3 "$DB" <<'SQL'
 SELECT count(*)
 FROM session child
@@ -268,14 +272,38 @@ SQL
 )"
   steer_live="$(grep -c '"role":"steer-issued","scenario":"steer","whileFirstOpen":true' "$WORK/provider.log" || true)"
   if [ "$steer_persisted" -gt 0 ] && [ "$steer_live" -gt 0 ]; then
-    pass "steer child user correction persisted while its first provider request was open"
+    pass "steer rightful parent resumed its child via task_id while the first provider request was open"
   else
-    fail "steer child user correction persisted while its first provider request was open"
+    fail "steer rightful parent resumed its child via task_id while the first provider request was open"
   fi
   if [ "$steer_ack" -gt 0 ]; then
     pass "steer child produced acknowledged mid-run correction"
   else
     fail "steer child produced acknowledged mid-run correction"
+  fi
+fi
+
+if [ "$SCENARIO" = "ownership" ]; then
+  # OWNERSHIP INVARIANT PAIR: this scenario proves the newest, foreign parent
+  # is refused. Run both `steer` and `ownership`; neither is complete alone.
+  newest_root_refusals="$(sqlite3 "$DB" <<'SQL'
+SELECT count(*)
+FROM part p
+WHERE p.session_id = (
+    SELECT id
+    FROM session
+    WHERE parent_id IS NULL
+    ORDER BY time_created DESC, id DESC
+    LIMIT 1
+  )
+  AND json_extract(p.data, '$.tool') = 'task'
+  AND coalesce(json_extract(p.data, '$.state.error'), json_extract(p.data, '$.state.output')) LIKE '%not owned by session%';
+SQL
+)"
+  if [ "$newest_root_refusals" -eq 1 ]; then
+    pass "ownership newest root parent B recorded the task_id ownership refusal"
+  else
+    fail "ownership newest root parent B recorded the task_id ownership refusal"
   fi
 fi
 
