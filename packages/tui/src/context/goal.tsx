@@ -13,6 +13,7 @@ type CommandResult = {
 type GoalContext = {
   get(sessionID: string): Accessor<Goal | undefined>
   refresh(sessionID: string): Promise<Goal>
+  resume(sessionID: string, send: () => Promise<unknown>): Promise<Goal>
   execute(sessionID: string, input: string): Promise<CommandResult>
 }
 
@@ -34,6 +35,20 @@ export function GoalProvider(props: ParentProps) {
   const refresh = async (sessionID: string) => {
     const response = await sdk.client.session.goal.get({ sessionID }, { throwOnError: true })
     return patch(sessionID, (response.data as SessionGoal | null) ?? null)
+  }
+
+  // The cached goal is whatever the one-second poll last read, so it lags the
+  // run it describes. A goal that the run completed, paused or blocked is still
+  // "active" in that copy until the next poll lands, and the session reports
+  // idle the moment the run ends — so a continuation decided on the cached copy
+  // sends one more worker turn at a goal that is already over. Nothing mutates
+  // a goal while its session is idle, which makes a re-read here authoritative:
+  // decide on that, and hand the caller the state it was decided on.
+  const resume = async (sessionID: string, send: () => Promise<unknown>) => {
+    const current = await refresh(sessionID)
+    if (current?.status !== "active") return current
+    await send()
+    return current
   }
 
   const execute = async (sessionID: string, input: string): Promise<CommandResult> => {
@@ -103,6 +118,7 @@ export function GoalProvider(props: ParentProps) {
       value={{
         get: (sessionID) => () => goals().get(sessionID),
         refresh,
+        resume,
         execute,
       }}
     >

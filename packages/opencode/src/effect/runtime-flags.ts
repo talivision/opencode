@@ -56,6 +56,7 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   // before applying its defaults; the env var wins when present.
   goalReviewTimeoutMs: positiveInteger("OPENCODE_GOAL_REVIEW_TIMEOUT_MS"),
   goalReviewMaxMs: positiveInteger("OPENCODE_GOAL_REVIEW_MAX_MS"),
+  goalReviewBlockedMaxMs: positiveInteger("OPENCODE_GOAL_REVIEW_BLOCKED_MAX_MS"),
   experimentalNativeLlm: bool("OPENCODE_EXPERIMENTAL_NATIVE_LLM"),
   experimentalWebSockets: bool("OPENCODE_EXPERIMENTAL_WEBSOCKETS"),
   client: Config.string("OPENCODE_CLIENT").pipe(Config.withDefault("cli")),

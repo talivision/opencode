@@ -1345,6 +1345,11 @@ const layer = Layer.effect(
       const reviewConfig = (yield* config.get()).goal?.review
       const reviewTimeoutMs = flags.goalReviewTimeoutMs ?? reviewConfig?.timeout ?? 1_200_000
       const reviewMaxMs = flags.goalReviewMaxMs ?? reviewConfig?.max_duration ?? 18_000_000
+      // How long a single review may sit waiting on a human before it is
+      // cancelled. Deliberately generous — someone at lunch should still be
+      // able to approve a prompt — but finite, because an unanswerable prompt
+      // must not pin an unattended run open indefinitely. One hour.
+      const reviewBlockedMaxMs = flags.goalReviewBlockedMaxMs ?? reviewConfig?.blocked_max ?? 3_600_000
       // Both limits are configurable, so the reason has to describe whatever the
       // operator actually set: a sub-minute cap must not report "1 minute".
       const reviewMaxLabel =
@@ -1547,6 +1552,19 @@ const layer = Layer.effect(
                 },
               },
             })
+          }
+          // Blocked time is excluded from the working clocks, but it cannot be
+          // unbounded. In a headless run nobody will ever answer, and the wait
+          // is externally triggerable: content the reviewer reads can steer it
+          // into a path its permission rules gate, which would otherwise hang
+          // an unattended goal forever. A generous ceiling keeps the fix for
+          // "a human is thinking" without turning it into a denial of service.
+          const blockedMs = blockedTotal + (blockedSince === undefined ? 0 : now - blockedSince)
+          if (blockedMs >= reviewBlockedMaxMs) {
+            return {
+              type: "timeout" as const,
+              reason: `Independent reviewer spent ${Math.ceil(blockedMs / 60_000)} minutes waiting for permission approval and was cancelled; nothing answered it`,
+            }
           }
           const workingMs = now - reviewStartedAt - blockedTotal - (blockedSince === undefined ? 0 : now - blockedSince)
           if (workingMs >= reviewMaxMs) {

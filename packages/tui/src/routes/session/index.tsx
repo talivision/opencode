@@ -433,12 +433,14 @@ export function Session() {
 
   const local = useLocal()
   let startedGoalUpdate = 0
+  let continuingGoal = false
 
   createEffect(
     on(
       () => route.sessionID,
       (sessionID) => {
         startedGoalUpdate = 0
+        continuingGoal = false
         void goals.refresh(sessionID)
       },
       { defer: false },
@@ -446,33 +448,47 @@ export function Session() {
   )
 
   createEffect(() => {
+    // Both are read before any early return so the effect keeps tracking them.
     const current = goal()
+    const status = sync.data.session_status[route.sessionID]
+    // One decision at a time: goals.resume refreshes the goal, which writes the
+    // store this effect reads, and a second continuation must not ride in on
+    // that write.
+    if (continuingGoal) return
     if (!current || current.status !== "active") return
     if (current.time.updated <= startedGoalUpdate) return
-    const status = sync.data.session_status[route.sessionID]
     if (status && status.type !== "idle") return
     const agent = local.agent.current()
     const model = local.model.current()
     if (!agent || !model) return
 
+    const sessionID = route.sessionID
     startedGoalUpdate = current.time.updated
-    void sdk.client.session
-      .prompt(
-        {
-          sessionID: route.sessionID,
-          ...model,
-          agent: agent.name,
-          model,
-          parts: [
-            {
-              type: "text",
-              text: "Continue working toward the active goal.",
-              synthetic: true,
-            },
-          ],
-        },
-        { throwOnError: true },
+    continuingGoal = true
+    void goals
+      .resume(sessionID, () =>
+        sdk.client.session.prompt(
+          {
+            sessionID,
+            ...model,
+            agent: agent.name,
+            model,
+            parts: [
+              {
+                type: "text",
+                text: "Continue working toward the active goal.",
+                synthetic: true,
+              },
+            ],
+          },
+          { throwOnError: true },
+        ),
       )
+      .then((fresh) => {
+        // Keep the watermark ahead of the state resume() actually decided on,
+        // so its own refresh cannot re-arm this effect.
+        if (fresh) startedGoalUpdate = Math.max(startedGoalUpdate, fresh.time.updated)
+      })
       .catch((error) => {
         startedGoalUpdate = 0
         toast.show({
@@ -480,6 +496,9 @@ export function Session() {
           message: errorMessage(error),
           variant: "error",
         })
+      })
+      .finally(() => {
+        continuingGoal = false
       })
   })
 

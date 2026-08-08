@@ -989,6 +989,58 @@ it.instance("a rejected completion review keeps the goal active until a later re
   }),
 )
 
+it.instance("an accepted review after a continuation ends the run without one more worker turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal accept after continuation",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "work the goal until the reviewer accepts" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "stop the moment the reviewer accepts" })
+    yield* llm.text("First increment done.", { usage: { input: 20, output: 5 } })
+    yield* llm.textFrom((hit) => {
+      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+      return `VERDICT: NOT_MET ${nonce} one more increment is required`
+    })
+    yield* llm.text("Second increment done.", { usage: { input: 20, output: 5 } })
+    yield* llm.textFrom((hit) => {
+      const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
+      return `VERDICT: MET ${nonce} objective independently verified`
+    })
+
+    yield* prompt.loop({ sessionID: session.id })
+
+    const goal = yield* goals.get(session.id)
+    expect(goal?.status).toBe("complete")
+    expect(goal?.review?.status).toBe("accepted")
+    // Two worker turns and two reviews. A third worker request here means the
+    // accepted goal re-sent the already-answered continuation.
+    expect(yield* llm.calls).toBe(4)
+    expect(yield* llm.pending).toBe(0)
+    // The accepting review is the last thing that talks to the provider.
+    const inputs = yield* llm.inputs
+    expect(JSON.stringify(inputs.at(-1))).toContain("<parent-session-index>")
+    expect(
+      inputs.filter((input) => JSON.stringify(input).includes("Continue working toward the active goal")),
+    ).toHaveLength(1)
+    // Only real working turns are counted.
+    expect(goal?.turns).toBe(2)
+
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    expect(messages.filter((message) => message.info.role === "assistant")).toHaveLength(2)
+  }),
+)
+
 it.instance("reviewers index the parent session, retrieve on demand, and hand conclusions to the next attempt", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

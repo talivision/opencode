@@ -128,6 +128,17 @@ if (scenario === "interrupted") {
     `resumed index ${resumedIndex}, first review request index ${firstReviewIndex}`,
   )
   check("only the recovered clean turn created a reviewer child session", reviewRows.length === 1, `${reviewRows.length} rows`)
+  // The accepting review is the last thing that may talk to the provider. A
+  // request after it is a continuation issued against a goal that is already
+  // complete: it carries no <active-goal> block (so it logs as auxiliary), it
+  // costs a full round trip, and it is the observable symptom of a continuation
+  // decided on a stale goal snapshot.
+  const afterLastReview = entries.slice(entries.findLastIndex((entry) => entry.role === "reviewer") + 1)
+  check(
+    "nothing is prompted after the accepting review",
+    afterLastReview.length === 0,
+    afterLastReview.map((entry) => entry.role).join(", "),
+  )
   notes.push("note first consecutive interruption intentionally has 0ms outer backoff; no delay assertion applies")
 }
 

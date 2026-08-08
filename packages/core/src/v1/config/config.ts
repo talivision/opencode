@@ -187,6 +187,10 @@ export const Info = Schema.Struct({
             description:
               "Milliseconds the independent goal reviewer may go without any activity before it is cancelled. Resets on streamed text, reasoning, and tool calls, so it only fires on a genuinely stalled reviewer (default: 1200000, i.e. 20 minutes)",
           }),
+          blocked_max: Schema.optional(PositiveInt).annotate({
+            description:
+              "Maximum total milliseconds a single goal review may spend waiting for a permission or question to be answered before it is cancelled (default: 3600000, i.e. 1 hour). Time spent waiting on a human does not count against the inactivity timer or the total duration, but it is still bounded: in an unattended run nobody will answer, and the wait can be provoked by content the reviewer reads.",
+          }),
           max_duration: Schema.optional(PositiveInt).annotate({
             description:
               "Maximum total milliseconds a single goal review may run before it is cancelled, regardless of activity (default: 18000000, i.e. 5 hours)",
