@@ -170,6 +170,7 @@ export function Prompt(props: PromptProps) {
   const keymap = useOpencodeKeymap()
   const agentShortcut = useCommandShortcut("agent.cycle")
   const paletteShortcut = useCommandShortcut("command.palette.show")
+  const permissionShortcut = useCommandShortcut("permission.cycle")
   const renderer = useRenderer()
   const exit = useExit()
   const dimensions = useTerminalDimensions()
@@ -1710,6 +1711,16 @@ export function Prompt(props: PromptProps) {
                   <text fg={theme.text}>
                     {paletteShortcut()} <span style={{ fg: theme.textMuted }}>commands</span>
                   </text>
+                  {/* The permission ladder was undiscoverable without this. A
+                      user has no way to learn shift+tab exists, and it is the
+                      only route to auto-approve and plan mode from the
+                      keyboard. Advertised beside the other two so the first
+                      screen names every mode-changing key. */}
+                  <Show when={permissionShortcut()}>
+                    <text fg={theme.text}>
+                      {permissionShortcut()} <span style={{ fg: theme.textMuted }}>mode</span>
+                    </text>
+                  </Show>
                 </Match>
                 <Match when={store.mode === "shell"}>
                   <text fg={theme.text}>
