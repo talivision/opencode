@@ -1034,6 +1034,18 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           dialog.clear()
         },
       },
+      {
+        name: "permission.auto",
+        title: "Toggle auto-approve permissions",
+        category: "System",
+        run: () => {
+          const sessionID = currentSessionID()
+          const next = permissionMode.get(sessionID) === "auto" ? "normal" : "auto"
+          permissionMode.set(sessionID, next)
+          if (next === "auto") showAutoPermissionToast()
+          dialog.clear()
+        },
+      },
     ].map((command) => ({
       namespace: "palette",
       ...command,

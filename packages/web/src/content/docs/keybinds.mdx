@@ -65,7 +65,8 @@ OpenCode has a list of keybinds that you can customize through `tui.json`.
     "console_org_switch": "none",
     "agent_list": "<leader>a",
     "agent_cycle": "tab",
-    "agent_cycle_reverse": "shift+tab",
+    "agent_cycle_reverse": "none",
+    "permission_cycle": "shift+tab",
     "variant_cycle": "ctrl+t",
     "variant_list": "none",
 
@@ -177,6 +178,13 @@ OpenCode has a list of keybinds that you can customize through `tui.json`.
   }
 }
 ```
+
+## Permission Mode Cycle
+
+`permission_cycle` defaults to `shift+tab` and cycles normal → auto → plan → normal.
+Entering plan mode selects the `plan` agent; leaving plan mode restores the previously selected agent.
+If no plan agent exists, the binding switches between normal and auto instead.
+`agent_cycle_reverse` has no default binding, but you can bind it in `tui.json`. An existing configuration that binds it to `shift+tab` keeps that shortcut and disables the permission-cycle default unless `permission_cycle` is also configured.
 
 :::note
 On Windows, the defaults for `input_undo` and `terminal_suspend` are different:

@@ -35,11 +35,11 @@ opencode run --auto "Refactor this module"
 
 Explicit `"deny"` rules are still enforced. Auto mode only changes requests that would otherwise ask for approval.
 
-In the TUI, open the command palette and select **Enable auto-approve permissions** or **Disable auto-approve permissions** to change modes. When auto mode is active, the prompt displays a muted `auto` indicator next to the current agent.
+In the TUI, open the command palette and select **Toggle auto-approve permissions** to switch directly between normal and auto modes, or select **Cycle permission mode (normal, auto, plan)** to move through the permission ladder. `shift+tab` runs the cycle command. With a plan agent available, the ladder is normal → auto → plan → normal; entering plan mode selects the plan agent, and leaving it restores the previous agent. Without a plan agent, the cycle switches between normal and auto. When auto mode is active, a bold, warning-coloured **auto-approve on** indicator appears above the prompt.
 
 ### How auto mode is scoped
 
-Auto mode is a property of a **session**, not of the process:
+On servers that support the auto-permission capability, auto mode is a property of a **session**, not of the process:
 
 - Turning it on for a session also turns it on for every session spawned from it, however deep. A subagent — a goal reviewer included — never re-asks for something its parent session is running in auto for.
 - Another session in the same OpenCode process is unaffected, so you can leave one session unattended while another still prompts you.
@@ -49,7 +49,7 @@ Auto mode is a property of a **session**, not of the process:
 
 Toggle it with `POST /permission/auto` (`{"sessionID": "...", "enabled": true}`), and read the effective status — including which ancestor it was inherited from — with `GET /permission/auto/:sessionID`. The session has to exist. Every change emits a `permission.auto.changed` event, so a connected client can show that prompts are being answered for you rather than simply not arriving.
 
-`opencode run --auto` sets the mode on the session it creates, which is what makes it cover subagents. The TUI command-palette toggle still drives the older client-side auto-approval, which replies to prompts as they arrive: it only answers prompts raised by the session you are looking at, and it cannot answer anything raised while the client is disconnected.
+`opencode run --auto` sets the mode on the session it creates, which is what makes it cover subagents. When the server does not support the auto-permission capability, the TUI falls back to the older client-side auto-reply. That fallback answers permission prompts as they arrive across the current workspace, regardless of which session raised them, and cannot answer prompts while the client is disconnected.
 
 :::caution
 `POST /permission/auto` is not authenticated beyond the server's own credentials, and neither is any other local endpoint. Anything that can reach the server port — which includes any agent that can run shell commands — can therefore turn auto mode on for a session and every session below it, durably, and it stays on across restarts. Unlike replying to a single prompt, nothing has to be pending for this to take effect. If that matters for your setup, do not expose the server beyond loopback, and check `GET /permission/auto-log` after an unattended run.
