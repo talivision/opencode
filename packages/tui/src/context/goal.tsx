@@ -74,8 +74,18 @@ export function GoalProvider(props: ParentProps) {
       return { goal, action: "changed", start: goal?.status === "active" }
     }
 
+    if (tail.length === 0) {
+      throw new Error("Usage: /goal [--tokens <positive number>] <objective with multiple words>")
+    }
+
     const next = parseBudget(args)
     if (!next.objective) throw new Error("Usage: /goal [--tokens <positive number>] <objective>")
+    const current = goals().get(sessionID)
+    if (current?.status === "active") {
+      throw new Error(
+        `An active goal already exists: "${current.objective}". Use /goal edit to replace it with "${next.objective}".`,
+      )
+    }
     const response = await sdk.client.session.goal.set(
       {
         sessionID,

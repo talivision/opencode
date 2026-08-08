@@ -20,8 +20,9 @@ read-only reviewer that inspects current state before the goal can close.
    needing you to prompt it again.
 2. When the agent believes it is finished, it requests completion. That request
    is never self-certifying.
-3. An independent reviewer starts in its own session. It is read-only: it cannot
-   edit files, run commands, install anything, or change the state it is judging.
+3. An independent reviewer starts in its own session. It cannot edit files,
+   install anything, or run arbitrary commands. If you configured exact review
+   commands, it may select one of those commands verbatim.
 4. The reviewer inspects current state and returns a verdict. If it rejects, its
    concrete reasons are handed back to the agent, which keeps working.
 5. Only an accepted verdict completes the goal.
@@ -40,8 +41,9 @@ explicit about what "done" means:
 - **Enumerate the requirements.** The reviewer decomposes the objective into a
   checklist on its first pass, and every later pass inherits it. Vague
   objectives produce vague checklists.
-- **Say what counts as evidence.** The reviewer cannot execute anything, so ask
-  for verification output to be quoted into the transcript where it can read it.
+- **Say what counts as evidence.** Unless you grant exact review commands, ask
+  for verification output to be quoted into the transcript where the reviewer
+  can read it.
 - **State the exclusions.** "Do not refactor unrelated files" is checkable.
 
 ---
@@ -73,7 +75,8 @@ Reviews are bounded by two timers, both configurable:
   "goal": {
     "review": {
       "timeout": 1200000,
-      "max_duration": 18000000
+      "max_duration": 18000000,
+      "commands": ["bun test", "bun turbo typecheck --filter=opencode"]
     }
   }
 }
@@ -86,6 +89,12 @@ Reviews are bounded by two timers, both configurable:
 - `max_duration` — the maximum total time one review may take regardless of
   activity (default `18000000`, 5 hours). This is the only bound on what a
   single review can spend, so lower it if you want a tighter budget.
+- `commands` — complete command lines the reviewer may run. Each model request
+  must match one configured entry verbatim after trimming. The command is split
+  into an executable and arguments without a shell, so the model cannot append
+  arguments or compose shell syntax. Adding an entry grants the reviewer the
+  ability to run that exact command from the instance directory. Omit it or use
+  an empty array to keep reviews fully non-executing.
 
 `OPENCODE_GOAL_REVIEW_TIMEOUT_MS` and `OPENCODE_GOAL_REVIEW_MAX_MS` override
 both for a single run.

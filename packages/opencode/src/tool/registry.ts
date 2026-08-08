@@ -60,6 +60,7 @@ import { GoalTool } from "./goal"
 import { GoalVerdictTool } from "./goal-verdict"
 import { GoalTranscriptTool } from "./goal-transcript"
 import { GoalChecklistTool } from "./goal-checklist"
+import { GoalCheckTool } from "./goal-check"
 import { SessionGoal } from "@/session/goal"
 import { SessionStatus } from "@/session/status"
 
@@ -70,6 +71,7 @@ export const REVIEWER_ONLY_TOOLS: ReadonlySet<string> = new Set([
   GoalVerdictTool.id,
   GoalTranscriptTool.id,
   GoalChecklistTool.id,
+  GoalCheckTool.id,
 ])
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
@@ -132,6 +134,7 @@ const layer = Layer.effect(
     const goalverdicttool = yield* GoalVerdictTool
     const goaltranscripttool = yield* GoalTranscriptTool
     const goalchecklisttool = yield* GoalChecklistTool
+    const goalchecktool = yield* GoalCheckTool
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
@@ -221,8 +224,11 @@ const layer = Layer.effect(
           }
         }
 
-        yield* config.get()
+        const cfg = yield* config.get()
         const questionEnabled = ["app", "cli", "desktop"].includes(flags.client) || flags.enableQuestionTool
+        const goalCheckCommands = [
+          ...new Set(cfg.goal?.review?.commands?.map((command) => command.trim()) ?? []),
+        ].filter((command) => command.length > 0)
 
         const tool = yield* Effect.all({
           invalid: Tool.init(invalid),
@@ -243,6 +249,7 @@ const layer = Layer.effect(
           goalVerdict: Tool.init(goalverdicttool),
           goalTranscript: Tool.init(goaltranscripttool),
           goalChecklist: Tool.init(goalchecklisttool),
+          goalCheck: Tool.init(goalchecktool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
@@ -272,6 +279,19 @@ const layer = Layer.effect(
             tool.goalVerdict,
             tool.goalTranscript,
             tool.goalChecklist,
+            ...(goalCheckCommands.length
+              ? [
+                  {
+                    ...tool.goalCheck,
+                    description: [
+                      tool.goalCheck.description,
+                      "Allowed commands (matched verbatim after trimming):",
+                      ...goalCheckCommands.map((command) => `- ${command}`),
+                      "Pass exactly one listed command. Do not add arguments, prefixes, suffixes, or shell syntax.",
+                    ].join("\n"),
+                  },
+                ]
+              : []),
             tool.patch,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
@@ -325,8 +345,9 @@ const layer = Layer.effect(
         }
         // The reviewer-only tools are the reviewer's private channel: no other
         // agent — especially not the worker whose claim is under review — may
-        // ever see them in its tool list. goal_verdict is unforgeable, and
-        // goal_transcript reads the parent session, so both must be gated. The
+        // ever see them in its tool list. They submit durable review state,
+        // read the parent session, or run operator-approved commands, so every
+        // one must be gated. The
         // gate keys on the goalReviewer marker, which is stamped only by the
         // native reviewer construction and never copied from user config —
         // config MAY rename a native agent, so keying on the name would let

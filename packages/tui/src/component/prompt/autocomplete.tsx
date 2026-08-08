@@ -70,6 +70,7 @@ export type AutocompleteOption = {
   isDirectory?: boolean
   onSelect?: () => void
   path?: string
+  submitOnExact?: boolean
 }
 
 export function Autocomplete(props: {
@@ -450,6 +451,7 @@ export function Autocomplete(props: {
       {
         display: "/goal",
         description: "Set, inspect, edit, pause, resume, or clear a durable goal",
+        submitOnExact: true,
         onSelect: () => {
           const newText = "/goal "
           const cursor = props.input().logicalCursor
@@ -627,7 +629,18 @@ export function Autocomplete(props: {
         title: "Select autocomplete item",
         category: "Autocomplete",
         run() {
+          const selected = options()[store.selected]
+          if (
+            store.visible === "/" &&
+            selected &&
+            selected.submitOnExact &&
+            (selected.value ?? selected.display).trimEnd() === props.input().plainText
+          ) {
+            setStore("visible", false)
+            return false
+          }
           select()
+          return true
         },
       },
       {

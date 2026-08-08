@@ -23,6 +23,7 @@ import { MCP } from "@/mcp"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/client"
 
 const configLayer = TestConfig.layer({
+  get: () => Effect.succeed({ goal: { review: { commands: ["bun test"] } } }),
   directories: () => InstanceState.directory.pipe(Effect.map((dir) => [path.join(dir, ".opencode")])),
 })
 
@@ -186,6 +187,7 @@ describe("tool.registry", () => {
       const reviewerOnly = [...REVIEWER_ONLY_TOOLS]
 
       expect(reviewerOnly).toContain("goal_verdict")
+      expect(reviewerOnly).toContain("goal_check")
       reviewerOnly.forEach((id) => expect(ids).not.toContain(id))
     }),
   )
@@ -196,14 +198,17 @@ describe("tool.registry", () => {
       const agents = yield* Agent.Service
       const reviewer = yield* agents.get("goal-reviewer")
       if (!reviewer) throw new Error("goal-reviewer agent not found")
-      const ids = (yield* registry.tools({
+      const tools = yield* registry.tools({
         providerID: ProviderV2.ID.opencode,
         modelID: ModelV2.ID.make("test"),
         agent: reviewer,
-      })).map((tool) => tool.id)
+      })
+      const ids = tools.map((tool) => tool.id)
       const reviewerOnly = [...REVIEWER_ONLY_TOOLS]
 
       expect(reviewerOnly).toContain("goal_verdict")
+      expect(reviewerOnly).toContain("goal_check")
+      expect(tools.find((tool) => tool.id === "goal_check")?.description).toContain("- bun test")
       reviewerOnly.forEach((id) => expect(ids).toContain(id))
     }),
   )
@@ -228,9 +233,10 @@ describe("tool.registry", () => {
 
   // The reviewer-only tools are the goal reviewer's private channel:
   // goal_verdict is the unforgeable verdict, goal_transcript reads the parent
-  // worker session, goal_checklist writes durable goal state. None of them may
-  // ever appear in another agent's tool list — including a config agent that
-  // merely renamed itself "goal-reviewer".
+  // worker session, goal_checklist writes durable goal state, and goal_check
+  // runs only exact operator-approved commands. None of them may ever appear in
+  // another agent's tool list — including a config agent that merely renamed
+  // itself "goal-reviewer".
   it.instance("exposes reviewer-only tools to the native goal-reviewer and to nobody else", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
@@ -240,7 +246,7 @@ describe("tool.registry", () => {
       if (!reviewer) throw new Error("goal-reviewer agent not found")
       const build = yield* agents.get("build")
       if (!build) throw new Error("build agent not found")
-      const reviewerOnly = ["goal_verdict", "goal_transcript", "goal_checklist"]
+      const reviewerOnly = [...REVIEWER_ONLY_TOOLS]
 
       const ids = yield* registry.ids()
       for (const id of reviewerOnly) expect(ids).toContain(id)

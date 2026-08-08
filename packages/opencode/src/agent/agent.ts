@@ -153,10 +153,12 @@ const layer = Layer.effect(
         // Security tradeoff, stated plainly. The reviewer consumes untrusted
         // repository content and its prompt already treats everything it
         // retrieves as data, never instructions, so a wider read scope grants it
-        // no new authority: it cannot mutate anything (bash/edit/write/patch are
-        // denied in the ruleset below and disabled again at the reviewGoal call
-        // site) and its only channel back to the worker is the structured
-        // verdict. That channel is not nothing, though — the verdict text lands
+        // no new authority by itself: bash/edit/write/patch are denied in the
+        // ruleset below and disabled again at the reviewGoal call site. The
+        // reviewer-only goal_check is a separate explicit grant, present only
+        // when the operator configures exact command strings. Its remaining
+        // channel back to the worker is the structured verdict. That channel is
+        // not nothing, though — the verdict text lands
         // in the context of a worker that CAN write and run commands, so injected
         // content that talks the reviewer into quoting a secret has somewhere to
         // go. Hence the credential denylist above rather than a blanket allow:
@@ -349,6 +351,7 @@ const layer = Layer.effect(
                 goal_verdict: "allow",
                 goal_transcript: "allow",
                 goal_checklist: "allow",
+                goal_check: "allow",
                 external_directory: reviewerExternalDirectory,
               }),
             ),
@@ -427,6 +430,7 @@ const layer = Layer.effect(
             goal_verdict: "allow",
             goal_transcript: "allow",
             goal_checklist: "allow",
+            goal_check: "allow",
             external_directory: reviewerExternalDirectory,
           }),
           user.filter((rule) => rule.action !== "allow"),

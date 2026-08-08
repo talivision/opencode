@@ -191,10 +191,14 @@ export const Info = Schema.Struct({
             description:
               "Maximum total milliseconds a single goal review may run before it is cancelled, regardless of activity (default: 18000000, i.e. 5 hours)",
           }),
+          commands: Schema.optional(Schema.mutable(Schema.Array(Schema.String))).annotate({
+            description:
+              "Complete command lines the independent goal reviewer may run. Entries are matched verbatim after trimming; adding an entry grants the reviewer permission to run that exact command without a shell.",
+          }),
         }),
       ).annotate({
         description:
-          "Limits for the independent reviewer that verifies goal completion. A review that hits either limit is recorded as unverified and the goal continues; it can never accept a goal as met.",
+          "Limits and exact command allowlist for the independent reviewer that verifies goal completion. A review that hits either limit is recorded as unverified and the goal continues; it can never accept a goal as met.",
       }),
     }),
   ).annotate({ description: "Goal mode settings" }),

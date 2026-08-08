@@ -165,7 +165,7 @@ export function DialogGoal(props: { sessionID: string }) {
       </Show>
       <box flexDirection="row" gap={2} paddingTop={1}>
         <text fg={theme.text} onMouseUp={edit}>
-          <span style={{ fg: theme.primary }}>e</span> {goal() ? "edit" : "set"}
+          <span style={{ fg: theme.primary }}>{goal() ? "e" : "s"}</span> {goal() ? "edit" : "set"}
         </text>
         <Show when={goal() && goal()!.status !== "complete"}>
           <text fg={theme.text} onMouseUp={toggle}>

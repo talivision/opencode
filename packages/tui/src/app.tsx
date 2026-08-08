@@ -1027,15 +1027,6 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       },
       {
         name: "permission.cycle",
-        title: "Cycle permission mode",
-        category: "System",
-        hidden: true,
-        run: () => {
-          cyclePermission(currentSessionID())
-        },
-      },
-      {
-        name: "permission.mode",
         title: "Cycle permission mode (normal, auto, plan)",
         category: "System",
         run: () => {
