@@ -32,7 +32,10 @@ env:
 jobs:
   drive:
     name: tui harness
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Stock runner: Blacksmith labels queue forever on forks without the
+    # Blacksmith app installed — the job shows "pending" for days and every
+    # push's concurrency group cancels the last one, so the harness never ran.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     defaults:
       run:
