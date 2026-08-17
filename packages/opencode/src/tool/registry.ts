@@ -77,7 +77,12 @@ export const REVIEWER_ONLY_TOOLS: ReadonlySet<string> = new Set([
 ])
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
-  return providerID === ProviderV2.ID.opencode || flags.exa || flags.parallel
+  return (
+    providerID === ProviderV2.ID.opencode ||
+    providerID === ProviderV2.ID.make("opencode-go") ||
+    flags.exa ||
+    flags.parallel
+  )
 }
 
 type TaskDef = Tool.InferDef<typeof TaskTool>
