@@ -12,7 +12,7 @@
 // env:
 //   PORT      listen port (default 4599)
 //   LOG       path to append one JSON line per request
-//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership | drop (default notify)
+//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership | drop | ux_navigation (default notify)
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
 import http from "node:http"
 import fs from "node:fs"
@@ -366,7 +366,12 @@ const server = http.createServer(async (req, res) => {
       hang(req, res, parsed.model ?? "unknown")
       return
     }
-    slowTaskDoneReply(req, res, "child work finished", SCENARIO === "inspect" ? 15_000 : 8_000)
+    slowTaskDoneReply(
+      req,
+      res,
+      "child work finished",
+      SCENARIO === "inspect" ? 15_000 : SCENARIO === "ux_navigation" ? 12_000 : 8_000,
+    )
     return
   }
 

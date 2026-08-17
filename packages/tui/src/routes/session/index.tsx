@@ -86,6 +86,7 @@ import { useGoal } from "../../context/goal"
 import { DialogGoal } from "../../component/dialog-goal"
 import { GoalIndicator } from "../../component/goal-indicator"
 import { DialogRunningTasks } from "../../component/dialog-running-tasks"
+import { TranscriptSearch, type TranscriptSearchRef } from "../../component/transcript-search"
 
 addDefaultParsers(parsers.parsers)
 
@@ -121,6 +122,7 @@ const sessionBindingCommands = [
   "session.share",
   "session.rename",
   "session.timeline",
+  "session.search",
   "session.fork",
   "session.compact",
   "session.unshare",
@@ -247,8 +249,17 @@ export function Session() {
 
   const pending = createMemo(() => {
     const completed = messages().findLast((x) => x.role === "assistant" && x.time.completed)?.id
-    return messages().findLast((x) => x.role === "assistant" && !x.time.completed && (!completed || x.id > completed))
-      ?.id
+    const streaming = messages().findLast(
+      (x) => x.role === "assistant" && !x.time.completed && (!completed || x.id > completed),
+    )?.id
+    if (streaming) return streaming
+    // A session can be busy with no assistant streaming — a goal review runs
+    // at the turn boundary after the last assistant completed. Messages typed
+    // then are queued too (the loop answers them after the review), so the
+    // threshold falls back to the last completed assistant.
+    const status = sync.data.session_status[route.sessionID]
+    if (status?.type === "busy" || status?.type === "retry") return completed
+    return undefined
   })
 
   const lastAssistant = createMemo(() => {
@@ -267,6 +278,7 @@ export function Session() {
   const [showAssistantMetadata, _setShowAssistantMetadata] = kv.signal("assistant_metadata_visibility", true)
   const [showScrollbar, setShowScrollbar] = kv.signal("scrollbar_visible", false)
   const [goalMinimized, setGoalMinimized] = kv.signal("goal_minimized", false)
+  const [searchOpen, setSearchOpen] = createSignal(false)
   const [diffWrapMode] = kv.signal<"word" | "none">("diff_wrap_mode", "word")
   const [_animationsEnabled, _setAnimationsEnabled] = kv.signal("animations_enabled", true)
   const [showGenericToolOutput, setShowGenericToolOutput] = kv.signal("generic_tool_output_visibility", false)
@@ -349,6 +361,7 @@ export function Session() {
   let seeded = false
   let scroll: ScrollBoxRenderable
   let prompt: PromptRef | undefined
+  let transcriptSearch: TranscriptSearchRef | undefined
   const bind = (r: PromptRef | undefined) => {
     prompt = r
     promptRef.set(r)
@@ -548,6 +561,19 @@ export function Session() {
       },
       run: () => {
         dialog.replace(() => <DialogGoal sessionID={route.sessionID} />)
+      },
+    },
+    {
+      title: "Find in transcript",
+      value: "session.search",
+      category: "Session",
+      run: () => {
+        dialog.clear()
+        if (searchOpen()) {
+          setTimeout(() => transcriptSearch?.focus(), 1)
+          return
+        }
+        setSearchOpen(true)
       },
     },
     {
@@ -1415,6 +1441,21 @@ export function Session() {
                   <SubagentFooter />
                 </Show>
                 <Show when={visible()}>
+                  <Show when={searchOpen()}>
+                    <TranscriptSearch
+                      ref={(value) => (transcriptSearch = value)}
+                      messages={messages()}
+                      partsByMessage={sync.data.part}
+                      jumpTo={(id) => {
+                        const child = scroll.getChildren().find((child) => child.id === id)
+                        if (child) scroll.scrollBy(child.y - scroll.y - 1)
+                      }}
+                      onClose={() => {
+                        setSearchOpen(false)
+                        setTimeout(() => prompt?.focus(), 1)
+                      }}
+                    />
+                  </Show>
                   <GoalIndicator sessionID={route.sessionID} minimized={goalMinimized()} />
                   <Show when={session()?.parentID && sync.data.session_status[route.sessionID]?.type === "busy"}>
                     <box paddingLeft={1} paddingRight={1} backgroundColor={theme.backgroundPanel}>
@@ -1820,7 +1861,13 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
   const { theme, syntax } = useTheme()
   return (
     <Show when={props.part.text.trim()}>
-      <box ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3} marginTop={1} flexShrink={0}>
+      <box
+        id={props.part.id}
+        ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+        paddingLeft={3}
+        marginTop={1}
+        flexShrink={0}
+      >
         <markdown
           syntaxStyle={syntax()}
           streaming={true}

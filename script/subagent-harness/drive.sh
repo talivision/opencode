@@ -20,6 +20,7 @@
 #           foreign-owner half of steer, so both scenarios must be run together
 #   drop    the child provider stream drops mid-turn; the harness reprompts until
 #           task_done and only then delivers a completed notification
+#   ux_navigation drives leader+down into the live child, then leader+up back to the parent
 #
 # Useful overrides:
 #   BIN=...     path to the compiled binary
@@ -41,9 +42,9 @@ WORK="${WORK:-${TMPDIR:-/tmp}/opencode-subagent-harness}"
 SOCK="${SOCK:-/tmp/opencode-subagent-harness.sock}"
 
 case "$SCENARIO" in
-  notify | steer | inspect | fanout | stop-one | ownership | drop) ;;
+  notify | steer | inspect | fanout | stop-one | ownership | drop | ux_navigation) ;;
   *)
-    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership|drop> [seconds]" >&2
+    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership|drop|ux_navigation> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -135,14 +136,61 @@ wait_for_children() {
   return 1
 }
 
+capture_subagent_pane() {
+  tmux -S "$SOCK" capture-pane -p -t subagent >"$1"
+}
+
+wait_for_subagent_text() {
+  local text="$1"
+  local snapshot="$2"
+  while [ "$SECONDS" -lt "$UX_DEADLINE" ]; do
+    capture_subagent_pane "$snapshot"
+    if grep -Fq "$text" "$snapshot"; then
+      return
+    fi
+    sleep 0.25
+  done
+  capture_subagent_pane "$snapshot"
+  return 1
+}
+
+wait_for_parent_return() {
+  local snapshot="$1"
+  while [ "$SECONDS" -lt "$UX_DEADLINE" ]; do
+    capture_subagent_pane "$snapshot"
+    if ! grep -Fq "Parent ctrl+x up" "$snapshot" &&
+      grep -Eq "Spawn a background investigation|view subagents|background investigation" "$snapshot"; then
+      return
+    fi
+    sleep 0.25
+  done
+  capture_subagent_pane "$snapshot"
+  return 1
+}
+
 sleep 15
 tmux -S "$SOCK" capture-pane -p -t subagent >"$WORK/snaps/00-startup.txt"
 send_prompt "$PROMPT"
 
-elapsed=0
-while [ "$elapsed" -lt "$WATCH" ]; do
-  sleep 1
-  elapsed=$((elapsed + 1))
+if [ "$SCENARIO" = "ux_navigation" ]; then
+  UX_DEADLINE=$((SECONDS + WATCH))
+  echo "==> wait for parent subagent navigation hint"
+  wait_for_subagent_text "ctrl+x down view subagents" "$WORK/snaps/ux-navigation-parent.txt" || true
+
+  echo "==> navigate to child with ctrl+x down"
+  tmux -S "$SOCK" send-keys -t subagent C-x
+  tmux -S "$SOCK" send-keys -t subagent Down
+  wait_for_subagent_text "Parent ctrl+x up" "$WORK/snaps/ux-navigation-child.txt" || true
+
+  echo "==> navigate back to parent with ctrl+x up"
+  tmux -S "$SOCK" send-keys -t subagent C-x
+  tmux -S "$SOCK" send-keys -t subagent Up
+  wait_for_parent_return "$WORK/snaps/ux-navigation-returned.txt" || true
+else
+  elapsed=0
+  while [ "$elapsed" -lt "$WATCH" ]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
 
   if [ "$SCENARIO" = "steer" ] && [ "$elapsed" -eq 8 ]; then
     send_prompt "Course-correct that task."
@@ -182,15 +230,16 @@ while [ "$elapsed" -lt "$WATCH" ]; do
     send_prompt "SECOND_PARENT_OWNERSHIP_PROBE: attempt to resume parent A's child."
   fi
 
-  if [ $((elapsed % 5)) -ne 0 ]; then
-    continue
-  fi
-  tmux -S "$SOCK" capture-pane -p -t subagent >"$WORK/snaps/$(printf '%03d' "$elapsed").txt"
-  echo "--- +${elapsed}s"
-  tmux -S "$SOCK" capture-pane -p -t subagent \
-    | grep -E "background|subagent|task|acknowledged|stopped|correction|Running tasks|Press ctrl.d again|ownership" \
-    | head -8 || true
-done
+    if [ $((elapsed % 5)) -ne 0 ]; then
+      continue
+    fi
+    tmux -S "$SOCK" capture-pane -p -t subagent >"$WORK/snaps/$(printf '%03d' "$elapsed").txt"
+    echo "--- +${elapsed}s"
+    tmux -S "$SOCK" capture-pane -p -t subagent \
+      | grep -E "background|subagent|task|acknowledged|stopped|correction|Running tasks|Press ctrl.d again|ownership" \
+      | head -8 || true
+  done
+fi
 
 DB="$WORK/home/.local/share/opencode/opencode.db"
 echo
@@ -224,6 +273,45 @@ fail() {
   echo "FAIL $1"
   failures=$((failures + 1))
 }
+ux_pass() {
+  echo "ok  $1"
+}
+ux_fail() {
+  echo "not ok $1${2:+ — $2}"
+  failures=$((failures + 1))
+}
+
+if [ "$SCENARIO" = "ux_navigation" ]; then
+  parent="$WORK/snaps/ux-navigation-parent.txt"
+  child="$WORK/snaps/ux-navigation-child.txt"
+  returned="$WORK/snaps/ux-navigation-returned.txt"
+
+  if grep -Fq "ctrl+x down view subagents" "$parent"; then
+    ux_pass "parent renders the ctrl+x down view subagents hint"
+  else
+    ux_fail "parent renders the ctrl+x down view subagents hint"
+  fi
+  if grep -Fq "SUBAGENT_HARNESS_CHILD: inspect the cache layer and report what you find" "$child"; then
+    ux_pass "leader+down shows the child task prompt"
+  else
+    ux_fail "leader+down shows the child task prompt"
+  fi
+  if grep -Fq "Parent ctrl+x up" "$child"; then
+    ux_pass "child footer rebinds Parent to ctrl+x up"
+  else
+    ux_fail "child footer rebinds Parent to ctrl+x up"
+  fi
+  if ! grep -Fq "Parent ctrl+x up" "$returned"; then
+    ux_pass "leader+up removes the child footer"
+  else
+    ux_fail "leader+up removes the child footer"
+  fi
+  if grep -Eq "Spawn a background investigation|view subagents|background investigation" "$returned"; then
+    ux_pass "leader+up restores parent-only content"
+  else
+    ux_fail "leader+up restores parent-only content"
+  fi
+fi
 
 if [ "$SCENARIO" = "notify" ]; then
   notify_reinvoked="$(sqlite3 "$DB" <<'SQL'

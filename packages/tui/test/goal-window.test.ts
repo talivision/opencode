@@ -19,3 +19,9 @@ test("defines collision-free goal and subagent navigation defaults", () => {
   expect(TuiKeybind.defaultValue("session_child_cycle")).toBe("<leader>right")
   expect(TuiKeybind.defaultValue("session_child_cycle_reverse")).toBe("<leader>left")
 })
+
+test("defines a collision-free transcript search default", () => {
+  expect(TuiKeybind.defaultValue("session_search")).toBe("<leader>f")
+  expect(Object.entries(TuiKeybind.Definitions).filter(([, item]) => item.default === "<leader>f")).toHaveLength(1)
+  expect(TuiKeybind.CommandMap.session_search).toBe("session.search")
+})

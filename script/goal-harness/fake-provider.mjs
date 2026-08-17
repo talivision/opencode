@@ -17,7 +17,7 @@
 //   REVIEWER_INPUT/OUTPUT fake reviewer usage (default 12000 / 58)
 //   REVIEWER_MODE         met | not_met | not_met_history | turns | interrupted | cache-stable | goal-events |
 //                         met_tool | not_met_tool | unclaimed | retrieval | permission_blocked | goal_check | invalid |
-//                         silent | slow | busy | http500
+//                         silent | slow | busy | http500 | ux_goal_window | ux_queued_cancel
 //   REVIEWER_NOT_MET_N    first N reviews return NOT_MET, then MET (default 0)
 //   REVIEWER_READ_PATH    controlled absolute path read by permission_blocked
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
@@ -316,7 +316,7 @@ const server = http.createServer(async (req, res) => {
       req.on("close", () => clearInterval(timer))
       return
     }
-    if (REVIEWER_MODE === "slow") {
+    if (["slow", "ux_queued_cancel"].includes(REVIEWER_MODE)) {
       // emit activity every 20s, then finish after 3 bursts: must NOT be killed
       res.writeHead(200, {
         "content-type": "text/event-stream",
@@ -412,6 +412,17 @@ const server = http.createServer(async (req, res) => {
     url: req.url,
     body: parsed,
   })
+  if (REVIEWER_MODE === "ux_goal_window") {
+    textReply(res, "Continuing careful work without claiming completion.", WORKER_USAGE)
+    return
+  }
+  if (REVIEWER_MODE === "ux_search") {
+    // Two searchable assistant texts, then filler with none of the scenario's
+    // search terms so late reminder-driven turns cannot shift the match count.
+    const texts = ["the amber zebra crossed quietly", "a xylophone hummed near the harbor"]
+    textReply(res, texts[workerCount - 1] ?? "background hum continues, no keywords", WORKER_USAGE)
+    return
+  }
   if (lastToolResultIs(parsed, "goal")) {
     textReply(res, "Claim submitted; awaiting review.", WORKER_USAGE)
     return
