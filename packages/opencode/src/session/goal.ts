@@ -127,7 +127,7 @@ export const Info = Schema.Struct({
       count: NonNegativeInt,
     }),
   ),
-  pauseReason: Schema.optional(Schema.Literals(["user", "budget"])),
+  pauseReason: Schema.optional(Schema.Literals(["user", "budget", "interrupted"])),
   // Write-once decomposition of the objective, produced by the first reviewer.
   // Survives review attempts; cleared only when the objective itself changes.
   requirements: Schema.optional(Schema.mutable(Schema.Array(Requirement))),
@@ -252,6 +252,7 @@ export interface Interface {
   readonly set: (input: SetInput) => Effect.Effect<Info>
   readonly edit: (input: EditInput) => Effect.Effect<Info | undefined>
   readonly pause: (sessionID: SessionID) => Effect.Effect<Info | undefined>
+  readonly suspendForInterrupt: (sessionID: SessionID) => Effect.Effect<Info | undefined>
   readonly resume: (sessionID: SessionID) => Effect.Effect<Info | undefined>
   readonly block: (sessionID: SessionID, reason: string) => Effect.Effect<Info | undefined>
   readonly requestReview: (input: ReviewRequestInput) => Effect.Effect<Info | undefined>
@@ -381,6 +382,19 @@ const layer = Layer.effect(
         stopClock(draft, now)
         draft.status = "paused"
         draft.pauseReason = "user"
+      })
+    })
+
+    const suspendForInterrupt = Effect.fn("SessionGoal.suspendForInterrupt")(function* (sessionID: SessionID) {
+      return yield* update(sessionID, (draft, now) => {
+        if (draft.status !== "active") return
+        // An aborted run must neither keep the elapsed clock ticking on a dead
+        // session nor let the TUI continuation silently restart what the user
+        // just interrupted. Paused-with-reason makes the stop visible and
+        // /goal resume the explicit way back.
+        stopClock(draft, now)
+        draft.status = "paused"
+        draft.pauseReason = "interrupted"
       })
     })
 
@@ -669,6 +683,7 @@ const layer = Layer.effect(
       set,
       edit,
       pause,
+      suspendForInterrupt,
       resume,
       block,
       requestReview,

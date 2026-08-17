@@ -12,7 +12,7 @@
 // env:
 //   PORT      listen port (default 4599)
 //   LOG       path to append one JSON line per request
-//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership | drop | ux_navigation (default notify)
+//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | ux_navigation (default notify)
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
 import http from "node:http"
 import fs from "node:fs"
@@ -114,7 +114,7 @@ function toolReplies(res, calls) {
   ])
 }
 
-function slowTextReply(req, res, text, duration, track = false) {
+function slowTextReply(req, res, text, duration, track = false, complete) {
   const pieces = text.split(" ")
   if (track) firstChildOpen = true
   res.writeHead(200, {
@@ -136,6 +136,7 @@ function slowTextReply(req, res, text, duration, track = false) {
       if (track) firstChildOpen = false
       res.write(`data: ${JSON.stringify(chunk({ finish: "stop", usage: USAGE }))}\n\n`)
       res.write("data: [DONE]\n\n")
+      complete?.()
       res.end()
     },
     Math.ceil(duration / (pieces.length + 1)),
@@ -311,6 +312,20 @@ const server = http.createServer(async (req, res) => {
       marker: flat.includes(CHILD_MARKER),
       corrected,
       doneMarkerMissing,
+      ...(SCENARIO === "soak"
+        ? {
+            at: Date.now(),
+            soakTurn: Math.ceil(childCount / 2),
+            soakPhase:
+              childCount <= 6
+                ? childCount % 2 === 1
+                  ? "drop"
+                  : "markerless"
+                : childCount === 7
+                  ? "complete"
+                  : "follow-up",
+          }
+        : {}),
       model: parsed.model,
       url: req.url,
       body: parsed,
@@ -330,6 +345,26 @@ const server = http.createServer(async (req, res) => {
       }
       if (doneMarkerMissing) {
         taskDoneReply(res, "recovered after provider stream drop")
+        return
+      }
+    }
+    if (SCENARIO === "soak") {
+      if (childCount <= 6 && childCount % 2 === 1) {
+        dropReply(res, `partial soak child output before stream drop ${Math.ceil(childCount / 2)}`)
+        return
+      }
+      if (childCount <= 6) {
+        const n = childCount
+        // Keep the recovered turns active long enough that the three drop/retry
+        // pairs themselves do not violate the raw six-requests-per-minute cap.
+        // The completion log lets the assertion measure only the outer 0/5/10s wait.
+        slowTextReply(req, res, `soak retry ${n / 2} completed without the required marker`, 20_000, false, () =>
+          log({ role: "child-markerless-complete", n, scenario: SCENARIO, at: Date.now() }),
+        )
+        return
+      }
+      if (childCount === 7 && doneMarkerMissing) {
+        taskDoneReply(res, "soak child recovered after three dropped turns")
         return
       }
     }

@@ -17,7 +17,7 @@
 //   REVIEWER_INPUT/OUTPUT fake reviewer usage (default 12000 / 58)
 //   REVIEWER_MODE         met | not_met | not_met_history | turns | interrupted | cache-stable | goal-events |
 //                         met_tool | not_met_tool | unclaimed | retrieval | permission_blocked | goal_check | invalid |
-//                         silent | slow | busy | http500 | ux_goal_window | ux_queued_cancel
+//                         silent | slow | soak | busy | http500 | ux_goal_window | ux_queued_cancel
 //   REVIEWER_NOT_MET_N    first N reviews return NOT_MET, then MET (default 0)
 //   REVIEWER_READ_PATH    controlled absolute path read by permission_blocked
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
@@ -316,7 +316,7 @@ const server = http.createServer(async (req, res) => {
       req.on("close", () => clearInterval(timer))
       return
     }
-    if (["slow", "ux_queued_cancel"].includes(REVIEWER_MODE)) {
+    if (["slow", "soak", "ux_queued_cancel"].includes(REVIEWER_MODE)) {
       // emit activity every 20s, then finish after 3 bursts: must NOT be killed
       res.writeHead(200, {
         "content-type": "text/event-stream",
@@ -332,6 +332,44 @@ const server = http.createServer(async (req, res) => {
           return
         }
         clearInterval(timer)
+        if (REVIEWER_MODE === "soak") {
+          const args = JSON.stringify({
+            met: true,
+            summary: "soak review verified the completed objective against current state",
+            unmet: [],
+          })
+          const split = Math.ceil(args.length / 2)
+          res.write(
+            `data: ${JSON.stringify(
+              chunk({
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call_soak_verdict",
+                      type: "function",
+                      function: { name: "goal_verdict", arguments: "" },
+                    },
+                  ],
+                },
+              }),
+            )}\n\n`,
+          )
+          res.write(
+            `data: ${JSON.stringify(
+              chunk({ delta: { tool_calls: [{ index: 0, function: { arguments: args.slice(0, split) } }] } }),
+            )}\n\n`,
+          )
+          res.write(
+            `data: ${JSON.stringify(
+              chunk({ delta: { tool_calls: [{ index: 0, function: { arguments: args.slice(split) } }] } }),
+            )}\n\n`,
+          )
+          res.write(`data: ${JSON.stringify(chunk({ finish: "tool_calls", usage: REVIEWER_USAGE }))}\n\n`)
+          res.write("data: [DONE]\n\n")
+          res.end()
+          return
+        }
         res.write(
           `data: ${JSON.stringify(chunk({ delta: { content: `VERDICT: MET ${nonce} slow but verified` } }))}\n\n`,
         )
@@ -414,6 +452,10 @@ const server = http.createServer(async (req, res) => {
   })
   if (REVIEWER_MODE === "ux_goal_window") {
     textReply(res, "Continuing careful work without claiming completion.", WORKER_USAGE)
+    return
+  }
+  if (REVIEWER_MODE === "soak" && workerCount <= 6) {
+    textReply(res, `Soak worker turn ${workerCount} ended without claiming completion.`, WORKER_USAGE)
     return
   }
   if (REVIEWER_MODE === "ux_search") {

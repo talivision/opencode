@@ -22574,9 +22574,19 @@
                     "type": "integer",
                     "exclusiveMinimum": 0
                   },
+                  "blocked_max": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  },
                   "max_duration": {
                     "type": "integer",
                     "exclusiveMinimum": 0
+                  },
+                  "commands": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
                   }
                 },
                 "additionalProperties": false
@@ -24237,6 +24247,10 @@
             "type": "integer",
             "minimum": 0
           },
+          "reminderStreak": {
+            "type": "integer",
+            "minimum": 0
+          },
           "blocker": {
             "type": "object",
             "properties": {
@@ -24275,7 +24289,7 @@
           },
           "pauseReason": {
             "type": "string",
-            "enum": ["user", "budget"]
+            "enum": ["user", "budget", "interrupted"]
           },
           "requirements": {
             "type": "array",

@@ -278,6 +278,15 @@ export const TaskTool = Tool.define(
         model,
         ...(runInBackground ? { background: true } : {}),
       }
+      let taskIsBackground = runInBackground
+      let doneMarkerMisses = 0
+
+      function taskPartMetadata() {
+        return {
+          ...metadata,
+          ...(taskIsBackground ? { background: true, jobId: nextSession.id } : {}),
+        }
+      }
 
       yield* ctx.metadata({
         title: params.description,
@@ -325,16 +334,42 @@ export const TaskTool = Tool.define(
           // one that owns task_done. Search only this prompt's transcript tail;
           // older markers from a resumed child must not complete new work.
           if (!done) {
-            done = (yield* sessions.messages({ sessionID: nextSession.id }))
-              .filter((message) => message.info.id > promptMessageID)
+            // Position, not ID comparison: the transcript is (time, id)-sorted
+            // and IDs are only monotonic per process under a steady clock —
+            // upstream's ordering campaign retired ID ordering as a time proxy.
+            const transcript = yield* sessions.messages({ sessionID: nextSession.id })
+            const promptIndex = transcript.findIndex((message) => message.info.id === promptMessageID)
+            done = transcript
+              .slice(promptIndex + 1)
               .flatMap((message) => message.parts)
               .findLast(isMarker)
           }
           if (done?.type === "tool" && done.state.status === "completed") {
             const summary = done.state.input.summary
-            if (typeof summary === "string" && summary.trim()) return summary.trim()
+            if (typeof summary === "string" && summary.trim()) {
+              if (doneMarkerMisses > 0) {
+                yield* ctx.metadata({
+                  title: params.description,
+                  metadata: { ...taskPartMetadata(), doneMarkerMisses, recovered: true },
+                })
+              }
+              return summary.trim()
+            }
           }
-          yield* Effect.sleep(taskDoneBackoffMs(missing))
+          const backoff = taskDoneBackoffMs(missing)
+          const nextReprompt = Date.now() + backoff
+          doneMarkerMisses = missing
+          yield* ctx.metadata({
+            title: `${params.description} · recovering (no completion marker, attempt ${missing})`,
+            metadata: { ...taskPartMetadata(), doneMarkerMisses: missing, nextReprompt },
+          })
+          yield* status.set(nextSession.id, {
+            type: "retry",
+            attempt: missing,
+            message: "Subagent turn ended without task_done — reprompting",
+            next: nextReprompt,
+          })
+          yield* Effect.sleep(backoff).pipe(Effect.onInterrupt(() => status.set(nextSession.id, { type: "idle" })))
           promptMessageID = MessageID.ascending()
           result = yield* ops.prompt({
             messageID: promptMessageID,
@@ -364,7 +399,7 @@ export const TaskTool = Tool.define(
         const currentParent = yield* sessions.get(ctx.sessionID)
         const summary =
           state === "completed"
-            ? `Background task completed: ${params.description}`
+            ? `Background task completed: ${params.description}${doneMarkerMisses > 0 ? ` (recovered after ${doneMarkerMisses} reprompts)` : ""}`
             : state === "error"
               ? `Background task failed: ${params.description}`
               : `Background task stopped: ${params.description}`
@@ -474,13 +509,16 @@ export const TaskTool = Tool.define(
         type: id,
         title: params.description,
         metadata,
-        onPromote: Effect.all([
-          ctx.metadata({
-            title: params.description,
-            metadata: { ...metadata, background: true, jobId: nextSession.id },
-          }),
-          notify(nextSession.id),
-        ]),
+        onPromote: Effect.gen(function* () {
+          taskIsBackground = true
+          yield* Effect.all([
+            ctx.metadata({
+              title: params.description,
+              metadata: { ...metadata, background: true, jobId: nextSession.id },
+            }),
+            notify(nextSession.id),
+          ])
+        }),
         run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
       })
 
@@ -528,7 +566,7 @@ export const TaskTool = Tool.define(
             if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
             return {
               title: params.description,
-              metadata,
+              metadata: doneMarkerMisses > 0 ? { ...metadata, doneMarkerMisses, recovered: true } : metadata,
               output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result?.output ?? "" }),
             }
           }),

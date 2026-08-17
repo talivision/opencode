@@ -240,6 +240,7 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const prompts: SessionPrompt.PromptInput[] = []
+      const metadata: { title?: string; metadata?: Record<string, unknown> }[] = []
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
@@ -264,7 +265,10 @@ describe("tool.task", () => {
           abort: new AbortController().signal,
           extra: { promptOps },
           messages: [],
-          metadata: () => Effect.void,
+          metadata: (input) =>
+            Effect.sync(() => {
+              metadata.push(input)
+            }),
           ask: () => Effect.void,
         },
       )
@@ -284,6 +288,72 @@ describe("tool.task", () => {
       ])
       expect(result.output).toContain("recovered completion summary")
       expect(result.output).not.toContain("partial response before provider drop")
+      expect(metadata).toHaveLength(3)
+      expect(metadata[1]?.title).toBe("recover dropped child · recovering (no completion marker, attempt 1)")
+      expect(metadata[1]?.metadata).toMatchObject({
+        parentSessionId: chat.id,
+        sessionId: result.metadata.sessionId,
+        doneMarkerMisses: 1,
+      })
+      expect(typeof metadata[1]?.metadata?.nextReprompt).toBe("number")
+      expect(metadata[2]).toMatchObject({
+        title: "recover dropped child",
+        metadata: {
+          parentSessionId: chat.id,
+          sessionId: result.metadata.sessionId,
+          doneMarkerMisses: 1,
+          recovered: true,
+        },
+      })
+      expect(result.metadata).toMatchObject({ doneMarkerMisses: 1, recovered: true })
+    }),
+  )
+
+  background.instance("clears done-marker retry status when cancelled during backoff", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const statuses = yield* SessionStatus.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const secondMiss = yield* Deferred.make<void>()
+      let childPrompts = 0
+
+      const result = yield* def.execute(
+        {
+          description: "cancel recovering child",
+          prompt: "inspect the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: (input) => {
+                if (input.sessionID === chat.id) return Effect.succeed(reply(input, "notified"))
+                childPrompts += 1
+                return Effect.succeed(textReply(input, `missing marker ${childPrompts}`))
+              },
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: (input) =>
+            input.metadata?.doneMarkerMisses === 2 ? Deferred.succeed(secondMiss, undefined) : Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      yield* Deferred.await(secondMiss)
+      yield* Effect.sleep(10)
+      expect(yield* statuses.get(result.metadata.sessionId)).toMatchObject({ type: "retry", attempt: 2 })
+
+      yield* jobs.cancel(result.metadata.sessionId)
+      expect(yield* statuses.get(result.metadata.sessionId)).toEqual({ type: "idle" })
     }),
   )
 
@@ -1457,6 +1527,58 @@ describe("tool.task", () => {
       expect(waited.timedOut).toBe(false)
       expect(waited.info?.status).toBe("completed")
       expect(waited.info?.output).toBe("background done")
+    }),
+  )
+
+  background.instance("background completion notification reports done-marker recovery", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      let childPrompts = 0
+
+      const result = yield* def.execute(
+        {
+          description: "recover background child",
+          prompt: "inspect the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: (input) => {
+                if (input.sessionID === chat.id) {
+                  return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "notification handled")))
+                }
+                childPrompts += 1
+                if (childPrompts === 1) return Effect.succeed(textReply(input, "provider dropped"))
+                return Effect.succeed(reply(input, "background recovered"))
+              },
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      expect(waited.info?.status).toBe("completed")
+      const notification = yield* Deferred.await(injected)
+      expect(notification.parts[0]?.type).toBe("text")
+      if (notification.parts[0]?.type === "text") {
+        expect(notification.parts[0].text).toContain(
+          "<summary>Background task completed: recover background child (recovered after 1 reprompts)</summary>",
+        )
+      }
     }),
   )
 

@@ -258,13 +258,15 @@ export function Session() {
     const pending = messages().findLastIndex(
       (message, index) => index > completed && message.role === "assistant" && !message.time.completed,
     )
-    if (pending !== -1) return pending
+    if (pending !== -1) return { index: pending, fallback: false }
     // A session can be busy with no assistant streaming — a goal review runs
     // at the turn boundary after the last assistant completed. Messages typed
     // then are queued too (the loop answers them after the review), so the
     // threshold falls back to the last completed assistant's index.
     const status = sync.data.session_status[route.sessionID]
-    if ((status?.type === "busy" || status?.type === "retry") && completed !== -1) return completed
+    if ((status?.type === "busy" || status?.type === "retry") && completed !== -1) {
+      return { index: completed, fallback: true }
+    }
     return undefined
   })
 
@@ -283,7 +285,7 @@ export function Session() {
   const [showDetails, setShowDetails] = kv.signal("tool_details_visibility", true)
   const [showAssistantMetadata, _setShowAssistantMetadata] = kv.signal("assistant_metadata_visibility", true)
   const [showScrollbar, setShowScrollbar] = kv.signal("scrollbar_visible", false)
-  const [goalMinimized, setGoalMinimized] = kv.signal("goal_minimized", false)
+  const [goalMinimized, setGoalMinimized] = kv.signal(`goal_minimized_${route.sessionID}`, false)
   const [searchOpen, setSearchOpen] = createSignal(false)
   const [diffWrapMode] = kv.signal<"word" | "none">("diff_wrap_mode", "word")
   const [_animationsEnabled, _setAnimationsEnabled] = kv.signal("animations_enabled", true)
@@ -1412,7 +1414,7 @@ export function Session() {
                                 sessionID={route.sessionID}
                                 queued={
                                   pending() !== undefined &&
-                                  index() > pending()! &&
+                                  index() > pending()!.index &&
                                   !(sync.data.part[message.id] ?? []).some(
                                     (part) => part.type === "text" && part.metadata?.taskNotification === true,
                                   )
@@ -1423,7 +1425,8 @@ export function Session() {
                           }}
                           message={message as UserMessage}
                           parts={sync.data.part[message.id] ?? []}
-                          pending={pending()}
+                          pending={pending()?.index}
+                          pendingFallback={pending()?.fallback ?? false}
                         />
                       </Match>
                       <Match when={message.role === "assistant"}>
@@ -1453,22 +1456,22 @@ export function Session() {
                 <Show when={session()?.parentID}>
                   <SubagentFooter />
                 </Show>
+                <Show when={searchOpen()}>
+                  <TranscriptSearch
+                    ref={(value) => (transcriptSearch = value)}
+                    messages={messages()}
+                    partsByMessage={sync.data.part}
+                    jumpTo={(id) => {
+                      const child = scroll.getChildren().find((child) => child.id === id)
+                      if (child) scroll.scrollBy(child.y - scroll.y - 1)
+                    }}
+                    onClose={() => {
+                      setSearchOpen(false)
+                      setTimeout(() => prompt?.focus(), 1)
+                    }}
+                  />
+                </Show>
                 <Show when={visible()}>
-                  <Show when={searchOpen()}>
-                    <TranscriptSearch
-                      ref={(value) => (transcriptSearch = value)}
-                      messages={messages()}
-                      partsByMessage={sync.data.part}
-                      jumpTo={(id) => {
-                        const child = scroll.getChildren().find((child) => child.id === id)
-                        if (child) scroll.scrollBy(child.y - scroll.y - 1)
-                      }}
-                      onClose={() => {
-                        setSearchOpen(false)
-                        setTimeout(() => prompt?.focus(), 1)
-                      }}
-                    />
-                  </Show>
                   <GoalIndicator sessionID={route.sessionID} minimized={goalMinimized()} />
                   <Show when={session()?.parentID && sync.data.session_status[route.sessionID]?.type === "busy"}>
                     <box paddingLeft={1} paddingRight={1} backgroundColor={theme.backgroundPanel}>
@@ -1534,6 +1537,7 @@ function UserMessage(props: {
   onMouseUp: () => void
   index: number
   pending?: number
+  pendingFallback: boolean
 }) {
   const ctx = use()
   const local = useLocal()
@@ -1556,7 +1560,17 @@ function UserMessage(props: {
   const files = createMemo(() => props.parts.flatMap((x) => (x.type === "file" ? [x] : [])))
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
-  const queued = createMemo(() => !notification() && props.pending !== undefined && props.index > props.pending)
+  const candidate = createMemo(() => !notification() && props.pending !== undefined && props.index > props.pending)
+  const [now, setNow] = createSignal(Date.now())
+  createEffect(() => {
+    if (!candidate() || !props.pendingFallback) return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 500)
+    onCleanup(() => clearInterval(timer))
+  })
+  const queued = createMemo(
+    () => candidate() && (!props.pendingFallback || props.message.time.created + 700 < now()),
+  )
   const color = createMemo(() => local.agent.color(props.message.agent))
   const queuedFg = createMemo(() => selectedForeground(theme, color()))
   const metadataVisible = createMemo(() => queued() || ctx.showTimestamps())

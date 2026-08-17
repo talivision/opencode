@@ -18,6 +18,12 @@ test("defines collision-free goal and subagent navigation defaults", () => {
   expect(TuiKeybind.defaultValue("session_parent")).toBe("<leader>up")
   expect(TuiKeybind.defaultValue("session_child_cycle")).toBe("<leader>right")
   expect(TuiKeybind.defaultValue("session_child_cycle_reverse")).toBe("<leader>left")
+  expect(TuiKeybind.defaultValue("session_queued_prompts")).toBe("none")
+  expect(
+    Object.entries(TuiKeybind.Definitions)
+      .filter(([, item]) => typeof item.default === "string" && item.default.split(",").includes("<leader>q"))
+      .map(([name]) => name),
+  ).toEqual(["app_exit"])
 })
 
 test("defines a collision-free transcript search default", () => {

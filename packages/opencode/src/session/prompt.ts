@@ -1174,6 +1174,30 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    // Pacing must never make a human wait: the goal backoff sleep wakes the
+    // moment a genuine (non-synthetic) user message lands in the session,
+    // instead of pinning the reply behind up to five minutes of timer.
+    const sleepUnlessUserInput = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      wait: number,
+      baselineUserID: MessageID | undefined,
+    ) {
+      const slice = 500
+      let remaining = wait
+      while (remaining > 0) {
+        yield* Effect.sleep(`${Math.min(slice, remaining)} millis`)
+        remaining -= slice
+        const recent = yield* sessions.messages({ sessionID, limit: 4 }).pipe(Effect.orDie)
+        const fresh = recent.find(
+          (message) =>
+            message.info.role === "user" &&
+            message.info.id !== baselineUserID &&
+            message.parts.some((part) => part.type === "text" && part.synthetic !== true),
+        )
+        if (fresh) return
+      }
+    })
+
     const hasRunningChildren = Effect.fnUntraced(function* (sessionID: SessionID) {
       return (yield* background.list()).some(
         (job) => job.status === "running" && job.metadata?.parentSessionId === sessionID,
@@ -1779,7 +1803,10 @@ const layer = Layer.effect(
           )
           const { user, assistant } = MessageV2.latest(current)
           if (!user || !assistant) return false
-          if (user.id < assistant.id) return false
+          // Answered means the latest assistant message is the reply to the
+          // latest user message. ID ordering is not a proxy for that: imported
+          // transcripts have nonmonotonic IDs (upstream's ordering campaign).
+          if (assistant.parentID === user.id) return false
           if (assistant.error || assistant.finish === "content-filter" || assistant.structured !== undefined)
             return false
           yield* Effect.logInfo("answering message injected mid-run", {
@@ -1805,7 +1832,10 @@ const layer = Layer.effect(
           // budget is concerned. Without this a long conversation that keeps
           // being steered accumulates steps until it trips agent.steps and gets
           // MAX_STEPS_PROMPT injected mid-answer.
-          if (seenUserID !== undefined && lastUser.id > seenUserID) step = 0
+          // Identity, not ordering: a mid-run message from a clock-skewed
+          // client can carry an ID below the previous one and still deserves
+          // a fresh step budget.
+          if (seenUserID !== undefined && lastUser.id !== seenUserID) step = 0
           seenUserID = lastUser.id
 
           const lastAssistantMsg = msgs.findLast(
@@ -1872,10 +1902,10 @@ const layer = Layer.effect(
                   message:
                     reviewWait >= reminderWait
                       ? (review?.reason ?? "Independent review keeps failing")
-                      : "Goal reminder rate limit",
+                      : "Pacing goal continuation — nudging again shortly",
                   next: (yield* Clock.currentTimeMillis) + wait,
                 })
-                yield* Effect.sleep(`${wait} millis`)
+                yield* sleepUnlessUserInput(sessionID, wait, lastUser.id)
               }
               step = 0
               continue
@@ -2148,10 +2178,12 @@ const layer = Layer.effect(
                   type: "retry",
                   attempt: goalBackoff && interruptWait >= reminderWait ? goalBackoff.count : reminderStreak,
                   message:
-                    goalBackoff && interruptWait >= reminderWait ? goalBackoff.reason : "Goal reminder rate limit",
+                    goalBackoff && interruptWait >= reminderWait
+                      ? goalBackoff.reason
+                      : "Pacing goal continuation — nudging again shortly",
                   next: (yield* Clock.currentTimeMillis) + wait,
                 })
-                yield* Effect.sleep(`${wait} millis`)
+                yield* sleepUnlessUserInput(sessionID, wait, lastUser.id)
               }
               goalBackoff = undefined
               step = 0
@@ -2177,7 +2209,15 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID).pipe(
+          // A cancelled run must not leave an active goal silently ticking:
+          // pause it visibly so /goal resume is the explicit way back.
+          Effect.onInterrupt(() => goal.suspendForInterrupt(input.sessionID).pipe(Effect.ignore)),
+        ),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(

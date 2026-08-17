@@ -18,6 +18,10 @@ on:
       - goal-mode
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Nightly soak: the long-running pacing/stability scenarios are too slow
+    # for the per-push job and run here instead.
+    - cron: "17 3 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -30,6 +34,87 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  soak:
+    name: tui soak harness
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux sqlite3
+
+      - name: Build binary
+        run: OPENCODE_VERSION=dev ./packages/opencode/script/build.ts --single --skip-install --skip-embed-web-ui
+
+      - name: Locate binary
+        id: bin
+        run: |
+          path="$(ls packages/opencode/dist/*/bin/opencode | head -1)"
+          test -x "$path" || { echo "no executable binary under packages/opencode/dist"; exit 1; }
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Drive soak scenarios
+        env:
+          BIN: ${{ github.workspace }}/${{ steps.bin.outputs.path }}
+        run: |
+          set -uo pipefail
+          fail=0
+
+          run_scenario() {
+            local harness="$1" scenario="$2" watch="$3" port="$4" expected="$5"
+            local log="/tmp/harness-${harness}-${scenario}.log"
+            echo "::group::${harness} ${scenario}"
+            PORT="$port" \
+            SOCK="/tmp/harness-${harness}-${scenario}.sock" \
+            WORK="/tmp/harness-${harness}-${scenario}" \
+              bash "script/${harness}/drive.sh" "$scenario" "$watch" 2>&1 | tee "$log" || true
+            echo "::endgroup::"
+
+            if grep -qE '^(FAIL|not ok)' "$log"; then
+              echo "::error::${harness}/${scenario} reported a failing assertion"
+              grep -E '^(FAIL|not ok)' "$log"
+              fail=1
+            fi
+            local seen
+            seen="$(grep -cE '^(PASS|ok)' "$log" || true)"
+            if [ "$seen" -lt "$expected" ]; then
+              echo "::error::${harness}/${scenario} emitted ${seen} passing assertions, expected at least ${expected} — the scenario stopped short"
+              fail=1
+            fi
+          }
+
+          run_scenario goal-harness soak 540 4910 6
+          run_scenario subagent-harness soak 420 4911 5
+
+          exit "$fail"
+
+      - name: Upload soak artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: soak-logs
+          path: |
+            /tmp/harness-*.log
+            /tmp/harness-*/snaps
+            /tmp/harness-*/provider.log
+            /tmp/harness-*/tui.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   drive:
     name: tui harness
     # Stock runner: Blacksmith labels queue forever on forks without the

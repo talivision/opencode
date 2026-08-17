@@ -35,6 +35,8 @@
 #             near-miss, sees both results, and submits an accepted verdict
 #   busy      reviewer streams forever                -> must survive inactivity, hit hard max
 #   slow      reviewer streams every 20s, then MET    -> must survive inactivity
+#   soak      six unclaimed worker turns exercise reminder backoff, then one slow
+#             tool-based review completes; watches pacing and TUI health for ~8 minutes
 #   ux_goal_window worker never claims completion; drives goal minimize/expand and pane assertions
 #   ux_queued_cancel worker claims completion, slow review stays busy while a queued message is cancelled
 #   ux_search worker replies with two searchable texts; drives leader+f find bar, counter cycling, escape
@@ -49,6 +51,9 @@ set -euo pipefail
 
 SCENARIO="${1:-not_met}"
 WATCH="${2:-30}"
+if [ "$SCENARIO" = "soak" ] && [ "$#" -lt 2 ]; then
+  WATCH=480
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
@@ -66,9 +71,9 @@ if [ "$SCENARIO" = "ux_goal_window" ]; then
 fi
 
 case "$SCENARIO" in
-  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow | ux_goal_window | ux_queued_cancel | ux_search) ;;
+  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow | soak | ux_goal_window | ux_queued_cancel | ux_search) ;;
   *)
-    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow|ux_goal_window|ux_queued_cancel|ux_search> [seconds]" >&2
+    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow|soak|ux_goal_window|ux_queued_cancel|ux_search> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -155,8 +160,9 @@ wait_for_cancelled_message() {
   local snapshot="$1"
   while [ "$SECONDS" -lt "$UX_DEADLINE" ]; do
     capture_goal_pane "$snapshot"
+    # The cancelled text legitimately reappears in the composer (restore),
+    # so completion is dialog-gone + badge-gone, not text-gone.
     if ! grep -Fq "Message Actions" "$snapshot" &&
-      ! grep -Fq "$QUEUED_MESSAGE" "$snapshot" &&
       ! grep -Fq "QUEUED" "$snapshot"; then
       return
     fi
@@ -409,6 +415,10 @@ else
   done
 fi
 
+if [ "$SCENARIO" = "soak" ]; then
+  capture_goal_pane "$WORK/snaps/final.txt" || true
+fi
+
 echo
 echo "==> durable goal state"
 cat "$WORK/home/.local/share/opencode/storage/goal/"*.json 2>/dev/null || echo "(none)"
@@ -425,7 +435,7 @@ if [ "$SCENARIO" = "retrieval" ]; then
 fi
 
 case "$SCENARIO" in
-  unclaimed | not_met_history | turns | interrupted | cache-stable | goal-events | permission_blocked | goal_check | silent | http500)
+  unclaimed | not_met_history | turns | interrupted | cache-stable | goal-events | permission_blocked | goal_check | silent | http500 | soak)
     echo "==> $SCENARIO assertions"
     DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
     node "$HERE/assert-scenarios.mjs" \
@@ -537,10 +547,13 @@ if [ "$SCENARIO" = "ux_queued_cancel" ]; then
   else
     ux_fail "cancelling closes the Message Actions dialog"
   fi
-  if ! grep -Fq "$QUEUED_MESSAGE" "$cancelled"; then
-    ux_ok "cancelled queued message disappears from the transcript"
+  # Cancellation restores the typed text into the composer, so the text is
+  # STILL on screen by design — exactly once, with no QUEUED badge. Durable
+  # deletion from the transcript is asserted separately against the database.
+  if [ "$(grep -Fc "$QUEUED_MESSAGE" "$cancelled" || true)" -eq 1 ]; then
+    ux_ok "cancelled text is restored into the composer exactly once"
   else
-    ux_fail "cancelled queued message disappears from the transcript"
+    ux_fail "cancelled text is restored into the composer exactly once" "$(grep -Fc "$QUEUED_MESSAGE" "$cancelled" || true) occurrences"
   fi
   if ! grep -Fq "QUEUED" "$cancelled"; then
     ux_ok "cancelled message leaves no QUEUED badge"

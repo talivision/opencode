@@ -2063,7 +2063,9 @@ export type Config = {
   goal?: {
     review?: {
       timeout?: number
+      blocked_max?: number
       max_duration?: number
+      commands?: Array<string>
     }
   }
   experimental?: {
@@ -2623,6 +2625,7 @@ export type SessionGoal = {
   tokenBudget?: number
   tokensUsed: number
   turns: number
+  reminderStreak?: number
   blocker?: {
     reason: string
     count: number
@@ -2633,7 +2636,7 @@ export type SessionGoal = {
     at: number
     count: number
   }
-  pauseReason?: "user" | "budget"
+  pauseReason?: "user" | "budget" | "interrupted"
   requirements?: Array<{
     id: string
     text: string

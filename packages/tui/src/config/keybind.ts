@@ -101,7 +101,7 @@ export const Definitions = {
   session_toggle_timestamps: keybind("none", "Toggle message timestamps"),
   session_toggle_generic_tool_output: keybind("none", "Toggle generic tool output"),
   goal_minimize: keybind("<leader>z", "Toggle goal window minimize"),
-  session_queued_prompts: keybind("<leader>q", "Manage queued prompts"),
+  session_queued_prompts: keybind("none", "Manage queued prompts"),
   session_child_first: keybind("<leader>down", "Go to first child session"),
   session_child_cycle: keybind("<leader>right", "Go to next child session"),
   session_child_cycle_reverse: keybind("<leader>left", "Go to previous child session"),

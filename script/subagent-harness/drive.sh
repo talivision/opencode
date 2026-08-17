@@ -20,6 +20,8 @@
 #           foreign-owner half of steer, so both scenarios must be run together
 #   drop    the child provider stream drops mid-turn; the harness reprompts until
 #           task_done and only then delivers a completed notification
+#   soak    three child turns drop and recover markerless before a paced fourth
+#           turn calls task_done; watches notification and TUI stability for ~6 minutes
 #   ux_navigation drives leader+down into the live child, then leader+up back to the parent
 #
 # Useful overrides:
@@ -32,6 +34,9 @@ set -euo pipefail
 
 SCENARIO="${1:-notify}"
 WATCH="${2:-35}"
+if [ "$SCENARIO" = "soak" ] && [ "$#" -lt 2 ]; then
+  WATCH=360
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
@@ -42,9 +47,9 @@ WORK="${WORK:-${TMPDIR:-/tmp}/opencode-subagent-harness}"
 SOCK="${SOCK:-/tmp/opencode-subagent-harness.sock}"
 
 case "$SCENARIO" in
-  notify | steer | inspect | fanout | stop-one | ownership | drop | ux_navigation) ;;
+  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | ux_navigation) ;;
   *)
-    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership|drop|ux_navigation> [seconds]" >&2
+    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership|drop|soak|ux_navigation> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -239,6 +244,10 @@ else
       | grep -E "background|subagent|task|acknowledged|stopped|correction|Running tasks|Press ctrl.d again|ownership" \
       | head -8 || true
   done
+fi
+
+if [ "$SCENARIO" = "soak" ]; then
+  capture_subagent_pane "$WORK/snaps/final.txt" || true
 fi
 
 DB="$WORK/home/.local/share/opencode/opencode.db"
@@ -439,7 +448,7 @@ if [ "$SCENARIO" = "stop-one" ]; then
 fi
 
 case "$SCENARIO" in
-  fanout | stop-one | ownership | drop)
+  fanout | stop-one | ownership | drop | soak)
     echo "==> $SCENARIO assertions"
     node "$HERE/assert-scenarios.mjs" \
       "$SCENARIO" \

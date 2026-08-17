@@ -8,6 +8,7 @@ import type { PromptInfo } from "../../component/prompt/history"
 import { stripPromptPartIDs as strip } from "../../prompt/part"
 import { useToast } from "../../ui/toast"
 import type { DialogContext } from "../../ui/dialog"
+import type { Part } from "@opencode-ai/sdk/v2"
 
 export function DialogMessage(props: {
   messageID: string
@@ -33,6 +34,8 @@ export function DialogMessage(props: {
                 value: "message.cancel",
                 description: "remove this message before it is picked up",
                 onSelect: async (dialog: DialogContext) => {
+                  const msg = message()
+                  const promptInfo = msg ? toPromptInfo(sync.data.part[msg.id] ?? []) : undefined
                   try {
                     const result = await sdk.client.session.deleteMessage({
                       sessionID: props.sessionID,
@@ -49,7 +52,9 @@ export function DialogMessage(props: {
                           : "Could not cancel the queued message.",
                         variant: "warning",
                       })
+                      return
                     }
+                    if (promptInfo && props.setPrompt) props.setPrompt(promptInfo)
                   } catch {
                     toast.show({
                       message: "Could not cancel the queued message.",
@@ -75,20 +80,7 @@ export function DialogMessage(props: {
               messageID: msg.id,
             })
 
-            if (props.setPrompt) {
-              const parts = sync.data.part[msg.id]
-              const promptInfo = parts.reduce(
-                (agg, part) => {
-                  if (part.type === "text") {
-                    if (!part.synthetic) agg.input += part.text
-                  }
-                  if (part.type === "file") agg.parts.push(strip(part))
-                  return agg
-                },
-                { input: "", parts: [] as PromptInfo["parts"] },
-              )
-              props.setPrompt(promptInfo)
-            }
+            if (props.setPrompt) props.setPrompt(toPromptInfo(sync.data.part[msg.id] ?? []))
 
             dialog.clear()
           },
@@ -145,5 +137,16 @@ export function DialogMessage(props: {
         },
       ]}
     />
+  )
+}
+
+function toPromptInfo(parts: Part[]) {
+  return parts.reduce(
+    (prompt, part) => {
+      if (part.type === "text" && !part.synthetic) prompt.input += part.text
+      if (part.type === "file") prompt.parts.push(strip(part))
+      return prompt
+    },
+    { input: "", parts: [] as PromptInfo["parts"] },
   )
 }

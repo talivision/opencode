@@ -183,11 +183,13 @@ function classify(parsed, url) {
   // unambiguous without being brittle — the control assertion proves a normal
   // turn scores zero.
   const summarySystemMatches = systemText.filter((value) => value.includes(COMPACTION_MARKER)).length
-  if (summarySystemMatches > 1) return { classification: "ambiguous", reason: "multiple-compaction-systems", summarySystemMatches }
+  if (summarySystemMatches > 1)
+    return { classification: "ambiguous", reason: "multiple-compaction-systems", summarySystemMatches }
   if (summarySystemMatches === 1) return { classification: "summary", scenario: "compaction", summarySystemMatches }
 
   const titleSystemMatches = systemText.filter((value) => value.startsWith(TITLE_SYSTEM)).length
-  if (titleSystemMatches > 1) return { classification: "ambiguous", reason: "multiple-title-systems", summarySystemMatches }
+  if (titleSystemMatches > 1)
+    return { classification: "ambiguous", reason: "multiple-title-systems", summarySystemMatches }
   if (titleSystemMatches === 1) return { classification: "title", summarySystemMatches }
 
   const scenarios = scenarioMarkers(userText)
@@ -202,8 +204,7 @@ function classify(parsed, url) {
 
   const resultID = lastToolResult(parsed)
   const resultPhase = Object.entries(CALLS).find(([, id]) => id === resultID)?.[0]
-  if (resultPhase)
-    return { classification: "worker", scenario, phase: `${resultPhase}-result`, summarySystemMatches }
+  if (resultPhase) return { classification: "worker", scenario, phase: `${resultPhase}-result`, summarySystemMatches }
 
   // Longest first matters for the intentional DENY_WINS / DENY_WINS_PREFLIGHT
   // prefix pair. A broad-prefix match must never steal the more specific case.
@@ -212,7 +213,14 @@ function classify(parsed, url) {
     .find(([, value]) => lastUser.includes(value))?.[0]
   if (marker) return { classification: "worker", scenario, phase: marker, summarySystemMatches }
   const turn = /PERMISSION_HARNESS_COMPACTION_TURN_([1-8])/.exec(lastUser)?.[1]
-  if (turn) return { classification: "worker", scenario, phase: `compaction-turn-${turn}`, turn: Number(turn), summarySystemMatches }
+  if (turn)
+    return {
+      classification: "worker",
+      scenario,
+      phase: `compaction-turn-${turn}`,
+      turn: Number(turn),
+      summarySystemMatches,
+    }
   return { classification: "unknown", scenario, summarySystemMatches }
 }
 

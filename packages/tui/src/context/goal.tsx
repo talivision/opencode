@@ -24,7 +24,9 @@ export function GoalProvider(props: ParentProps) {
   const [goals, setGoals] = createSignal(new Map<string, Goal>())
 
   const patch = (sessionID: string, goal: Goal) => {
+    const serialized = JSON.stringify(goal)
     setGoals((current) => {
+      if (JSON.stringify(current.get(sessionID)) === serialized) return current
       const next = new Map(current)
       next.set(sessionID, goal)
       return next

@@ -27,14 +27,14 @@ Two layers, both deliberate:
 
 ## Core tools
 
-| Script | What it does |
-|--------|-------------|
-| `start.sh [session]` | Build scratch tree, start the fake provider, launch the TUI, wait until the prompt renders |
-| `stop.sh [session]` | Kill the session, its provider, and its scratch tree |
-| `stop.sh --all` | Tear down every session and provider on the dedicated socket |
-| `send_keys.sh [session] <key...>` | Send keystrokes (each arg is one key) |
-| `capture.py [session] [out.json]` | Dump the screen as JSON: text plus styled segments, colours, highlights, selections |
-| `diff_snapshots.py before.json after.json` | Diff two snapshots and summarise what changed |
+| Script                                     | What it does                                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| `start.sh [session]`                       | Build scratch tree, start the fake provider, launch the TUI, wait until the prompt renders |
+| `stop.sh [session]`                        | Kill the session, its provider, and its scratch tree                                       |
+| `stop.sh --all`                            | Tear down every session and provider on the dedicated socket                               |
+| `send_keys.sh [session] <key...>`          | Send keystrokes (each arg is one key)                                                      |
+| `capture.py [session] [out.json]`          | Dump the screen as JSON: text plus styled segments, colours, highlights, selections        |
+| `diff_snapshots.py before.json after.json` | Diff two snapshots and summarise what changed                                              |
 
 `capture.py` is the reason to prefer this over `capture-pane | grep`: it sees
 **colour and style**, so you can assert that a warning badge is actually rendered
@@ -67,13 +67,13 @@ Then invoke the styled tools with that interpreter:
 
 ## Environment
 
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `BIN` | `packages/opencode/dist/opencode-darwin-arm64/bin/opencode` | Which binary to drive |
-| `PROVIDER` | `goal` | Which harness provider: `goal`, `subagent`, `permission` |
-| `PORT` | `5010` | Fake provider port |
-| `TUI_COLS` / `TUI_ROWS` | `170` / `48` | Terminal size |
-| `KEEP_WORK` | unset | Set to `1` to keep the scratch tree after `stop.sh` |
+| Var                     | Default                                                     | Purpose                                                  |
+| ----------------------- | ----------------------------------------------------------- | -------------------------------------------------------- |
+| `BIN`                   | `packages/opencode/dist/opencode-darwin-arm64/bin/opencode` | Which binary to drive                                    |
+| `PROVIDER`              | `goal`                                                      | Which harness provider: `goal`, `subagent`, `permission` |
+| `PORT`                  | `5010`                                                      | Fake provider port                                       |
+| `TUI_COLS` / `TUI_ROWS` | `170` / `48`                                                | Terminal size                                            |
+| `KEEP_WORK`             | unset                                                       | Set to `1` to keep the scratch tree after `stop.sh`      |
 
 Provider scenario variables pass straight through, e.g. `REVIEWER_MODE=not_met`
 for the goal provider.

@@ -1,4 +1,4 @@
-// Assertions for fanout, stop-one, ownership, and drop.
+// Assertions for fanout, stop-one, ownership, drop, and soak.
 //
 // Uses provider request logs plus SQLite's snake_case session_id, parent_id,
 // and message_id columns. stop-one also consumes the provider's live-state
@@ -33,6 +33,13 @@ const entries = fs
   .filter(Boolean)
   .map((line) => JSON.parse(line))
 const db = new DatabaseSync(dbPath, { readOnly: true })
+
+function maxInWindow(items, duration) {
+  return items.reduce((maximum, item, index) => {
+    const count = items.slice(index).findIndex((next) => next.at - item.at >= duration)
+    return Math.max(maximum, count < 0 ? items.length - index : count)
+  }, 0)
+}
 
 if (scenario === "fanout") {
   const children = db
@@ -193,6 +200,71 @@ if (scenario === "drop") {
     "drop completion notification carries the task_done summary",
     notifications.some((row) => row.text?.includes("recovered after provider stream drop")),
     JSON.stringify(notifications),
+  )
+}
+
+if (scenario === "soak") {
+  const childRequests = entries.filter((entry) => entry.role === "child")
+  const markerless = entries.filter((entry) => entry.role === "child-markerless-complete")
+  const reprompts = childRequests.filter((entry) => [3, 5, 7].includes(entry.n))
+  const gaps = markerless.map((entry, index) => reprompts[index]?.at - entry.at)
+  const notifications = db
+    .prepare(
+      `SELECT json_extract(p.data, '$.text') AS text
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'user'
+         AND json_extract(p.data, '$.text') LIKE '%<task-notification task_id=%status="completed"%'`,
+    )
+    .all()
+  const children = db.prepare("SELECT count(*) AS count FROM session WHERE parent_id IS NOT NULL").get()
+  const unfinishedParent = db
+    .prepare(
+      `SELECT count(*) AS count
+       FROM message m
+       JOIN session s ON s.id = m.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'assistant'
+         AND json_extract(m.data, '$.time.completed') IS NULL`,
+    )
+    .get()
+  const finalPane = fs.existsSync(path.join(snapDir, "final.txt"))
+    ? fs.readFileSync(path.join(snapDir, "final.txt"), "utf8")
+    : ""
+  check(
+    "soak missing-marker reprompts retain the 0s, 5s, 10s backoff spacing",
+    markerless.length === 3 &&
+      reprompts.length === 3 &&
+      reprompts.every((entry) => entry.doneMarkerMissing === true) &&
+      gaps.every(Number.isFinite) &&
+      gaps[0] <= 2_000 &&
+      gaps[1] >= 4_000 &&
+      gaps[2] >= 8_000 &&
+      gaps.every((gap, index) => index === 0 || gap >= gaps[index - 1] * 0.8),
+    `gaps=${gaps.map((gap) => Math.round(gap / 100) / 10).join(",")}s`,
+  )
+  check(
+    "soak creates one child and delivers exactly one completed notification to the parent",
+    children.count === 1 && notifications.length === 1,
+    `${children.count} children, ${notifications.length} notifications`,
+  )
+  check(
+    "soak completion notification carries the task_done summary",
+    notifications[0]?.text?.includes("soak child recovered after three dropped turns"),
+  )
+  check(
+    "soak has no 60-second child request storm",
+    childRequests.every((entry) => Number.isFinite(entry.at)) && maxInWindow(childRequests, 60_000) <= 6,
+    `maximum=${maxInWindow(childRequests, 60_000)}`,
+  )
+  check(
+    "soak leaves the parent idle and the TUI alive with prompt chrome",
+    // Footer chrome, not the agent chip: the pane renders "Build · Fake
+    // Model" mixed-case, and the command hints are the stable alive marker.
+    unfinishedParent.count === 0 && (finalPane.includes("ctrl+p") || finalPane.includes("shift+tab")),
+    `unfinished parent messages=${unfinishedParent.count}`,
   )
 }
 

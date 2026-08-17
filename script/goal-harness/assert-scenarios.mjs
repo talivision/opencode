@@ -83,6 +83,13 @@ const reviewers = entries.filter((entry) => entry.role === "reviewer")
 const goal = readGoal(goalDir)
 const db = new DatabaseSync(dbPath, { readOnly: true })
 
+function maxInWindow(items, duration) {
+  return items.reduce((maximum, item, index) => {
+    const count = items.slice(index).findIndex((next) => next.at - item.at >= duration)
+    return Math.max(maximum, count < 0 ? items.length - index : count)
+  }, 0)
+}
+
 if (scenario === "unclaimed") {
   const firstReviewer = entries.findIndex((entry) => entry.role === "reviewer")
   const secondWorker = entries.findIndex((entry) => entry.role === "worker" && entry.n === 2)
@@ -117,6 +124,57 @@ if (scenario === "unclaimed") {
       goal.review?.status === "accepted" &&
       goal.review?.attempt === 1 &&
       !goal.reminderStreak,
+  )
+}
+
+if (scenario === "soak") {
+  const unclaimed = workers.slice(0, 6)
+  const gaps = unclaimed.slice(1).map((entry, index) => entry.at - unclaimed[index].at)
+  const expectedGaps = [0, 5_000, 10_000, 20_000, 40_000]
+  const firstClaim = entries.findIndex((entry) => entry.role === "worker" && entry.n === 7)
+  const firstReviewer = entries.findIndex((entry) => entry.role === "reviewer")
+  const reviewSessions = db
+    .prepare("SELECT title FROM session WHERE parent_id IS NOT NULL AND title LIKE 'Goal review #%'")
+    .all()
+  const attempts = reviewSessions.map((row) => Number(/Goal review #(\d+)/.exec(row.title)?.[1]))
+  const finalPane = fs.existsSync(path.join(snapDir, "final.txt"))
+    ? fs.readFileSync(path.join(snapDir, "final.txt"), "utf8")
+    : ""
+  check(
+    "soak reminder gaps keep backing off through the 0s, 5s, 10s, 20s, 40s series",
+    unclaimed.length === 6 &&
+      unclaimed.every((entry) => Number.isFinite(entry.at)) &&
+      gaps.every((gap, index) => index === 0 || gap >= gaps[index - 1] * 0.8) &&
+      gaps.every((gap, index) => gap >= expectedGaps[index] * 0.8) &&
+      gaps.at(-1) >= 20_000,
+    `gaps=${gaps.map((gap) => Math.round(gap / 100) / 10).join(",")}s`,
+  )
+  check(
+    "soak has no 60-second worker request storm",
+    maxInWindow(workers, 60_000) <= 5,
+    `maximum=${maxInWindow(workers, 60_000)}`,
+  )
+  check("soak stays within the total provider request budget", entries.length <= 25, `${entries.length} requests`)
+  check(
+    "soak creates exactly one reviewer session per attempt and none before the first claim",
+    goal?.review?.attempt > 0 &&
+      reviewSessions.length === goal.review.attempt &&
+      new Set(attempts).size === reviewSessions.length &&
+      attempts.every((attempt) => attempt >= 1 && attempt <= goal.review.attempt) &&
+      firstClaim >= 0 &&
+      firstReviewer > firstClaim,
+    `${reviewSessions.length} sessions for ${goal?.review?.attempt ?? 0} attempts; claim index ${firstClaim}, reviewer index ${firstReviewer}`,
+  )
+  check(
+    "soak completes durably and resets the reminder streak",
+    goal?.status === "complete" && goal.review?.status === "accepted" && goal.reminderStreak === 0,
+    `status=${goal?.status}, review=${goal?.review?.status}, reminderStreak=${goal?.reminderStreak}`,
+  )
+  check(
+    "soak leaves the TUI alive with prompt chrome and a complete goal indicator",
+    // Footer chrome, not the agent chip: the pane renders "Build · Fake
+    // Model" mixed-case, and the command hints are the stable alive marker.
+    (finalPane.includes("ctrl+p") || finalPane.includes("shift+tab")) && finalPane.includes("Goal complete"),
   )
 }
 

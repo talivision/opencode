@@ -18,7 +18,15 @@ export function GoalIndicator(props: { sessionID: string; minimized: boolean }) 
   const shortcut = useCommandShortcut("goal.minimize")
   const maxHeight = createMemo(() => tuiConfig.goal?.max_height ?? Math.max(3, Math.floor(dimensions().height / 4)))
 
-  const paused = createMemo(() => (goal()?.pauseReason === "budget" ? " (token budget reached)" : ""))
+  const paused = createMemo(() => {
+    if (goal()?.pauseReason === "budget") return " (token budget reached)"
+    if (goal()?.pauseReason === "interrupted") return " (interrupted — /goal resume)"
+    return ""
+  })
+  const minimized = createMemo(() => {
+    const status = goal()?.status
+    return props.minimized || (status !== "active" && status !== "paused")
+  })
 
   const review = createMemo(() => {
     const status = goal()?.review?.status
@@ -54,18 +62,18 @@ export function GoalIndicator(props: { sessionID: string; minimized: boolean }) 
                     ? theme.warning
                     : theme.primary
             }
-            wrapMode={props.minimized ? "none" : "word"}
-            truncate={props.minimized}
+            wrapMode={minimized() ? "none" : "word"}
+            truncate={minimized()}
           >
             ◎ Goal {current().status}
             {paused()} · {goalDuration(current().time.elapsed)} · {Locale.number(current().turns)} turn
             {current().turns === 1 ? "" : "s"} · {Locale.number(current().tokensUsed)} tokens{review()}
             <span style={{ fg: theme.textMuted }}>
-              {props.minimized ? ` · ${current().objective}` : ""} · /goal · {shortcut()}{" "}
-              {props.minimized ? "expand" : "minimize"}
+              {minimized() ? ` · ${current().objective}` : ""} · /goal · {shortcut()}{" "}
+              {minimized() ? "expand" : "minimize"}
             </span>
           </text>
-          <Show when={!props.minimized}>
+          <Show when={!minimized()}>
             <text fg={theme.textMuted} wrapMode="word" maxHeight={maxHeight()}>
               {current().objective}
             </text>

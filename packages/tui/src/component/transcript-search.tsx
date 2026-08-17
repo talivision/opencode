@@ -123,7 +123,7 @@ export function TranscriptSearch(props: {
         placeholderColor={theme.textMuted}
       />
       <text fg={matches().length ? theme.text : theme.textMuted}>{counter()}</text>
-      <text fg={theme.textMuted}>enter next · esc close</text>
+      <text fg={theme.textMuted}>enter/up older · down newer · esc close</text>
     </box>
   )
 }

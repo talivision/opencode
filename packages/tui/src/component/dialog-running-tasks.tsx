@@ -47,17 +47,24 @@ export function DialogRunningTasks(props: { tasks: ToolPart[] }) {
   const options = createMemo<DialogSelectOption<string>[]>(() =>
     tasks().map((task) => {
       const isStopped = stopped().has(task.sessionID)
-      const busy = !isStopped && sync.data.session_status[task.sessionID]?.type === "busy"
+      const status = sync.data.session_status[task.sessionID]
+      const working = !isStopped && (status?.type === "busy" || status?.type === "retry")
       return {
         title: toStop() === task.sessionID ? "Press ctrl+d again to stop" : task.title,
         value: task.sessionID,
         description: isStopped
           ? "stopped"
-          : `${task.modelID} · ${goalDuration(Math.max(0, now() - task.start))} · ${busy ? "busy" : "idle"}`,
+          : `${task.modelID} · ${goalDuration(Math.max(0, now() - task.start))} · ${
+              status?.type === "retry"
+                ? `${status.message} · retrying in ${goalDuration(Math.max(0, status.next - now()))} (attempt ${status.attempt})`
+                : status?.type === "busy"
+                  ? "busy"
+                  : "idle"
+            }`,
         bg: toStop() === task.sessionID ? theme.error : undefined,
         gutter: isStopped
           ? () => <text fg={theme.textMuted}>■</text>
-          : busy
+          : working
             ? () => <Spinner />
             : () => <text fg={theme.success}>✓</text>,
       }
@@ -86,7 +93,7 @@ export function DialogRunningTasks(props: { tasks: ToolPart[] }) {
             !option ||
             stopped().has(option.value) ||
             stopping().has(option.value) ||
-            sync.data.session_status[option.value]?.type !== "busy",
+            !["busy", "retry"].includes(sync.data.session_status[option.value]?.type ?? "idle"),
           onTrigger: (option) => {
             if (toStop() !== option.value) {
               setToStop(option.value)
