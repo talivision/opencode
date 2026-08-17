@@ -4,12 +4,19 @@ import { useTheme } from "../context/theme"
 import { useDialog } from "../ui/dialog"
 import { DialogGoal } from "./dialog-goal"
 import { Locale } from "../util/locale"
+import { useTerminalDimensions } from "@opentui/solid"
+import { useTuiConfig } from "../config"
+import { useCommandShortcut } from "../keymap"
 
-export function GoalIndicator(props: { sessionID: string }) {
+export function GoalIndicator(props: { sessionID: string; minimized: boolean }) {
   const goals = useGoal()
   const goal = goals.get(props.sessionID)
   const { theme } = useTheme()
   const dialog = useDialog()
+  const dimensions = useTerminalDimensions()
+  const tuiConfig = useTuiConfig()
+  const shortcut = useCommandShortcut("goal.minimize")
+  const maxHeight = createMemo(() => tuiConfig.goal?.max_height ?? Math.max(3, Math.floor(dimensions().height / 4)))
 
   const paused = createMemo(() => (goal()?.pauseReason === "budget" ? " (token budget reached)" : ""))
 
@@ -47,16 +54,22 @@ export function GoalIndicator(props: { sessionID: string }) {
                     ? theme.warning
                     : theme.primary
             }
-            wrapMode="word"
+            wrapMode={props.minimized ? "none" : "word"}
+            truncate={props.minimized}
           >
             ◎ Goal {current().status}
             {paused()} · {goalDuration(current().time.elapsed)} · {Locale.number(current().turns)} turn
             {current().turns === 1 ? "" : "s"} · {Locale.number(current().tokensUsed)} tokens{review()}
-            <span style={{ fg: theme.textMuted }}> · /goal</span>
+            <span style={{ fg: theme.textMuted }}>
+              {props.minimized ? ` · ${current().objective}` : ""} · /goal · {shortcut()}{" "}
+              {props.minimized ? "expand" : "minimize"}
+            </span>
           </text>
-          <text fg={theme.textMuted} wrapMode="word">
-            {current().objective}
-          </text>
+          <Show when={!props.minimized}>
+            <text fg={theme.textMuted} wrapMode="word" maxHeight={maxHeight()}>
+              {current().objective}
+            </text>
+          </Show>
         </box>
       )}
     </Show>

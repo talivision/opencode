@@ -18,6 +18,8 @@
 #           ctrl+d action stops only the selected row and renders its stopped state
 #   ownership parent A owns A1; a fresh parent B is refused when it calls task(task_id=A1);
 #           foreign-owner half of steer, so both scenarios must be run together
+#   drop    the child provider stream drops mid-turn; the harness reprompts until
+#           task_done and only then delivers a completed notification
 #
 # Useful overrides:
 #   BIN=...     path to the compiled binary
@@ -39,9 +41,9 @@ WORK="${WORK:-${TMPDIR:-/tmp}/opencode-subagent-harness}"
 SOCK="${SOCK:-/tmp/opencode-subagent-harness.sock}"
 
 case "$SCENARIO" in
-  notify | steer | inspect | fanout | stop-one | ownership) ;;
+  notify | steer | inspect | fanout | stop-one | ownership | drop) ;;
   *)
-    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership> [seconds]" >&2
+    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership|drop> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -349,7 +351,7 @@ if [ "$SCENARIO" = "stop-one" ]; then
 fi
 
 case "$SCENARIO" in
-  fanout | stop-one | ownership)
+  fanout | stop-one | ownership | drop)
     echo "==> $SCENARIO assertions"
     node "$HERE/assert-scenarios.mjs" \
       "$SCENARIO" \

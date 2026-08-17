@@ -368,6 +368,30 @@ describe("SessionGoal", () => {
     }),
   )
 
+  it.live("tracks consecutive reminders and resets them on review request and finish", () =>
+    Effect.gen(function* () {
+      const { goal, sessionID } = yield* setup()
+      yield* goal.set({ sessionID, objective: "finish after programmatic reminders" })
+
+      expect((yield* goal.recordReminder(sessionID))?.reminderStreak).toBe(1)
+      expect((yield* goal.recordReminder(sessionID))?.reminderStreak).toBe(2)
+      expect((yield* goal.requestReview({ sessionID }))?.reminderStreak).toBe(0)
+
+      const reviewerID = SessionID.create()
+      yield* goal.beginReview(sessionID, reviewerID)
+      yield* goal.recordReminder(sessionID)
+      expect((yield* goal.get(sessionID))?.reminderStreak).toBe(1)
+      const finished = yield* goal.finishReview({
+        sessionID,
+        reviewerSessionID: reviewerID,
+        accepted: false,
+        reason: "one requirement remains",
+        tokens: 0,
+      })
+      expect(finished?.reminderStreak).toBe(0)
+    }),
+  )
+
   it.live("decodes a goal row written before requirements and attemptStats existed", () =>
     Effect.gen(function* () {
       const goal = yield* SessionGoal.Service
@@ -398,6 +422,7 @@ describe("SessionGoal", () => {
       const loaded = yield* goal.get(sessionID)
       expect(loaded?.objective).toBe("a goal stored before this tranche")
       expect(loaded?.requirements).toBeUndefined()
+      expect(loaded?.reminderStreak).toBeUndefined()
       expect(loaded?.review?.attemptStats).toBeUndefined()
       expect(loaded?.review?.history).toHaveLength(1)
       // And it stays writable through the new code paths.

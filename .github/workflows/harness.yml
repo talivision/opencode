@@ -110,8 +110,10 @@ jobs:
           # Ports and sockets are distinct so a leaked process from one
           # scenario cannot poison the next.
           run_scenario goal-harness retrieval 70 4901 12
+          run_scenario goal-harness unclaimed 40 4904 6
           run_scenario subagent-harness notify 45 4902 1
           run_scenario subagent-harness inspect 50 4903 2
+          run_scenario subagent-harness drop 45 4905 3
 
           exit "$fail"
 

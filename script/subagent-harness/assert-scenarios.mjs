@@ -1,4 +1,4 @@
-// Assertions for fanout, stop-one, and ownership.
+// Assertions for fanout, stop-one, ownership, and drop.
 //
 // Uses provider request logs plus SQLite's snake_case session_id, parent_id,
 // and message_id columns. stop-one also consumes the provider's live-state
@@ -78,7 +78,11 @@ if (scenario === "fanout") {
       childRequests.some((entry) => entry.model === model),
     ),
   )
-  check("all three completion notifications arrived at the parent", notifications.length === 3, `${notifications.length} notifications`)
+  check(
+    "all three completion notifications arrived at the parent",
+    notifications.length === 3,
+    `${notifications.length} notifications`,
+  )
 }
 
 if (scenario === "stop-one") {
@@ -118,25 +122,20 @@ if (scenario === "stop-one") {
     aborted.length === 1,
     `${aborted.length} MessageAbortedError sessions`,
   )
-  check(
-    "the other child remains live at the provider",
-    state?.activeChildModels?.length === 1,
-    JSON.stringify(state),
-  )
+  check("the other child remains live at the provider", state?.activeChildModels?.length === 1, JSON.stringify(state))
   check(
     "the stopped child is no longer live while the other model remains",
     state?.activeChildModels?.length === 1 &&
       children.some((row) => row.model_id === state.activeChildModels[0]) &&
       children.some((row) => row.id === aborted[0]?.session_id && row.model_id !== state.activeChildModels[0]),
   )
-  check(
-    "the running-tasks pane shows the stopped state",
-    panes.includes("stopped") || panes.includes("Task stopped"),
-  )
+  check("the running-tasks pane shows the stopped state", panes.includes("stopped") || panes.includes("Task stopped"))
 }
 
 if (scenario === "ownership") {
-  const roots = db.prepare("SELECT id, parent_id, title FROM session WHERE parent_id IS NULL ORDER BY time_created, id").all()
+  const roots = db
+    .prepare("SELECT id, parent_id, title FROM session WHERE parent_id IS NULL ORDER BY time_created, id")
+    .all()
   const children = db
     .prepare("SELECT id, parent_id, title FROM session WHERE parent_id IS NOT NULL AND title LIKE 'owned child task%'")
     .all()
@@ -159,7 +158,42 @@ if (scenario === "ownership") {
     `${refusals.length} refusal rows`,
   )
   check("the foreign prompt never reached A1", childRequests.length === 1, `${childRequests.length} child requests`)
-  check("the provider issued the explicit ownership probe", entries.some((entry) => entry.role === "ownership-attempt"))
+  check(
+    "the provider issued the explicit ownership probe",
+    entries.some((entry) => entry.role === "ownership-attempt"),
+  )
+}
+
+if (scenario === "drop") {
+  const childRequests = entries.filter((entry) => entry.role === "child")
+  const notifications = db
+    .prepare(
+      `SELECT json_extract(p.data, '$.text') AS text
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'user'
+         AND json_extract(p.data, '$.text') LIKE '%<task-notification task_id=%status="completed"%'`,
+    )
+    .all()
+  check(
+    "drop issued at least three child requests",
+    childRequests.length >= 3,
+    `${childRequests.length} child requests`,
+  )
+  check(
+    "drop third child request carries the missing-marker reprompt",
+    childRequests[2]?.doneMarkerMissing === true,
+    JSON.stringify(
+      childRequests.slice(0, 3).map((entry) => ({ n: entry.n, doneMarkerMissing: entry.doneMarkerMissing })),
+    ),
+  )
+  check(
+    "drop completion notification carries the task_done summary",
+    notifications.some((row) => row.text?.includes("recovered after provider stream drop")),
+    JSON.stringify(notifications),
+  )
 }
 
 db.close()

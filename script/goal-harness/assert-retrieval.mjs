@@ -44,6 +44,10 @@ check("reviewer requests were made", reviewer.length > 0, `${reviewer.length} re
 const seeds = bodies.filter((body) => body.includes("<parent-session-index>"))
 check("the reviewer seed carries the session index", seeds.length > 0)
 check(
+  "every retrieval review follows an explicit worker completion claim",
+  seeds.length > 0 && seeds.every((body) => body.includes(" goal [completed]")),
+)
+check(
   "the reviewer seed no longer inlines the parent transcript",
   !bodies.some((body) => body.includes("<parent-session-transcript>")),
 )

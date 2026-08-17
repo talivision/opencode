@@ -40,14 +40,18 @@ function systemMessage(entry) {
 }
 
 function reviewState(system) {
-  return /Independent review attempt \d+ did not accept completion:/.exec(system)?.[0] ??
+  return (
+    /Independent review attempt \d+ did not accept completion:/.exec(system)?.[0] ??
     /Independent review attempt \d+ is (?:pending|running)\./.exec(system)?.[0] ??
     "no-review"
+  )
 }
 
 function partRows(tool) {
   return db
-    .prepare("SELECT session_id, data FROM part WHERE json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.tool') = ?")
+    .prepare(
+      "SELECT session_id, data FROM part WHERE json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.tool') = ?",
+    )
     .all(tool)
     .map((row) => ({ sessionID: row.session_id, data: JSON.parse(row.data) }))
 }
@@ -79,25 +83,68 @@ const reviewers = entries.filter((entry) => entry.role === "reviewer")
 const goal = readGoal(goalDir)
 const db = new DatabaseSync(dbPath, { readOnly: true })
 
-if (scenario === "not_met_history") {
-  const third = JSON.stringify(workers[2]?.body ?? {})
-  check("the worker reached a third request", workers.length >= 3, `${workers.length} worker requests`)
-  check("the third worker request carries the active-goal status header", third.includes("Current active-goal status for this turn:"))
+if (scenario === "unclaimed") {
+  const firstReviewer = entries.findIndex((entry) => entry.role === "reviewer")
+  const secondWorker = entries.findIndex((entry) => entry.role === "worker" && entry.n === 2)
+  const reminder = "Your turn ended without calling the goal tool"
+  const reminderParts = db
+    .prepare(
+      "SELECT count(*) AS count FROM part WHERE json_extract(data, '$.type') = 'text' AND json_extract(data, '$.synthetic') = 1 AND json_extract(data, '$.text') LIKE ?",
+    )
+    .get(`%${reminder}%`)
+  const reviewSessions = db
+    .prepare("SELECT count(*) AS count FROM session WHERE parent_id IS NOT NULL AND title LIKE 'Goal review #1%'")
+    .get()
+  const reviewSeeds = reviewers.filter(
+    (entry) => !(entry.body.messages ?? []).some((message) => message.role === "tool"),
+  )
+  check("the first worker turn returned plain text without requesting completion", workers.length >= 2)
   check(
-    "the third worker request carries the latest rejection",
-    third.includes("beta regression remains unresolved after the latest worker turn"),
+    "no reviewer request ran before the reminder re-invoked the worker",
+    secondWorker > 0 && firstReviewer > secondWorker,
+    `second worker index ${secondWorker}, first reviewer index ${firstReviewer}`,
+  )
+  check("the unclaimed-turn reminder is persisted as a synthetic user part", reminderParts.count === 1)
+  check("the reminder reached the worker's second request", JSON.stringify(workers[1]?.body ?? {}).includes(reminder))
+  check(
+    "the later completion claim launched exactly one review attempt",
+    reviewSeeds.length === 1 && reviewSessions.count === 1,
+    `${reviewSeeds.length} seeds, ${reviewSessions.count} sessions`,
   )
   check(
-    "the third worker request carries the earlier rejection under the anti-cycling heading",
-    third.includes("Earlier attempts were also rejected") &&
-      third.includes("alpha evidence is missing from the authoritative state"),
+    "the structured review completes the goal and resets the reminder streak",
+    goal?.status === "complete" &&
+      goal.review?.status === "accepted" &&
+      goal.review?.attempt === 1 &&
+      !goal.reminderStreak,
+  )
+}
+
+if (scenario === "not_met_history") {
+  const later = workers.find((entry) => JSON.stringify(entry.body).includes("Earlier attempts were also rejected"))
+  const body = JSON.stringify(later?.body ?? {})
+  check(
+    "the worker reached a later request after two rejected attempts",
+    workers.length >= 5,
+    `${workers.length} worker requests`,
+  )
+  check(
+    "the later worker request carries the active-goal status header",
+    body.includes("Current active-goal status for this turn:"),
+  )
+  check(
+    "the later worker request carries the latest rejection",
+    body.includes("beta regression remains unresolved after the latest worker turn"),
+  )
+  check(
+    "the later worker request carries the earlier rejection under the anti-cycling heading",
+    body.includes("Earlier attempts were also rejected") &&
+      body.includes("alpha evidence is missing from the authoritative state"),
   )
 }
 
 if (scenario === "turns") {
-  const globCalls = workers.filter((entry) =>
-    JSON.stringify(entry.body).includes('"name":"glob"'),
-  )
+  const globCalls = workers.filter((entry) => JSON.stringify(entry.body).includes('"name":"glob"'))
   check("the worker made two glob tool-call steps", globCalls.length >= 2, `${globCalls.length} glob requests`)
   check("the multi-step worker turn is counted once", goal?.turns === 1, `turns=${goal?.turns}`)
 }
@@ -110,12 +157,14 @@ if (scenario === "interrupted") {
     .all()
   const firstReviewIndex = entries.findIndex((entry) => entry.role === "reviewer")
   const resumedIndex = entries.findIndex((entry) => entry.role === "worker" && entry.n === 2)
+  const claimIndex = entries.findIndex((entry) => entry.role === "worker" && entry.n === 3)
+  const followupIndex = entries.findIndex((entry) => entry.role === "worker" && entry.n === 4)
   check("the failed turn was durably recorded as interrupted", interrupted?.interrupted?.count === 1)
   check(
     "the durable interruption records the non-retryable provider error",
     interrupted?.interrupted?.reason?.includes("GOAL_HARNESS_PROVIDER_400"),
   )
-  check("the worker resumed after the failed turn", workers.length >= 2)
+  check("the worker resumed after the failed turn", workers.length === 4, `${workers.length} worker requests`)
   check(
     "the resumed worker request carries interruption context",
     resumed.includes("Current active-goal status for this turn:") &&
@@ -123,11 +172,15 @@ if (scenario === "interrupted") {
       resumed.includes("GOAL_HARNESS_PROVIDER_400"),
   )
   check(
-    "no reviewer ran for the failed turn",
-    firstReviewIndex > resumedIndex,
-    `resumed index ${resumedIndex}, first review request index ${firstReviewIndex}`,
+    "no reviewer ran before the recovered turn's claim follow-up ended",
+    resumedIndex >= 0 && claimIndex > resumedIndex && followupIndex > claimIndex && firstReviewIndex > followupIndex,
+    `resumed index ${resumedIndex}, claim index ${claimIndex}, follow-up index ${followupIndex}, first review request index ${firstReviewIndex}`,
   )
-  check("only the recovered clean turn created a reviewer child session", reviewRows.length === 1, `${reviewRows.length} rows`)
+  check(
+    "only the recovered clean turn created a reviewer child session",
+    reviewRows.length === 1,
+    `${reviewRows.length} rows`,
+  )
   // The accepting review is the last thing that may talk to the provider. A
   // request after it is a continuation issued against a goal that is already
   // complete: it carries no <active-goal> block (so it logs as auxiliary), it
@@ -156,7 +209,10 @@ if (scenario === "permission_blocked_pending") {
   // Each predicate has an opposing observable failure: a charged watchdog
   // changes the durable attempt/part to error, a missing gate leaves no running
   // read or waiting activity, and a UI regression removes the permission pane.
-  check("the same durable review attempt is still running", goal?.review?.status === "running" && goal.review.attempt === 1)
+  check(
+    "the same durable review attempt is still running",
+    goal?.review?.status === "running" && goal.review.attempt === 1,
+  )
   check(
     "the running review part is older than the configured 5s limits",
     running?.data.state.time?.start && Date.now() - running.data.state.time.start >= 7000,
@@ -171,16 +227,13 @@ if (scenario === "permission_blocked_pending") {
     "the reviewer read remains blocked on the controlled external file",
     reads.some(
       (part) =>
-        part.data.state.status === "running" &&
-        part.data.state.input?.filePath?.endsWith("/reviewer-outside.txt"),
+        part.data.state.status === "running" && part.data.state.input?.filePath?.endsWith("/reviewer-outside.txt"),
     ),
   )
   check(
     "no timeout error was recorded while permission was pending",
     !reviews.some(
-      (part) =>
-        part.data.state.status === "error" &&
-        String(part.data.state.error ?? "").includes("timed out"),
+      (part) => part.data.state.status === "error" && String(part.data.state.error ?? "").includes("timed out"),
     ) &&
       !goal?.review?.errorStreak &&
       !String(goal?.review?.reason ?? "").includes("timed out"),
@@ -197,8 +250,15 @@ if (scenario === "permission_blocked") {
   // These fail respectively if approval did not resume the child, if it timed
   // out/retried, if the read result never reached the reviewer, or if the parent
   // transcript did not receive the accepted verdict.
-  check("permission approval lets the review reach completion", goal?.status === "complete" && goal.review?.status === "accepted")
-  check("permission approval completes the original durable attempt", goal?.review?.attempt === 1, `attempt=${goal?.review?.attempt}`)
+  check(
+    "permission approval lets the review reach completion",
+    goal?.status === "complete" && goal.review?.status === "accepted",
+  )
+  check(
+    "permission approval completes the original durable attempt",
+    goal?.review?.attempt === 1,
+    `attempt=${goal?.review?.attempt}`,
+  )
   check(
     "the approved read result reached the reviewer as a tool result",
     readResults.some((output) => output.includes("GOAL_HARNESS_PERMISSION_APPROVED")),
@@ -215,7 +275,9 @@ if (scenario === "permission_blocked") {
   )
   check(
     "the completed permission-blocked review has no timeout part",
-    !reviews.some((part) => part.data.state.status === "error" && String(part.data.state.error ?? "").includes("timed out")),
+    !reviews.some(
+      (part) => part.data.state.status === "error" && String(part.data.state.error ?? "").includes("timed out"),
+    ),
   )
 }
 
@@ -278,7 +340,11 @@ if (scenario === "silent") {
   // than reviewer HTTP count also prevents SDK retries from masquerading as
   // separate goal-level review attempts.
   check("the silent reviewer still hits the inactivity watchdog", timedOut.length > 0)
-  check("silent-review continuation advances the durable attempt", goal?.review?.attempt >= 2, `attempt=${goal?.review?.attempt}`)
+  check(
+    "silent-review continuation advances the durable attempt",
+    goal?.review?.attempt >= 2,
+    `attempt=${goal?.review?.attempt}`,
+  )
   check(
     "the silent timeout is durably costed as a finished attempt",
     goal?.review?.attemptStats?.some((stat) => stat.durationMs >= 5000),

@@ -3,6 +3,7 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { PlanExitTool } from "./plan"
 import { Session } from "@/session/session"
+import type { SessionID } from "@/session/schema"
 import { QuestionTool } from "./question"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
@@ -10,6 +11,7 @@ import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
+import { TaskDoneTool } from "./task-done"
 import { TaskOutputTool } from "./task-output"
 import { TaskStopTool } from "./task-stop"
 import { Database } from "@opencode-ai/core/database/database"
@@ -97,6 +99,7 @@ export interface Interface {
     modelID: ModelV2.ID
     agent: Agent.Info
     permission?: PermissionV1.Ruleset
+    parentID?: SessionID
   }) => Effect.Effect<Tool.Def[]>
 }
 
@@ -114,6 +117,7 @@ const layer = Layer.effect(
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
+    const taskDone = yield* TaskDoneTool
     const taskOutput = yield* TaskOutputTool
     const taskStop = yield* TaskStopTool
     const read = yield* ReadTool
@@ -239,6 +243,7 @@ const layer = Layer.effect(
           edit: Tool.init(edit),
           write: Tool.init(writetool),
           task: Tool.init(task),
+          taskDone: Tool.init(taskDone),
           taskOutput: Tool.init(taskOutput),
           taskStop: Tool.init(taskStop),
           fetch: Tool.init(webfetch),
@@ -269,6 +274,7 @@ const layer = Layer.effect(
             tool.edit,
             tool.write,
             tool.task,
+            tool.taskDone,
             tool.taskOutput,
             tool.taskStop,
             tool.fetch,
@@ -353,6 +359,8 @@ const layer = Layer.effect(
         // config MAY rename a native agent, so keying on the name would let
         // any renamed native inherit the reviewer's tool surface.
         if (REVIEWER_ONLY_TOOLS.has(tool.id)) return input.agent.goalReviewer === true && input.agent.native === true
+        if (tool.id === TaskDoneTool.id)
+          return input.parentID !== undefined && input.agent.goalReviewer !== true && input.agent.hidden !== true
 
         const usePatch =
           input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")

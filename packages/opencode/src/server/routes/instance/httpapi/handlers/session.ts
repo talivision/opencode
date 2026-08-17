@@ -439,7 +439,26 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID; messageID: MessageID }
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* SessionError.mapBusy(runState.assertNotBusy(ctx.params.sessionID))
+      yield* runState.assertNotBusy(ctx.params.sessionID).pipe(
+        Effect.catchTag("SessionBusyError", (error) =>
+          Effect.gen(function* () {
+            const messages = yield* SessionError.mapStorageNotFound(
+              session.messages({ sessionID: ctx.params.sessionID }),
+            )
+            const target = messages.find((message) => message.info.id === ctx.params.messageID)
+            const lastAssistant = messages.findLast((message) => message.info.role === "assistant")?.info
+            // Only genuinely queued HUMAN input may be deleted while busy.
+            // Synthetic control messages (task notifications, goal reminders)
+            // also sort after the last assistant message, and deleting a
+            // queued task notification would discard the only delivery of a
+            // background child's result.
+            const human = target?.parts.some((part) => part.type === "text" && part.synthetic !== true) ?? false
+            if (target?.info.role === "user" && human && (!lastAssistant || target.info.id > lastAssistant.id))
+              return
+            return yield* SessionError.mapBusy(Effect.fail(error))
+          }),
+        ),
+      )
       yield* session.removeMessage(ctx.params)
       return true
     })

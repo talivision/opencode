@@ -12,7 +12,7 @@
 // env:
 //   PORT      listen port (default 4599)
 //   LOG       path to append one JSON line per request
-//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership (default notify)
+//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership | drop (default notify)
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
 import http from "node:http"
 import fs from "node:fs"
@@ -89,6 +89,10 @@ function toolReply(res, name, args, id = "call_1") {
   ])
 }
 
+function taskDoneReply(res, summary, id = `call_task_done_${childCount}`) {
+  toolReply(res, "task_done", { summary }, id)
+}
+
 function toolReplies(res, calls) {
   sse(res, [
     chunk({ delta: { role: "assistant" } }),
@@ -140,6 +144,61 @@ function slowTextReply(req, res, text, duration, track = false) {
     clearInterval(timer)
     if (track) firstChildOpen = false
   })
+}
+
+function slowTaskDoneReply(req, res, summary, duration) {
+  const input = JSON.stringify({ summary })
+  const split = Math.ceil(input.length / 2)
+  const id = `call_task_done_${childCount}`
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  res.write(`data: ${JSON.stringify(chunk({ delta: { role: "assistant" } }))}\n\n`)
+  const timer = setTimeout(() => {
+    res.write(
+      `data: ${JSON.stringify(
+        chunk({
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id,
+                type: "function",
+                function: { name: "task_done", arguments: "" },
+              },
+            ],
+          },
+        }),
+      )}\n\n`,
+    )
+    res.write(
+      `data: ${JSON.stringify(
+        chunk({ delta: { tool_calls: [{ index: 0, function: { arguments: input.slice(0, split) } }] } }),
+      )}\n\n`,
+    )
+    res.write(
+      `data: ${JSON.stringify(
+        chunk({ delta: { tool_calls: [{ index: 0, function: { arguments: input.slice(split) } }] } }),
+      )}\n\n`,
+    )
+    res.write(`data: ${JSON.stringify(chunk({ finish: "tool_calls", usage: USAGE }))}\n\n`)
+    res.write("data: [DONE]\n\n")
+    res.end()
+  }, duration)
+  res.on("close", () => clearTimeout(timer))
+}
+
+function dropReply(res, text) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  res.write(`data: ${JSON.stringify(chunk({ delta: { role: "assistant" } }))}\n\n`)
+  res.write(`data: ${JSON.stringify(chunk({ delta: { content: text } }))}\n\n`)
+  setImmediate(() => res.destroy())
 }
 
 function hang(req, res, model) {
@@ -228,26 +287,71 @@ const server = http.createServer(async (req, res) => {
   if (foundChildID) childID = foundChildID
 
   if (!isMainRequest) {
-    log({ role: isParent ? "parent-title" : isChild ? "child-title" : "auxiliary", scenario: SCENARIO, url: req.url, body: parsed })
-    textReply(res, isParent ? "Background investigation" : isChild ? "Cache investigation" : "Harness auxiliary request")
+    log({
+      role: isParent ? "parent-title" : isChild ? "child-title" : "auxiliary",
+      scenario: SCENARIO,
+      url: req.url,
+      body: parsed,
+    })
+    textReply(
+      res,
+      isParent ? "Background investigation" : isChild ? "Cache investigation" : "Harness auxiliary request",
+    )
     return
   }
 
   if (isChild) {
     childCount += 1
     const corrected = flat.includes("change of plan: only inspect the cache layer")
+    const doneMarkerMissing = flat.includes("done-marker-missing")
     log({
       role: "child",
       n: childCount,
       scenario: SCENARIO,
       marker: flat.includes(CHILD_MARKER),
       corrected,
+      doneMarkerMissing,
       model: parsed.model,
       url: req.url,
       body: parsed,
     })
+    if (flat.includes("Completion recorded. This task is now finished.")) {
+      textReply(res, "task completion confirmed")
+      return
+    }
+    if (SCENARIO === "drop") {
+      if (childCount === 1) {
+        dropReply(res, "partial child output before stream drop")
+        return
+      }
+      if (childCount === 2) {
+        textReply(res, "retry completed without the required marker")
+        return
+      }
+      if (doneMarkerMissing) {
+        taskDoneReply(res, "recovered after provider stream drop")
+        return
+      }
+    }
     if (SCENARIO === "steer" && corrected) {
-      textReply(res, "acknowledged mid-run correction")
+      const input = JSON.stringify({ summary: "acknowledged mid-run correction" })
+      sse(res, [
+        chunk({ delta: { role: "assistant" } }),
+        chunk({ delta: { content: "acknowledged mid-run correction" } }),
+        chunk({
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: `call_task_done_${childCount}`,
+                type: "function",
+                function: { name: "task_done", arguments: input },
+              },
+            ],
+          },
+        }),
+        chunk({ finish: "tool_calls", usage: USAGE }),
+      ])
       return
     }
     if (SCENARIO === "steer") {
@@ -262,7 +366,7 @@ const server = http.createServer(async (req, res) => {
       hang(req, res, parsed.model ?? "unknown")
       return
     }
-    slowTextReply(req, res, "child work finished", SCENARIO === "inspect" ? 15_000 : 8_000)
+    slowTaskDoneReply(req, res, "child work finished", SCENARIO === "inspect" ? 15_000 : 8_000)
     return
   }
 
@@ -273,7 +377,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   parentCount += 1
-  log({ role: isParentB ? "parent-b" : "parent", n: parentCount, scenario: SCENARIO, childID, url: req.url, body: parsed })
+  log({
+    role: isParentB ? "parent-b" : "parent",
+    n: parentCount,
+    scenario: SCENARIO,
+    childID,
+    url: req.url,
+    body: parsed,
+  })
 
   // Match the ENVELOPE, not the bare word. The task tool's description now
   // contains a literal <task-notification> tag as part of its anti-forgery

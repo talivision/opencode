@@ -60,6 +60,7 @@ import { LLMEvent } from "@opencode-ai/llm"
 import { SessionGoal } from "./goal"
 import { GoalManifest } from "./goal-manifest"
 import { GoalTranscriptTool } from "@/tool/goal-transcript"
+import { BackgroundJob } from "@/background/job"
 import { randomUUID } from "node:crypto"
 
 // @ts-ignore
@@ -228,6 +229,7 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const goal = yield* SessionGoal.Service
+    const background = yield* BackgroundJob.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -1144,6 +1146,12 @@ const layer = Layer.effect(
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)
+      // Genuine user input breaks an automatic-continuation sequence: without
+      // this, a goal that accumulated reminder backoff would keep pacing at
+      // the old streak long after the user re-engaged.
+      if (input.parts.some((part) => part.type === "text" && part.synthetic !== true)) {
+        yield* goal.clearReminderStreak(input.sessionID)
+      }
 
       const permissions: PermissionV1.Rule[] = []
       for (const [t, enabled] of Object.entries(input.tools ?? {})) {
@@ -1164,6 +1172,12 @@ const layer = Layer.effect(
       const msgs = yield* sessions.messages({ sessionID, limit: 1 }).pipe(Effect.orDie)
       if (msgs.length > 0) return msgs[0]
       throw new Error("Impossible")
+    })
+
+    const hasRunningChildren = Effect.fnUntraced(function* (sessionID: SessionID) {
+      return (yield* background.list()).some(
+        (job) => job.status === "running" && job.metadata?.parentSessionId === sessionID,
+      )
     })
 
     const continueGoal = Effect.fnUntraced(function* (sessionID: SessionID, lastUser: SessionV1.User) {
@@ -1221,6 +1235,22 @@ const layer = Layer.effect(
             ...earlier.map((entry) => `  - attempt #${entry.attempt}: ${entry.reason}`),
           )
         }
+      } else if (current.blocker) {
+        // The worker DID call the goal tool — status="blocked" — but the
+        // blocker has not yet reached the consecutive-turn threshold. Telling
+        // it that it never called the tool would contradict the transcript.
+        lines.push(
+          "Your blocker report was recorded but has not yet ended the goal — a blocker only takes effect after being reported on consecutive turns.",
+          "If the blocker is real and unresolvable, report the same blocker again; if you can make progress another way, continue working toward the goal now.",
+        )
+      } else {
+        lines.push(
+          "Your turn ended without calling the goal tool while this goal is still active.",
+          '- If the goal is complete, call the goal tool with status="complete" and a short evidence summary.',
+          '- If you are blocked on something only the user can resolve, call the goal tool with status="blocked" and the reason.',
+          "- Otherwise, continue working toward the goal now.",
+          "Asking the user a question does not end a goal; do not stop to await confirmation.",
+        )
       }
       if (current.interrupted) {
         lines.push(
@@ -1232,9 +1262,11 @@ const layer = Layer.effect(
           `Token budget is nearly exhausted (${current.tokensUsed} of ${current.tokenBudget} tokens used). Prioritize the smallest verifiable increment.`,
         )
       }
-      lines.push(
-        "Continue working toward the active goal. Re-read the active-goal context, inspect current state, and make the next meaningful increment of progress. Do not stop merely to report partial progress. Use the goal tool only when its completion or blocking rules are satisfied.",
-      )
+      if (review?.status === "rejected" || review?.status === "error") {
+        lines.push(
+          "Continue working toward the active goal. Re-read the active-goal context, inspect current state, and make the next meaningful increment of progress. Do not stop merely to report partial progress. Use the goal tool only when its completion or blocking rules are satisfied.",
+        )
+      }
       yield* createUserMessage({
         sessionID,
         agent: lastUser.agent,
@@ -1251,14 +1283,11 @@ const layer = Layer.effect(
           },
         ],
       }).pipe(Effect.orDie)
+      if (!review || !["rejected", "error"].includes(review.status)) yield* goal.recordReminder(sessionID)
       return true
     })
 
-    const reviewGoal = Effect.fnUntraced(function* (
-      sessionID: SessionID,
-      lastUser: SessionV1.User,
-      automatic: boolean,
-    ) {
+    const reviewGoal = Effect.fnUntraced(function* (sessionID: SessionID, lastUser: SessionV1.User) {
       let current = yield* goal.get(sessionID)
       if (current?.review?.status === "running") {
         const orphan = current.review.reviewerSessionID
@@ -1299,17 +1328,8 @@ const layer = Layer.effect(
             .pipe(Effect.ignore)
         }
       }
-      // Claude's Stop hook evaluates on EVERY stop attempt, not only when the
-      // model volunteers that it is done. If the turn is ending with an active
-      // goal and no review pending, request one implicitly so the model cannot
-      // decide whether verification happens.
-      if (automatic && current?.status === "active" && current?.review?.status !== "pending") {
-        current = yield* goal.requestReview({
-          sessionID,
-          evidence: "The assistant ended its latest turn while this goal remained active.",
-        })
-      }
       if (current?.review?.status !== "pending") return
+      if (yield* hasRunningChildren(sessionID)) return
       const reviewer = yield* agents.get("goal-reviewer")
       if (!reviewer) {
         yield* Effect.logError("goal reviewer agent is unavailable", { "session.id": sessionID })
@@ -1823,28 +1843,36 @@ const layer = Layer.effect(
             // Tokens were already accumulated per step.
             if (goalBoundaryPending) {
               goalBoundaryPending = false
-              // Counted even when the goal completed mid-turn (a review accepted
-              // during the turn): the turn still happened. Post-completion turns
-              // can never be counted here because the flag is only set by steps
-              // that ran under an active goal.
+              // Count the completed worker turn before the boundary review can
+              // accept it. Post-completion turns can never be counted here
+              // because the flag is only set by steps that ran under an active
+              // goal.
               yield* goal.recordTurn({ sessionID, tokens: 0, completed: true })
             }
-            yield* reviewGoal(sessionID, lastUser, true)
-            if (yield* continueGoal(sessionID, lastUser)) {
+            const waitingForChildren = yield* hasRunningChildren(sessionID)
+            if (!waitingForChildren) yield* reviewGoal(sessionID, lastUser)
+            if (!waitingForChildren && (yield* continueGoal(sessionID, lastUser))) {
               // Repeated review errors pace the loop exactly like repeated
               // provider failures: first error continues immediately, then 5s
               // doubling to the 5 minute ceiling. Without this, a reviewer
               // that keeps failing to produce a verdict re-reviews hundreds of
               // times a minute (observed 337 attempts in 30s in the TUI
               // harness before this guard).
-              const review = (yield* goal.get(sessionID))?.review
+              const current = yield* goal.get(sessionID)
+              const review = current?.review
               const streak = review?.status === "error" ? (review.errorStreak ?? 0) : 0
-              const wait = goalContinueBackoffMs(streak)
+              const reminderStreak = current?.reminderStreak ?? 0
+              const reviewWait = goalContinueBackoffMs(streak)
+              const reminderWait = goalContinueBackoffMs(reminderStreak)
+              const wait = Math.max(reviewWait, reminderWait)
               if (wait > 0) {
                 yield* status.set(sessionID, {
                   type: "retry",
-                  attempt: streak,
-                  message: review?.reason ?? "Independent review keeps failing",
+                  attempt: Math.max(streak, reminderStreak),
+                  message:
+                    reviewWait >= reminderWait
+                      ? (review?.reason ?? "Independent review keeps failing")
+                      : "Goal reminder rate limit",
                   next: (yield* Clock.currentTimeMillis) + wait,
                 })
                 yield* Effect.sleep(`${wait} millis`)
@@ -2075,6 +2103,7 @@ const layer = Layer.effect(
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
+          const interrupted = handle.message.error ? formatMessageError(handle.message.error) : undefined
           if (goalTurn) {
             // A turn that died on a provider error, an exhausted retry, or an
             // abort never claimed completion, so there is nothing to verify.
@@ -2083,7 +2112,6 @@ const layer = Layer.effect(
             // rate limited — and overwrites review.reason with a verdict about a
             // turn that never happened. Skip the review and tell the worker to
             // carry on instead.
-            const interrupted = handle.message.error ? formatMessageError(handle.message.error) : undefined
             const updated = yield* goal.recordTurn({
               sessionID,
               tokens: Math.max(0, handle.message.tokens.output + handle.message.tokens.reasoning),
@@ -2097,29 +2125,35 @@ const layer = Layer.effect(
             // An interrupted turn defers even an already-pending review (one the
             // worker requested before the provider died): the reviewer would run
             // against the same failing provider. The review stays pending and
-            // runs at the next clean turn boundary.
-            if (!interrupted) yield* reviewGoal(sessionID, lastUser, outcome === "break")
+            // runs at the next clean turn boundary below.
             if (interrupted && updated?.interrupted) {
               goalBackoff = { count: updated.interrupted.count, reason: updated.interrupted.reason }
             }
           }
           if (outcome === "break") {
-            if (yield* continueGoal(sessionID, lastUser)) {
-              if (goalBackoff) {
-                const wait = goalContinueBackoffMs(goalBackoff.count)
-                if (wait > 0) {
-                  // Reuses the in-turn retry status so the TUI shows the same
-                  // countdown it shows for provider retries within a turn.
-                  yield* status.set(sessionID, {
-                    type: "retry",
-                    attempt: goalBackoff.count,
-                    message: goalBackoff.reason,
-                    next: (yield* Clock.currentTimeMillis) + wait,
-                  })
-                  yield* Effect.sleep(`${wait} millis`)
-                }
-                goalBackoff = undefined
+            const waitingForChildren = yield* hasRunningChildren(sessionID)
+            if (!interrupted && !waitingForChildren) yield* reviewGoal(sessionID, lastUser)
+            if (!waitingForChildren && (yield* continueGoal(sessionID, lastUser))) {
+              // Break turns pace reminders exactly like clean exits do:
+              // without this, repeated permission denials re-inject the
+              // unclaimed reminder with no backoff at all.
+              const reminderStreak = (yield* goal.get(sessionID))?.reminderStreak ?? 0
+              const interruptWait = goalBackoff ? goalContinueBackoffMs(goalBackoff.count) : 0
+              const reminderWait = goalContinueBackoffMs(reminderStreak)
+              const wait = Math.max(interruptWait, reminderWait)
+              if (wait > 0) {
+                // Reuses the in-turn retry status so the TUI shows the same
+                // countdown it shows for provider retries within a turn.
+                yield* status.set(sessionID, {
+                  type: "retry",
+                  attempt: goalBackoff && interruptWait >= reminderWait ? goalBackoff.count : reminderStreak,
+                  message:
+                    goalBackoff && interruptWait >= reminderWait ? goalBackoff.reason : "Goal reminder rate limit",
+                  next: (yield* Clock.currentTimeMillis) + wait,
+                })
+                yield* Effect.sleep(`${wait} millis`)
               }
+              goalBackoff = undefined
               step = 0
               continue
             }
@@ -2427,6 +2461,7 @@ export const node = LayerNode.make({
     RuntimeFlags.node,
     Database.node,
     SessionGoal.node,
+    BackgroundJob.node,
   ],
 })
 

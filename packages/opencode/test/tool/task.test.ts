@@ -19,6 +19,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { TaskDoneTool } from "../../src/tool/task-done"
 import { ToolJsonSchema } from "../../src/tool/json-schema"
 import { TaskOutputTool } from "../../src/tool/task-output"
 import { TaskStopTool } from "../../src/tool/task-stop"
@@ -164,11 +165,128 @@ function reply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithPa
         type: "text",
         text,
       },
+      {
+        id: PartID.ascending(),
+        messageID: id,
+        sessionID: input.sessionID,
+        type: "tool",
+        callID: `call_${id}`,
+        tool: TaskDoneTool.id,
+        state: {
+          status: "completed",
+          input: { summary: text },
+          output: "Completion recorded. This task is now finished.",
+          title: "Completion recorded",
+          metadata: {},
+          time: { start: Date.now(), end: Date.now() },
+        },
+      },
     ],
   }
 }
 
+function textReply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithParts {
+  const result = reply(input, text)
+  return { ...result, parts: result.parts.filter((part) => part.type !== "tool") }
+}
+
 describe("tool.task", () => {
+  it.instance("task_done refuses top-level sessions and empty summaries", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({ title: "Top-level" })
+      const child = yield* sessions.create({ parentID: parent.id, title: "Child" })
+      const tool = yield* TaskDoneTool
+      const def = yield* tool.init()
+      const context = (sessionID: SessionID) => ({
+        sessionID,
+        messageID: MessageID.ascending(),
+        agent: "general",
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      })
+
+      const topLevel = yield* def.execute({ summary: "finished" }, context(parent.id))
+      const empty = yield* def.execute({ summary: "   " }, context(child.id))
+
+      expect(topLevel.title).toBe("No parent task")
+      expect(topLevel.output).toContain("top-level session")
+      expect(empty.title).toBe("Summary missing")
+      expect(empty.output).toContain("Call task_done again")
+    }),
+  )
+
+  it.instance("registry exposes task_done only to normal subagent children", () =>
+    Effect.gen(function* () {
+      const agents = yield* Agent.Service
+      const registry = yield* ToolRegistry.Service
+      const build = yield* agents.get("build")
+      if (!build) throw new Error("build agent not found")
+      const ids = (agent: Agent.Info, parentID?: SessionID) =>
+        registry.tools({ ...ref, agent, parentID }).pipe(Effect.map((tools) => tools.map((tool) => tool.id)))
+
+      expect(yield* ids(build)).not.toContain(TaskDoneTool.id)
+      expect(yield* ids({ ...build, goalReviewer: true }, SessionID.make("ses_parent"))).not.toContain(TaskDoneTool.id)
+      expect(yield* ids({ ...build, hidden: true }, SessionID.make("ses_parent"))).not.toContain(TaskDoneTool.id)
+      expect(yield* ids(build, SessionID.make("ses_parent"))).toContain(TaskDoneTool.id)
+    }),
+  )
+
+  it.instance("reprompts immediately until task_done and returns its summary", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const promptOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) =>
+          Effect.sync(() => {
+            prompts.push(input)
+            if (prompts.length === 1) return textReply(input, "partial response before provider drop")
+            return reply(input, "recovered completion summary")
+          }),
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "recover dropped child",
+          prompt: "inspect the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(prompts).toHaveLength(2)
+      expect(prompts[0]?.parts).toContainEqual({
+        type: "text",
+        synthetic: true,
+        text: "<subagent-contract>When you have fully completed this task, call task_done with a summary of the outcome as your FINAL tool call. Your work is not considered finished until you do. If you cannot finish, still call task_done and explain why in the summary.</subagent-contract>",
+      })
+      expect(prompts[1]?.parts).toEqual([
+        {
+          type: "text",
+          synthetic: true,
+          text: "<done-marker-missing>Your previous turn ended without a task_done call. If the task is finished, call task_done with your summary now. If it is not finished, continue working and call task_done when it is.</done-marker-missing>",
+        },
+      ])
+      expect(result.output).toContain("recovered completion summary")
+      expect(result.output).not.toContain("partial response before provider drop")
+    }),
+  )
+
   it.instance(
     "description sorts subagents by name and is stable across calls",
     () =>

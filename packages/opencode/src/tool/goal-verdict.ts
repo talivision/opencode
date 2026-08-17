@@ -21,7 +21,10 @@ export const Parameters = Schema.Struct({
         }),
       ),
     ),
-  ).annotate({ description: "Every unmet requirement, with evidence. Required when met is false." }),
+  ).annotate({
+    description:
+      "Every unmet requirement, with evidence. Required whenever met=false. Populate it on your first call; a rejection without unmet entries is refused.",
+  }),
   requirements: Schema.optional(
     Schema.mutable(
       Schema.Array(

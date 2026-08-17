@@ -248,7 +248,11 @@ it.instance("task_output snapshots running and completed task transcripts", () =
     })
     yield* llm.pushMatch(
       (hit) => lastUserIncludes(hit, `child work ${marker}`),
-      reply().wait(deferredAsPromise(gate)).text("final child text").stop(),
+      reply().wait(deferredAsPromise(gate)).text("final child text").tool("task_done", { summary: "final child text" }),
+    )
+    yield* llm.textMatch(
+      (hit) => JSON.stringify(hit.body).includes("Completion recorded. This task is now finished."),
+      "final child text",
     )
     yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("Background task started"), "parent continues")
     yield* promptParent(parent.id, marker)

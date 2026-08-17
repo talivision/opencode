@@ -16,7 +16,7 @@
 //   WORKER_INPUT/OUTPUT   fake worker usage (default 9000 / 4)
 //   REVIEWER_INPUT/OUTPUT fake reviewer usage (default 12000 / 58)
 //   REVIEWER_MODE         met | not_met | not_met_history | turns | interrupted | cache-stable | goal-events |
-//                         met_tool | not_met_tool | retrieval | permission_blocked | goal_check | invalid |
+//                         met_tool | not_met_tool | unclaimed | retrieval | permission_blocked | goal_check | invalid |
 //                         silent | slow | busy | http500
 //   REVIEWER_NOT_MET_N    first N reviews return NOT_MET, then MET (default 0)
 //   REVIEWER_READ_PATH    controlled absolute path read by permission_blocked
@@ -131,6 +131,16 @@ function hasTool(parsed, name) {
 
 function toolResult(parsed, callID) {
   return parsed.messages?.find((message) => message.role === "tool" && message.tool_call_id === callID)
+}
+
+function lastToolResultIs(parsed, name) {
+  const last = parsed.messages?.at(-1)
+  if (last?.role !== "tool") return false
+  return parsed.messages?.some(
+    (message) =>
+      message.role === "assistant" &&
+      message.tool_calls?.some((call) => call.id === last.tool_call_id && call.function?.name === name),
+  )
 }
 
 export function classifyRequest(parsed) {
@@ -268,22 +278,10 @@ const server = http.createServer(async (req, res) => {
       return
     }
     if (exact) {
-      toolReply(
-        res,
-        "goal_check",
-        { command: "printf goal-check-ok-extra" },
-        REVIEWER_USAGE,
-        "call_goal_check_refused",
-      )
+      toolReply(res, "goal_check", { command: "printf goal-check-ok-extra" }, REVIEWER_USAGE, "call_goal_check_refused")
       return
     }
-    toolReply(
-      res,
-      "goal_check",
-      { command: "printf goal-check-ok" },
-      REVIEWER_USAGE,
-      "call_goal_check_exact",
-    )
+    toolReply(res, "goal_check", { command: "printf goal-check-ok" }, REVIEWER_USAGE, "call_goal_check_exact")
     return
   }
 
@@ -353,18 +351,14 @@ const server = http.createServer(async (req, res) => {
         reviewCount === 1
           ? "alpha evidence is missing from the authoritative state"
           : "beta regression remains unresolved after the latest worker turn"
-      textReply(
-        res,
-        `Checked the transcript and current state.\nVERDICT: NOT_MET ${nonce} ${reason}`,
-        REVIEWER_USAGE,
-      )
+      textReply(res, `Checked the transcript and current state.\nVERDICT: NOT_MET ${nonce} ${reason}`, REVIEWER_USAGE)
       return
     }
     const met =
       ["met", "met_tool", "not_met_history", "turns", "interrupted", "cache-stable", "goal-events"].includes(
         REVIEWER_MODE,
       ) || reviewCount > REVIEWER_NOT_MET_N
-    if (REVIEWER_MODE === "met_tool" || REVIEWER_MODE === "not_met_tool") {
+    if (["met_tool", "not_met_tool", "unclaimed"].includes(REVIEWER_MODE)) {
       const verdictArguments = met
         ? '{"met": true, "summary": "tool verdict: objective verified against current state", "unmet": []}'
         : '{"met": false, "summary": "tool verdict: not yet met", "unmet": [{"requirement": "say lima twice", "evidence": "only one lima found in the transcript"}]}'
@@ -418,6 +412,10 @@ const server = http.createServer(async (req, res) => {
     url: req.url,
     body: parsed,
   })
+  if (lastToolResultIs(parsed, "goal")) {
+    textReply(res, "Claim submitted; awaiting review.", WORKER_USAGE)
+    return
+  }
   if (REVIEWER_MODE === "cache-stable" && workerCount === 1) {
     // End one goal turn before any review. The continuation must carry the
     // interruption in its user message without perturbing the cached system
@@ -435,6 +433,10 @@ const server = http.createServer(async (req, res) => {
     // A normal, finite stream with enough duration for drive.sh to snapshot the
     // durable interrupted record before the clean turn clears it.
     slowTextReply(req, res, "worker resumed after the provider error", 4_000)
+    return
+  }
+  if (REVIEWER_MODE === "unclaimed" && workerCount === 1) {
+    textReply(res, "First turn ended without a completion claim.", WORKER_USAGE)
     return
   }
   if (
@@ -455,7 +457,13 @@ const server = http.createServer(async (req, res) => {
     )
     return
   }
-  textReply(res, WORKER_TEXT, WORKER_USAGE)
+  toolReply(
+    res,
+    "goal",
+    { status: "complete", reason: `${WORKER_TEXT}: current-state evidence gathered by worker turn ${workerCount}` },
+    WORKER_USAGE,
+    `call_goal_complete_${workerCount}`,
+  )
 })
 
 if (process.env.CLASSIFIER_SELF_TEST === "1") {
@@ -490,7 +498,18 @@ if (process.env.CLASSIFIER_SELF_TEST === "1") {
     console.log(`${actual === item.expected ? "ok" : "not ok"} ${item.name}: ${actual}`)
     return actual !== item.expected
   })
-  process.exit(failed.length ? 1 : 0)
+  const goalFollowup = {
+    messages: [
+      {
+        role: "assistant",
+        tool_calls: [{ id: "call_goal", type: "function", function: { name: "goal", arguments: "{}" } }],
+      },
+      { role: "tool", tool_call_id: "call_goal", content: "Completion is pending independent review." },
+    ],
+  }
+  const followsGoal = lastToolResultIs(goalFollowup, "goal")
+  console.log(`${followsGoal ? "ok" : "not ok"} goal tool-result follow-up: ${followsGoal}`)
+  process.exit(failed.length || !followsGoal ? 1 : 0)
 } else {
   server.listen(PORT, "127.0.0.1", () => {
     console.log(`fake provider listening on http://127.0.0.1:${PORT}`)

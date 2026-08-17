@@ -812,7 +812,7 @@ it.instance("static loop consumes queued replies across turns", () =>
   }),
 )
 
-it.instance("active goals are independently reviewed after every provider turn until accepted", () =>
+it.instance("active goals are independently reviewed only after completion claims until accepted", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -830,13 +830,20 @@ it.instance("active goals are independently reviewed after every provider turn u
       parts: [{ type: "text", text: "start the durable goal" }],
     })
     yield* goals.set({ sessionID: session.id, objective: "continue once, then finish" })
-    yield* llm.text("First increment complete.", { usage: { input: 20, output: 5 } })
+    yield* llm.push(
+      reply()
+        .text("First increment complete.")
+        .tool("goal", { status: "complete", reason: "first increment evidence" })
+        .usage({ input: 20, output: 5 }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom((hit) => {
       const input = JSON.stringify(hit.body)
       const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(input)?.[1]
       return `VERDICT: NOT_MET ${nonce} another increment is still required`
     })
     yield* llm.tool("goal", { status: "complete" })
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom(
       (hit) => {
         const input = JSON.stringify(hit.body)
@@ -849,7 +856,7 @@ it.instance("active goals are independently reviewed after every provider turn u
     const result = yield* prompt.loop({ sessionID: session.id })
     const goal = yield* goals.get(session.id)
     const messages = yield* sessions.messages({ sessionID: session.id })
-    expect(yield* llm.calls).toBe(5)
+    expect(yield* llm.calls).toBe(6)
     expect(goal?.status).toBe("complete")
     expect(goal?.review?.status).toBe("accepted")
     expect(goal?.turns).toBe(2)
@@ -877,10 +884,10 @@ it.instance("active goals are independently reviewed after every provider turn u
     expect(JSON.stringify(inputs[0])).toContain("continue once, then finish")
     // The reviewer is seeded with an index of the parent session, not the
     // parent session itself.
-    expect(JSON.stringify(inputs[1])).not.toContain("<parent-session-transcript>")
-    expect(JSON.stringify(inputs[1])).toContain("<parent-session-index>")
-    expect(JSON.stringify(inputs[1])).toContain("First increment complete.")
-    expect(JSON.stringify(inputs[1])).toContain("<goal-requirements>")
+    expect(JSON.stringify(inputs[2])).not.toContain("<parent-session-transcript>")
+    expect(JSON.stringify(inputs[2])).toContain("<parent-session-index>")
+    expect(JSON.stringify(inputs[2])).toContain("First increment complete.")
+    expect(JSON.stringify(inputs[2])).toContain("<goal-requirements>")
 
     const reviewers = yield* sessions.children(session.id)
     expect(reviewers).toHaveLength(2)
@@ -952,12 +959,14 @@ it.instance("a rejected completion review keeps the goal active until a later re
     })
     yield* goals.set({ sessionID: session.id, objective: "produce authoritative verification evidence" })
     yield* llm.tool("goal", { status: "complete", reason: "unverified worker claim" })
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom((hit) => {
       const input = JSON.stringify(hit.body)
       const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(input)?.[1]
       return `VERDICT: NOT_MET ${nonce} authoritative evidence is missing`
     })
     yield* llm.tool("goal", { status: "complete", reason: "authoritative evidence gathered" })
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom((hit) => {
       const input = JSON.stringify(hit.body)
       const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(input)?.[1]
@@ -1007,12 +1016,24 @@ it.instance("an accepted review after a continuation ends the run without one mo
       parts: [{ type: "text", text: "work the goal until the reviewer accepts" }],
     })
     yield* goals.set({ sessionID: session.id, objective: "stop the moment the reviewer accepts" })
-    yield* llm.text("First increment done.", { usage: { input: 20, output: 5 } })
+    yield* llm.push(
+      reply()
+        .text("First increment done.")
+        .tool("goal", { status: "complete", reason: "first increment evidence" })
+        .usage({ input: 20, output: 5 }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom((hit) => {
       const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
       return `VERDICT: NOT_MET ${nonce} one more increment is required`
     })
-    yield* llm.text("Second increment done.", { usage: { input: 20, output: 5 } })
+    yield* llm.push(
+      reply()
+        .text("Second increment done.")
+        .tool("goal", { status: "complete", reason: "second increment evidence" })
+        .usage({ input: 20, output: 5 }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom((hit) => {
       const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
       return `VERDICT: MET ${nonce} objective independently verified`
@@ -1023,21 +1044,35 @@ it.instance("an accepted review after a continuation ends the run without one mo
     const goal = yield* goals.get(session.id)
     expect(goal?.status).toBe("complete")
     expect(goal?.review?.status).toBe("accepted")
-    // Two worker turns and two reviews. A third worker request here means the
-    // accepted goal re-sent the already-answered continuation.
-    expect(yield* llm.calls).toBe(4)
+    // Two worker turns, each with a claim step and the protocol-required
+    // follow-up, plus two reviews. A seventh request here means the accepted
+    // goal re-sent the already-answered continuation.
+    expect(yield* llm.calls).toBe(6)
     expect(yield* llm.pending).toBe(0)
     // The accepting review is the last thing that talks to the provider.
     const inputs = yield* llm.inputs
     expect(JSON.stringify(inputs.at(-1))).toContain("<parent-session-index>")
+    // Every request after the continuation carries it in its history, so count
+    // continuation USER MESSAGES in the last worker request's transcript
+    // rather than counting requests: two messages there means the accepted
+    // goal re-sent the already-answered continuation.
+    const workerInputs = inputs.filter((input) =>
+      JSON.stringify(input).includes("Continue working toward the active goal"),
+    )
+    expect(workerInputs.length).toBeGreaterThan(0)
+    const lastWorker = workerInputs.at(-1) as { messages?: { role?: string; content?: unknown }[] }
     expect(
-      inputs.filter((input) => JSON.stringify(input).includes("Continue working toward the active goal")),
+      (lastWorker.messages ?? []).filter(
+        (message) =>
+          message.role === "user" &&
+          JSON.stringify(message.content ?? "").includes("Continue working toward the active goal"),
+      ),
     ).toHaveLength(1)
     // Only real working turns are counted.
     expect(goal?.turns).toBe(2)
 
     const messages = yield* sessions.messages({ sessionID: session.id })
-    expect(messages.filter((message) => message.info.role === "assistant")).toHaveLength(2)
+    expect(messages.filter((message) => message.info.role === "assistant")).toHaveLength(4)
   }),
 )
 
@@ -1071,7 +1106,12 @@ it.instance("reviewers index the parent session, retrieve on demand, and hand co
     const saw = (hit: { body: unknown }, value: string) => flat(hit).includes(value)
 
     yield* llm.toolMatch(isWorker, "goal", { status: "complete", reason: "lima was said once" })
-    yield* llm.textMatch(isWorker, "Second proof added.")
+    yield* llm.textMatch(isWorker, "Claim submitted; awaiting review.")
+    yield* llm.pushMatch(
+      isWorker,
+      reply().text("Second proof added.").tool("goal", { status: "complete", reason: "both proofs are present" }),
+    )
+    yield* llm.textMatch(isWorker, "Claim submitted; awaiting review.")
 
     yield* llm.toolMatch((hit) => first(hit) && !saw(hit, "Checklist recorded"), "goal_checklist", {
       requirements: [
@@ -1238,6 +1278,7 @@ reviewerTimeout.instance("a hanging reviewer times out, remains inspectable, and
       tokenBudget: 1,
     })
     yield* llm.tool("goal", { status: "complete", reason: "lima was spoken" })
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.hang
     yield* llm.text("Worker resumed after the reviewer timeout.", { usage: { input: 10, output: 1 } })
 
@@ -1302,6 +1343,7 @@ reviewerTimeout.instance("a reviewer blocked on an unanswered permission is not 
     })
     yield* goals.set({ sessionID: session.id, objective: "verify a reviewer that stops on a human, not on a stall" })
     yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    yield* llm.text("Claim submitted; awaiting review.")
     // The reviewer's first act blocks on a permission nobody is there to answer.
     yield* llm.tool("read", { filePath: credentialProbe })
     yield* llm.textFrom((hit) => {
@@ -1374,6 +1416,7 @@ reviewerTimeout.instance("the inactivity timer resumes once the permission is an
       tokenBudget: 1,
     })
     yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.tool("read", { filePath: credentialProbe })
     // Answered, then genuinely stalls: the suspended window has to start ticking
     // again, otherwise one permission would buy immunity for the whole review.
@@ -1419,6 +1462,7 @@ it.instance("goal review limits fall back to config when the env override is uns
       tokenBudget: 1,
     })
     yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.hang
     yield* llm.text("Worker resumed after the reviewer timeout.", { usage: { input: 10, output: 1 } })
 
@@ -1453,6 +1497,7 @@ reviewerTimeout.instance("the goal review env override wins over config", () =>
       tokenBudget: 1,
     })
     yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.hang
     yield* llm.text("Worker resumed after the reviewer timeout.", { usage: { input: 10, output: 1 } })
 
@@ -1487,6 +1532,7 @@ reviewerHardCap.instance("a reviewer that stays busy is stopped by the total-dur
       tokenBudget: 1,
     })
     yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+    yield* llm.text("Claim submitted; awaiting review.")
     // Never emits a verdict, but never goes quiet either, so the inactivity
     // watchdog keeps being reset and only the hard cap can stop it.
     yield* llm.textChunksFrom(() => Array.from({ length: 200 }, (_, index) => `still working ${index}\n`), {
@@ -1525,6 +1571,7 @@ reviewerPaced.instance(
       })
       yield* goals.set({ sessionID: session.id, objective: "verify a slow but continuously active reviewer" })
       yield* llm.tool("goal", { status: "complete", reason: "worker claims completion" })
+      yield* llm.text("Claim submitted; awaiting review.")
       // Streams for ~6x the inactivity window, but never stops producing output.
       // Text deltas are broadcast as part deltas and only land in the part row at
       // text-end, so a poll-only watchdog sees this reviewer as idle and kills it.
@@ -1662,6 +1709,95 @@ it.instance(
   15_000,
 )
 
+it.instance("an unclaimed goal turn persists a reminder without spawning a reviewer", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Goal unclaimed reminder",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "continue the goal without claiming completion" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "keep working until explicitly complete" })
+    yield* llm.text("I stopped without using the goal tool.")
+    yield* llm.hang
+
+    const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(2), "timed out waiting for reminder continuation", "10 seconds")
+
+    const goal = yield* goals.get(session.id)
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const reminder = messages.find(
+      (message) =>
+        message.info.role === "user" &&
+        message.parts.some(
+          (part) =>
+            part.type === "text" &&
+            part.synthetic === true &&
+            part.text.includes("Your turn ended without calling the goal tool"),
+        ),
+    )
+    expect(goal?.review).toBeUndefined()
+    expect(goal?.reminderStreak).toBe(1)
+    expect(reminder).toBeDefined()
+    expect(yield* sessions.children(session.id)).toHaveLength(0)
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+it.instance("a running background child defers pending review and goal continuation", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const goals = yield* SessionGoal.Service
+    const sessions = yield* Session.Service
+    const background = yield* BackgroundJob.Service
+    const session = yield* sessions.create({
+      title: "Goal waiting for background child",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "wait for the background child" }],
+    })
+    yield* goals.set({ sessionID: session.id, objective: "incorporate the background child's result" })
+    yield* goals.requestReview({ sessionID: session.id, evidence: "premature completion claim" })
+    const job = yield* background.start({
+      id: "goal-running-child",
+      type: "task",
+      metadata: { parentSessionId: session.id },
+      run: Effect.never,
+    })
+    yield* Effect.addFinalizer(() => background.cancel(job.id).pipe(Effect.ignore))
+    yield* llm.text("Waiting for the child notification.")
+
+    yield* prompt.loop({ sessionID: session.id })
+
+    const goal = yield* goals.get(session.id)
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    expect(goal?.review?.status).toBe("pending")
+    expect(goal?.reminderStreak).toBe(0)
+    expect(yield* sessions.children(session.id)).toHaveLength(0)
+    expect(
+      messages.some(
+        (message) =>
+          message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.synthetic === true),
+      ),
+    ).toBe(false)
+  }),
+)
+
 it.instance("the reviewer accepts through the goal_verdict tool without a nonce line", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -1680,7 +1816,13 @@ it.instance("the reviewer accepts through the goal_verdict tool without a nonce 
       parts: [{ type: "text", text: "start the structured goal" }],
     })
     yield* goals.set({ sessionID: session.id, objective: "say lima once and return control" })
-    yield* llm.text("Lima", { usage: { input: 9_000, output: 4 } })
+    yield* llm.push(
+      reply()
+        .text("Lima")
+        .tool("goal", { status: "complete", reason: "lima appears in the worker response" })
+        .usage({ input: 9_000, output: 4 }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     // Reviewer submits through the tool; its closing text has NO nonce line, so
     // acceptance can only have come from the structured verdict.
     yield* llm.tool("goal_verdict", { met: true, summary: "verified by structured tool verdict" })
@@ -1713,7 +1855,13 @@ it.instance("a contradictory verdict is refused and the corrected retry is the o
       parts: [{ type: "text", text: "start the contradictory goal" }],
     })
     yield* goals.set({ sessionID: session.id, objective: "say lima once" })
-    yield* llm.text("Lima", { usage: { input: 9_000, output: 4 } })
+    yield* llm.push(
+      reply()
+        .text("Lima")
+        .tool("goal", { status: "complete", reason: "lima appears in the worker response" })
+        .usage({ input: 9_000, output: 4 }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     // met:true with unmet items must be refused by the tool, not recorded.
     yield* llm.tool("goal_verdict", {
       met: true,
@@ -1749,7 +1897,13 @@ it.instance("a structured rejection feeds unmet requirements into the continuati
       parts: [{ type: "text", text: "start the rejected goal" }],
     })
     yield* goals.set({ sessionID: session.id, objective: "say lima twice" })
-    yield* llm.text("Lima", { usage: { input: 9_000, output: 4 } })
+    yield* llm.push(
+      reply()
+        .text("Lima")
+        .tool("goal", { status: "complete", reason: "one lima appears in the worker response" })
+        .usage({ input: 9_000, output: 4 }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     // Review #1: structured rejection with a concrete unmet requirement.
     yield* llm.tool("goal_verdict", {
       met: false,
@@ -1758,20 +1912,24 @@ it.instance("a structured rejection feeds unmet requirements into the continuati
     })
     yield* llm.text("Review finished.", { usage: { input: 100, output: 5 } })
     // Worker continuation turn; capture what the model was actually sent.
-    let continuation: string | undefined
-    let workerTools: string | undefined
-    yield* llm.textFrom((hit) => {
-      const body = hit.body as { messages?: { role: string; content: unknown }[]; tools?: unknown }
-      continuation = JSON.stringify(body.messages?.filter((m) => m.role === "user") ?? [])
-      workerTools = JSON.stringify(body.tools ?? [])
-      return "Lima"
-    })
+    yield* llm.push(
+      reply().text("Lima").tool("goal", { status: "complete", reason: "both limas now appear in the transcript" }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     // Review #2 accepts.
     yield* llm.tool("goal_verdict", { met: true, summary: "both limas verified" })
     yield* llm.text("Review finished.", { usage: { input: 100, output: 5 } })
 
     yield* prompt.loop({ sessionID: session.id })
     const goal = yield* goals.get(session.id)
+    const inputs = yield* llm.inputs
+    const worker = inputs.find(
+      (input) =>
+        JSON.stringify(input).includes("only one lima appears in the transcript") &&
+        !JSON.stringify(input).includes("<parent-session-index>"),
+    ) as { messages?: { role: string; content: unknown }[]; tools?: unknown } | undefined
+    const continuation = JSON.stringify(worker?.messages?.filter((message) => message.role === "user") ?? [])
+    const workerTools = JSON.stringify(worker?.tools ?? [])
     expect(goal?.status).toBe("complete")
     expect(goal?.review?.attempt).toBe(2)
     // The rejection reached the worker as conversation content, verbatim.
@@ -1813,7 +1971,13 @@ it.instance("a multi-step worker turn counts as one goal turn", () =>
     // turns" is reachable inside a single worker turn.
     yield* llm.tool("glob", { pattern: "*" })
     yield* llm.tool("glob", { pattern: "**/*.json" })
-    yield* llm.text("Done", { usage: { input: 9_000, output: 4 } })
+    yield* llm.push(
+      reply()
+        .text("Done")
+        .tool("goal", { status: "complete", reason: "both glob calls completed" })
+        .usage({ input: 9_000, output: 4 }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom((hit) => {
       const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
       return `VERDICT: MET ${nonce} both tools ran and control returned`
@@ -1844,7 +2008,13 @@ it.instance("goal accounting counts only generated worker and reviewer tokens", 
       parts: [{ type: "text", text: "start the accounting goal" }],
     })
     yield* goals.set({ sessionID: session.id, objective: "say lima once and return control" })
-    yield* llm.text("Lima", { usage: { input: 9_000, output: 4 } })
+    yield* llm.push(
+      reply()
+        .text("Lima")
+        .tool("goal", { status: "complete", reason: "lima was spoken once" })
+        .usage({ input: 9_000, output: 4 }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom(
       (hit) => {
         const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
@@ -1886,12 +2056,18 @@ it.instance("worker model context never advertises the hidden reviewer agent or 
       parts: [{ type: "text", text: "start the isolation goal" }],
     })
     yield* goals.set({ sessionID: session.id, objective: "keep the reviewer out of worker context" })
-    yield* llm.text("First increment.")
+    yield* llm.push(
+      reply().text("First increment.").tool("goal", { status: "complete", reason: "first increment evidence" }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom((hit) => {
       const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
       return `VERDICT: NOT_MET ${nonce} keep going`
     })
-    yield* llm.text("Second increment.")
+    yield* llm.push(
+      reply().text("Second increment.").tool("goal", { status: "complete", reason: "second increment evidence" }),
+    )
+    yield* llm.text("Claim submitted; awaiting review.")
     yield* llm.textFrom((hit) => {
       const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
       return `VERDICT: MET ${nonce} verified`
@@ -1899,8 +2075,8 @@ it.instance("worker model context never advertises the hidden reviewer agent or 
 
     yield* prompt.loop({ sessionID: session.id })
     const inputs = yield* llm.inputs
-    // inputs[2] is the worker turn that runs after the first review was rejected.
-    const worker = JSON.stringify(inputs[2])
+    // inputs[3] is the worker turn that runs after the first review was rejected.
+    const worker = JSON.stringify(inputs[3])
     expect(worker).toContain("<active-goal>")
     expect(worker).not.toContain("goal-reviewer")
     expect(worker).not.toContain("goal-review")
@@ -2055,6 +2231,7 @@ it.instance("subtask child inherits parent session external_directory allow", ()
       title: "Parent",
       permission: [{ permission: "external_directory", pattern: "/tmp/allowed/*", action: "allow" }],
     })
+    yield* llm.tool("task_done", { summary: "done" })
     yield* llm.text("done")
     const msg = yield* user(chat.id, "hello")
     yield* addSubtask(chat.id, msg.id)
@@ -2749,7 +2926,12 @@ it.instance(
       yield* goals.set({ sessionID: session.id, objective: "continue once, then finish" })
 
       // Turn 1, rejected: produces the single goal continuation.
-      yield* llm.text("First increment complete.")
+      yield* llm.push(
+        reply()
+          .text("First increment complete.")
+          .tool("goal", { status: "complete", reason: "first increment evidence" }),
+      )
+      yield* llm.text("Claim submitted; awaiting review.")
       yield* llm.textFrom((hit) => {
         const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
         return `VERDICT: NOT_MET ${nonce} another increment is still required`
@@ -2758,7 +2940,12 @@ it.instance(
       // completes, so no continuation is queued and the loop is about to break
       // with the injected message unanswered. The reviewer streams slowly so the
       // injection lands squarely inside it.
-      yield* llm.text("Second increment complete.")
+      yield* llm.push(
+        reply()
+          .text("Second increment complete.")
+          .tool("goal", { status: "complete", reason: "second increment evidence" }),
+      )
+      yield* llm.text("Claim submitted; awaiting review.")
       yield* llm.textChunksFrom(
         (hit) => {
           const nonce = /verdict nonce for this review is ([a-z0-9-]+)/i.exec(JSON.stringify(hit.body))?.[1]
@@ -2774,7 +2961,7 @@ it.instance(
       yield* llm.text("Checked the config path too.")
 
       const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
-      yield* awaitWithTimeout(llm.wait(4), "timed out waiting for the accepting reviewer request", "20 seconds")
+      yield* awaitWithTimeout(llm.wait(6), "timed out waiting for the accepting reviewer request", "20 seconds")
       const injected = yield* user(session.id, "also double check the config path")
 
       const exit = yield* Fiber.await(fiber)
@@ -2799,8 +2986,8 @@ it.instance(
       )
 
       const inputs = yield* llm.inputs
-      expect(inputs).toHaveLength(5)
-      expect(JSON.stringify(inputs[4])).toContain("also double check the config path")
+      expect(inputs).toHaveLength(7)
+      expect(JSON.stringify(inputs[6])).toContain("also double check the config path")
 
       const reviewParts = msgs.flatMap((msg) =>
         msg.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "goal-review"),

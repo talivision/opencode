@@ -13,11 +13,13 @@
 #   not_met   reviewer rejects once, then accepts     -> "Goal not yet met... continuing"
 #   met_tool      reviewer accepts via goal_verdict tool  -> Goal achieved
 #   not_met_tool  reviewer rejects via tool, then accepts -> "Goal not yet met... continuing"
+#   unclaimed worker omits the goal tool once, receives a persisted reminder,
+#             then requests completion and is accepted by one structured review
 #   retrieval reviewer builds a checklist, pulls evidence through goal_transcript,
 #             rejects with per-requirement verdicts, then inherits the checklist
 #             on attempt 2 and accepts. Asserted by assert-retrieval.mjs.
 #   not_met_history reviewer rejects twice for different reasons, then accepts;
-#             asserts both reasons reach worker request 3 under the anti-cycling heading
+#             asserts both reasons reach a later worker request under the anti-cycling heading
 #   turns    one worker turn calls glob twice, then answers; durable turns must be 1
 #   interrupted worker request 1 gets a non-retryable 400, is not reviewed, and resumes
 #   cache-stable one interrupted worker turn is followed before any review by a recovered
@@ -54,9 +56,9 @@ WORK="${WORK:-${TMPDIR:-/tmp}/opencode-goal-harness}"
 SOCK="${SOCK:-/tmp/opencode-goal-harness.sock}"
 
 case "$SCENARIO" in
-  met | not_met | met_tool | not_met_tool | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow) ;;
+  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow) ;;
   *)
-    echo "usage: $0 <met|not_met|met_tool|not_met_tool|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow> [seconds]" >&2
+    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -117,6 +119,12 @@ if [ -n "${REVIEW_CONFIG:-}" ]; then
   node -e 'const f=process.argv[1],fs=require("fs");const c=JSON.parse(fs.readFileSync(f,"utf8"));c.goal={...c.goal,review:{...c.goal?.review,...JSON.parse(process.argv[2])}};fs.writeFileSync(f,JSON.stringify(c,null,2)+"\n")' \
     "$WORK/proj/opencode.json" "$REVIEW_CONFIG"
   echo "==> goal.review config: $REVIEW_CONFIG"
+fi
+
+# unclaimed asserts a single accepted review attempt, so its reviewer must
+# accept on the first verdict rather than inheriting the NOT_MET-once default.
+if [ "$SCENARIO" = "unclaimed" ]; then
+  REVIEWER_NOT_MET_N="${REVIEWER_NOT_MET_N:-0}"
 fi
 
 echo "==> fake provider (:$PORT, REVIEWER_MODE=$SCENARIO)"
@@ -239,7 +247,7 @@ if [ "$SCENARIO" = "retrieval" ]; then
 fi
 
 case "$SCENARIO" in
-  not_met_history | turns | interrupted | cache-stable | goal-events | permission_blocked | goal_check | silent | http500)
+  unclaimed | not_met_history | turns | interrupted | cache-stable | goal-events | permission_blocked | goal_check | silent | http500)
     echo "==> $SCENARIO assertions"
     DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
     node "$HERE/assert-scenarios.mjs" \

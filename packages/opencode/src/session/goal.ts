@@ -106,6 +106,9 @@ export const Info = Schema.Struct({
   tokenBudget: Schema.optional(NonNegativeInt),
   tokensUsed: NonNegativeInt,
   turns: NonNegativeInt,
+  // Consecutive automatic continuations caused by a worker turn ending
+  // without a goal-tool claim. Optional so older persisted rows still decode.
+  reminderStreak: Schema.optional(NonNegativeInt),
   blocker: Schema.optional(
     Schema.Struct({
       reason: Schema.String,
@@ -258,6 +261,8 @@ export interface Interface {
   readonly submitVerdict: (input: SubmitVerdictInput) => Effect.Effect<Info | undefined>
   readonly finishReview: (input: ReviewFinishInput) => Effect.Effect<Info | undefined>
   readonly clear: (sessionID: SessionID) => Effect.Effect<boolean>
+  readonly recordReminder: (sessionID: SessionID) => Effect.Effect<Info | undefined>
+  readonly clearReminderStreak: (sessionID: SessionID) => Effect.Effect<Info | undefined>
   readonly recordTurn: (input: RecordTurnInput) => Effect.Effect<Info | undefined>
   readonly context: (sessionID: SessionID) => Effect.Effect<string | undefined>
 }
@@ -418,6 +423,7 @@ const layer = Layer.effect(
     const requestReview = Effect.fn("SessionGoal.requestReview")(function* (input: ReviewRequestInput) {
       return yield* update(input.sessionID, (draft, now) => {
         if (draft.status !== "active") return
+        draft.reminderStreak = 0
         const evidence = input.evidence?.trim()
         draft.review = {
           status: "pending",
@@ -523,6 +529,7 @@ const layer = Layer.effect(
       const result = yield* update(input.sessionID, (draft, now) => {
         if (draft.review?.status !== "running") return
         if (draft.review.reviewerSessionID !== input.reviewerSessionID) return
+        draft.reminderStreak = 0
         draft.tokensUsed += input.tokens
         draft.review.status = input.error ? "error" : input.accepted ? "accepted" : "rejected"
         draft.review.errorStreak = input.error ? (draft.review.errorStreak ?? 0) + 1 : 0
@@ -562,6 +569,21 @@ const layer = Layer.effect(
       if (!current) return false
       yield* storage.remove(key(sessionID)).pipe(Effect.orDie)
       return true
+    })
+
+    const recordReminder = Effect.fn("SessionGoal.recordReminder")(function* (sessionID: SessionID) {
+      return yield* update(sessionID, (draft) => {
+        if (draft.status !== "active") return
+        draft.reminderStreak = (draft.reminderStreak ?? 0) + 1
+      })
+    })
+
+    const clearReminderStreak = Effect.fn("SessionGoal.clearReminderStreak")(function* (sessionID: SessionID) {
+      return yield* update(sessionID, (draft) => {
+        if (draft.status !== "active") return
+        if (!draft.reminderStreak) return
+        draft.reminderStreak = 0
+      })
     })
 
     const recordTurn = Effect.fn("SessionGoal.recordTurn")(function* (input: RecordTurnInput) {
@@ -656,6 +678,8 @@ const layer = Layer.effect(
       submitVerdict,
       finishReview,
       clear,
+      recordReminder,
+      clearReminderStreak,
       recordTurn,
       context,
     })

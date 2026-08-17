@@ -26,4 +26,5 @@ Checklist duty:
 
 Verdict:
 - Deliver your verdict by calling the goal_verdict tool exactly once at the end of your review. A not-met verdict must list every unmet requirement with the evidence that shows it is unmet — the worker only receives what you put in that tool call, so vague verdicts waste an attempt.
+- A NOT MET verdict MUST include the unmet array in the SAME, FIRST goal_verdict call — one entry per failed requirement with concrete evidence. A rejection with an empty unmet array is refused and wastes a round trip.
 - Only if the goal_verdict tool is unavailable, fall back to a final non-empty line in the exact nonce-bearing verdict format requested in the user message, preceded by a brief explanation of the decisive evidence.

@@ -133,6 +133,7 @@ const sessionBindingCommands = [
   "session.toggle.actions",
   "session.toggle.scrollbar",
   "session.toggle.generic_tool_output",
+  "goal.minimize",
   "session.first",
   "session.last",
   "session.messages_last_user",
@@ -265,6 +266,7 @@ export function Session() {
   const [showDetails, setShowDetails] = kv.signal("tool_details_visibility", true)
   const [showAssistantMetadata, _setShowAssistantMetadata] = kv.signal("assistant_metadata_visibility", true)
   const [showScrollbar, setShowScrollbar] = kv.signal("scrollbar_visible", false)
+  const [goalMinimized, setGoalMinimized] = kv.signal("goal_minimized", false)
   const [diffWrapMode] = kv.signal<"word" | "none">("diff_wrap_mode", "word")
   const [_animationsEnabled, _setAnimationsEnabled] = kv.signal("animations_enabled", true)
   const [showGenericToolOutput, setShowGenericToolOutput] = kv.signal("generic_tool_output_visibility", false)
@@ -826,6 +828,16 @@ export function Session() {
       },
     },
     {
+      title: goalMinimized() ? "Expand goal window" : "Minimize goal window",
+      value: "goal.minimize",
+      category: "Session",
+      enabled: !!goal() && visible(),
+      run: () => {
+        setGoalMinimized((prev) => !prev)
+        dialog.clear()
+      },
+    },
+    {
       title: showGenericToolOutput() ? "Hide generic tool output" : "Show generic tool output",
       value: "session.toggle.generic_tool_output",
       category: "Session",
@@ -1144,7 +1156,6 @@ export function Session() {
       title: "Go to parent session",
       value: "session.parent",
       category: "Session",
-      hidden: true,
       enabled: !!session()?.parentID,
       run: childSessionHandler(() => {
         const parentID = session()?.parentID
@@ -1360,6 +1371,13 @@ export function Session() {
                               <DialogMessage
                                 messageID={message.id}
                                 sessionID={route.sessionID}
+                                queued={
+                                  !!pending() &&
+                                  message.id > pending()! &&
+                                  !(sync.data.part[message.id] ?? []).some(
+                                    (part) => part.type === "text" && part.metadata?.taskNotification === true,
+                                  )
+                                }
                                 setPrompt={(promptInfo) => prompt?.set(promptInfo)}
                               />
                             ))
@@ -1397,7 +1415,7 @@ export function Session() {
                   <SubagentFooter />
                 </Show>
                 <Show when={visible()}>
-                  <GoalIndicator sessionID={route.sessionID} />
+                  <GoalIndicator sessionID={route.sessionID} minimized={goalMinimized()} />
                   <Show when={session()?.parentID && sync.data.session_status[route.sessionID]?.type === "busy"}>
                     <box paddingLeft={1} paddingRight={1} backgroundColor={theme.backgroundPanel}>
                       <text fg={theme.textMuted}>

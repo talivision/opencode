@@ -18,6 +18,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Provider } from "@/provider/provider"
 import { NotFoundError } from "@/storage/storage"
 import { randomUUID } from "node:crypto"
+import { TaskDoneTool } from "./task-done"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -48,6 +49,17 @@ const BACKGROUND_RESTARTED = [
   "Your message was delivered as a new run in the same task session, but this call did not arm another automatic completion notification.",
   "Use task_output(task_id=...) to inspect the new run.",
 ].join("\n")
+const SUBAGENT_CONTRACT =
+  "<subagent-contract>When you have fully completed this task, call task_done with a summary of the outcome as your FINAL tool call. Your work is not considered finished until you do. If you cannot finish, still call task_done and explain why in the summary.</subagent-contract>"
+const DONE_MARKER_MISSING =
+  "<done-marker-missing>Your previous turn ended without a task_done call. If the task is finished, call task_done with your summary now. If it is not finished, continue working and call task_done when it is.</done-marker-missing>"
+const TASK_DONE_BACKOFF_INITIAL = 5_000
+const TASK_DONE_BACKOFF_MAX = 300_000
+
+function taskDoneBackoffMs(consecutive: number) {
+  if (consecutive <= 1) return 0
+  return Math.min(TASK_DONE_BACKOFF_INITIAL * Math.pow(2, consecutive - 2), TASK_DONE_BACKOFF_MAX)
+}
 
 const ParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
@@ -277,8 +289,9 @@ export const TaskTool = Tool.define(
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
-        const result = yield* ops.prompt({
-          messageID: MessageID.ascending(),
+        let promptMessageID = MessageID.ascending()
+        let result = yield* ops.prompt({
+          messageID: promptMessageID,
           sessionID: nextSession.id,
           model: {
             modelID: model.modelID,
@@ -286,9 +299,62 @@ export const TaskTool = Tool.define(
           },
           variant,
           agent: next.name,
-          parts,
+          parts: [
+            ...parts,
+            {
+              type: "text",
+              synthetic: true,
+              text: SUBAGENT_CONTRACT,
+            },
+          ],
         })
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        let missing = 1
+        while (true) {
+          // An empty summary must not count as the marker: the tool refuses it
+          // and asks the child to call again, so accepting it here would let a
+          // malformed call end the task with no report.
+          const isMarker = (item: (typeof result.parts)[number]) =>
+            item.type === "tool" &&
+            item.tool === TaskDoneTool.id &&
+            item.state.status === "completed" &&
+            typeof item.state.input.summary === "string" &&
+            item.state.input.summary.trim().length > 0
+          let done = result.parts.findLast(isMarker)
+          // A normal provider finish after a tool call is a newer assistant
+          // message, so prompt() returns that message rather than the preceding
+          // one that owns task_done. Search only this prompt's transcript tail;
+          // older markers from a resumed child must not complete new work.
+          if (!done) {
+            done = (yield* sessions.messages({ sessionID: nextSession.id }))
+              .filter((message) => message.info.id > promptMessageID)
+              .flatMap((message) => message.parts)
+              .findLast(isMarker)
+          }
+          if (done?.type === "tool" && done.state.status === "completed") {
+            const summary = done.state.input.summary
+            if (typeof summary === "string" && summary.trim()) return summary.trim()
+          }
+          yield* Effect.sleep(taskDoneBackoffMs(missing))
+          promptMessageID = MessageID.ascending()
+          result = yield* ops.prompt({
+            messageID: promptMessageID,
+            sessionID: nextSession.id,
+            model: {
+              modelID: model.modelID,
+              providerID: model.providerID,
+            },
+            variant,
+            agent: next.name,
+            parts: [
+              {
+                type: "text",
+                synthetic: true,
+                text: DONE_MARKER_MISSING,
+              },
+            ],
+          })
+          missing += 1
+        }
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (

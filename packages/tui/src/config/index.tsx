@@ -50,6 +50,10 @@ export const Prompt = Schema.Struct({
   }),
 }).annotate({ description: "Prompt size settings" })
 
+export const Goal = Schema.Struct({
+  max_height: Schema.optional(PromptSize).annotate({ description: "Goal objective max height" }),
+}).annotate({ description: "Goal display settings" })
+
 export const Info = Schema.Struct({
   $schema: Schema.optional(Schema.String),
   theme: Schema.optional(Schema.String),
@@ -59,6 +63,7 @@ export const Info = Schema.Struct({
   leader_timeout: Schema.optional(LeaderTimeout),
   attention: Schema.optional(Attention),
   prompt: Schema.optional(Prompt),
+  goal: Schema.optional(Goal),
   scroll_speed: Schema.optional(ScrollSpeed).annotate({ description: "TUI scroll speed" }),
   scroll_acceleration: Schema.optional(ScrollAcceleration),
   diff_style: Schema.optional(DiffStyle),
