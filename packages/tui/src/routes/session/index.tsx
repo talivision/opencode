@@ -287,6 +287,7 @@ export function Session() {
   const [showScrollbar, setShowScrollbar] = kv.signal("scrollbar_visible", false)
   const [goalMinimized, setGoalMinimized] = kv.signal(`goal_minimized_${route.sessionID}`, false)
   const [searchOpen, setSearchOpen] = createSignal(false)
+  const [searchMatchID, setSearchMatchID] = createSignal<string>()
   const [diffWrapMode] = kv.signal<"word" | "none">("diff_wrap_mode", "word")
   const [_animationsEnabled, _setAnimationsEnabled] = kv.signal("animations_enabled", true)
   const [showGenericToolOutput, setShowGenericToolOutput] = kv.signal("generic_tool_output_visibility", false)
@@ -1427,6 +1428,7 @@ export function Session() {
                           parts={sync.data.part[message.id] ?? []}
                           pending={pending()?.index}
                           pendingFallback={pending()?.fallback ?? false}
+                          searchMatchID={searchMatchID()}
                         />
                       </Match>
                       <Match when={message.role === "assistant"}>
@@ -1434,6 +1436,7 @@ export function Session() {
                           last={lastAssistant()?.id === message.id}
                           message={message as AssistantMessage}
                           parts={sync.data.part[message.id] ?? []}
+                          searchMatchID={searchMatchID()}
                         />
                       </Match>
                     </Switch>
@@ -1461,6 +1464,7 @@ export function Session() {
                     ref={(value) => (transcriptSearch = value)}
                     messages={messages()}
                     partsByMessage={sync.data.part}
+                    onMatch={setSearchMatchID}
                     jumpTo={(id) => {
                       const child = scroll.getChildren().find((child) => child.id === id)
                       if (child) scroll.scrollBy(child.y - scroll.y - 1)
@@ -1538,6 +1542,7 @@ function UserMessage(props: {
   index: number
   pending?: number
   pendingFallback: boolean
+  searchMatchID?: string
 }) {
   const ctx = use()
   const local = useLocal()
@@ -1606,6 +1611,7 @@ function UserMessage(props: {
           borderColor={color()}
           customBorderChars={SplitBorder.customBorderChars}
           marginTop={props.index === 0 ? 0 : 1}
+          backgroundColor={props.searchMatchID === props.message.id ? theme.backgroundElement : undefined}
         >
           <box
             onMouseOver={() => {
@@ -1618,10 +1624,17 @@ function UserMessage(props: {
             paddingTop={1}
             paddingBottom={1}
             paddingLeft={2}
-            backgroundColor={hover() ? theme.backgroundElement : theme.backgroundPanel}
+            backgroundColor={
+              props.searchMatchID === props.message.id || hover() ? theme.backgroundElement : theme.backgroundPanel
+            }
             flexShrink={0}
           >
-            <text fg={theme.text}>{text()}</text>
+            <text fg={theme.text}>
+              <Show when={props.searchMatchID === props.message.id}>
+                <span style={{ fg: theme.primary }}>▍ </span>
+              </Show>
+              {text()}
+            </text>
             <Show when={files().length}>
               <box flexDirection="row" paddingBottom={metadataVisible() ? 1 : 0} paddingTop={1} gap={1} flexWrap="wrap">
                 <For each={files()}>
@@ -1671,7 +1684,7 @@ function UserMessage(props: {
   )
 }
 
-function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; last: boolean }) {
+function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; last: boolean; searchMatchID?: string }) {
   const ctx = use()
   const local = useLocal()
   const { theme } = useTheme()
@@ -1706,6 +1719,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
                 component={component()}
                 part={part as any}
                 message={props.message}
+                searchMatchID={props.searchMatchID}
               />
             </Show>
           )
@@ -1883,7 +1897,7 @@ function ReasoningHeader(props: {
   )
 }
 
-function TextPart(props: { last: boolean; part: TextPart; message: AssistantMessage }) {
+function TextPart(props: { last: boolean; part: TextPart; message: AssistantMessage; searchMatchID?: string }) {
   const ctx = use()
   const { theme, syntax } = useTheme()
   return (
@@ -1894,8 +1908,16 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
         paddingLeft={3}
         marginTop={1}
         flexShrink={0}
+        flexDirection="row"
+        backgroundColor={props.searchMatchID === props.part.id ? theme.backgroundElement : undefined}
       >
+        <Show when={props.searchMatchID === props.part.id}>
+          <text fg={theme.primary} flexShrink={0}>
+            ▍{" "}
+          </text>
+        </Show>
         <markdown
+          flexGrow={1}
           syntaxStyle={syntax()}
           streaming={true}
           internalBlockMode="top-level"
@@ -1903,7 +1925,7 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
           tableOptions={{ style: "grid" }}
           conceal={ctx.conceal()}
           fg={theme.markdownText}
-          bg={theme.background}
+          bg={props.searchMatchID === props.part.id ? theme.backgroundElement : theme.background}
         />
       </box>
     </Show>

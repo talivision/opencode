@@ -45,7 +45,12 @@ const keybind = (value: Definition["default"], description: string): Definition 
 export const Definitions = {
   leader: keybind(LeaderDefault, "Leader key for keybind combinations"),
 
-  app_exit: keybind("ctrl+c,ctrl+d,<leader>q", "Exit the application"),
+  // <leader>q belongs to session_queued_prompts (implemented in the headless
+  // run CLI). It previously also sat on app_exit, so in the graphical TUI —
+  // where the queued-prompts command is not registered — the advertised
+  // binding fell through and EXITED THE APP. In the TUI the chord is now a
+  // harmless no-op; the run CLI keeps its queue manager.
+  app_exit: keybind("ctrl+c,ctrl+d", "Exit the application"),
   app_debug: keybind("none", "Toggle debug panel"),
   app_console: keybind("none", "Toggle console"),
   app_heap_snapshot: keybind("none", "Write heap snapshot"),
@@ -101,7 +106,7 @@ export const Definitions = {
   session_toggle_timestamps: keybind("none", "Toggle message timestamps"),
   session_toggle_generic_tool_output: keybind("none", "Toggle generic tool output"),
   goal_minimize: keybind("<leader>z", "Toggle goal window minimize"),
-  session_queued_prompts: keybind("none", "Manage queued prompts"),
+  session_queued_prompts: keybind("<leader>q", "Manage queued prompts"),
   session_child_first: keybind("<leader>down", "Go to first child session"),
   session_child_cycle: keybind("<leader>right", "Go to next child session"),
   session_child_cycle_reverse: keybind("<leader>left", "Go to previous child session"),

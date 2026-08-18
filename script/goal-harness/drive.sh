@@ -348,6 +348,10 @@ elif [ "$SCENARIO" = "ux_search" ]; then
   echo "==> cycle to the older match"
   tmux -S "$SOCK" send-keys -t goal Enter
   wait_for_goal_text "1/2" "$WORK/snaps/ux-search-cycled.txt" || true
+  # The streaming markdown beside the marker re-renders asynchronously after
+  # the highlight moves; poll until the marker and the matched text share a
+  # settled frame rather than asserting on the counter snapshot.
+  wait_for_goal_regex "▍.*amber zebra" "$WORK/snaps/ux-search-cycled-marker.txt" || true
 
   echo "==> close search"
   tmux -S "$SOCK" send-keys -t goal Escape
@@ -599,10 +603,20 @@ if [ "$SCENARIO" = "ux_search" ]; then
   else
     ux_fail "typing a two-hit query lands on the most recent match with a 2/2 counter"
   fi
+  if grep -F "near the harbor" "$counter" | grep -Fq "▍ "; then
+    ux_ok "the most recent match has a visible gutter marker"
+  else
+    ux_fail "the most recent match has a visible gutter marker"
+  fi
   if grep -Fq "1/2" "$cycled"; then
     ux_ok "enter cycles the counter to the older match"
   else
     ux_fail "enter cycles the counter to the older match"
+  fi
+  if grep -F "amber zebra" "$WORK/snaps/ux-search-cycled-marker.txt" | grep -Fq "▍"; then
+    ux_ok "cycling moves the visible gutter marker to the older match"
+  else
+    ux_fail "cycling moves the visible gutter marker to the older match"
   fi
   if [ "${UX_SEARCH_CLOSED:-0}" -eq 1 ]; then
     ux_ok "escape closes the search bar"

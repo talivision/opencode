@@ -1,6 +1,6 @@
-import type { InputRenderable } from "@opentui/core"
+import { TextAttributes, type InputRenderable } from "@opentui/core"
 import type { Message, Part } from "@opencode-ai/sdk/v2"
-import { createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { useTuiConfig } from "../config"
 import { useTheme } from "../context/theme"
 import { useBindings, useOpencodeModeStack } from "../keymap"
@@ -18,6 +18,7 @@ export function TranscriptSearch(props: {
   partsByMessage: Record<string, Part[]>
   jumpTo: (id: string) => void
   onClose: () => void
+  onMatch?: (id: string | undefined) => void
   ref?: (ref: TranscriptSearchRef | undefined) => void
 }) {
   const { theme } = useTheme()
@@ -41,23 +42,23 @@ export function TranscriptSearch(props: {
     onCleanup(popMode)
   })
 
-  createEffect(
-    on(query, () => {
-      const index = matches().length - 1
-      setSelected(index)
-      const match = matches()[index]
-      if (match) props.jumpTo(match.partID ?? match.messageID)
-    }),
-  )
+  const select = (index: number) => {
+    setSelected(index)
+    const match = matches()[index]
+    const id = match ? (match.partID ?? match.messageID) : undefined
+    props.onMatch?.(id)
+    if (id) props.jumpTo(id)
+  }
+
+  createEffect(() => select(matches().length - 1))
+  onCleanup(() => props.onMatch?.(undefined))
 
   const move = (direction: -1 | 1) => {
     const total = matches().length
     if (!total) return
     const current = selected() < 0 ? total - 1 : Math.min(selected(), total - 1)
     const index = (current + direction + total) % total
-    setSelected(index)
-    const match = matches()[index]
-    if (match) props.jumpTo(match.partID ?? match.messageID)
+    select(index)
   }
 
   useBindings(() => ({
@@ -108,6 +109,9 @@ export function TranscriptSearch(props: {
       paddingRight={1}
       backgroundColor={theme.backgroundPanel}
     >
+      <text fg={theme.primary} attributes={TextAttributes.BOLD}>
+        Find
+      </text>
       <input
         flexGrow={1}
         onInput={setQuery}

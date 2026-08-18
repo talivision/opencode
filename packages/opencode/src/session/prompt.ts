@@ -2209,7 +2209,7 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(
+      const result = yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
         runLoop(input.sessionID).pipe(
@@ -2218,6 +2218,14 @@ const layer = Layer.effect(
           Effect.onInterrupt(() => goal.suspendForInterrupt(input.sessionID).pipe(Effect.ignore)),
         ),
       )
+      // Close the lost-wakeup window: a message (user input or a child's
+      // task-notification) that lands between the run's final injected-message
+      // check and the idle transition attaches to the dying run and would sit
+      // unanswered until unrelated input arrives. Interrupted runs never reach
+      // this line, so an explicit user abort is not undone.
+      const trailing = yield* sessions.messages({ sessionID: input.sessionID, limit: 1 }).pipe(Effect.orDie)
+      if (trailing[0]?.info.role === "user") return yield* loop(input)
+      return result
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(

@@ -198,7 +198,7 @@ jobs:
           run_scenario goal-harness unclaimed 40 4904 6
           run_scenario goal-harness ux_goal_window 30 4906 9
           run_scenario goal-harness ux_queued_cancel 30 4908 8
-          run_scenario goal-harness ux_search 30 4909 6
+          run_scenario goal-harness ux_search 30 4909 8
           run_scenario subagent-harness notify 45 4902 1
           run_scenario subagent-harness inspect 50 4903 2
           run_scenario subagent-harness drop 45 4905 3
