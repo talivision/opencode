@@ -304,6 +304,17 @@ if [ "$SCENARIO" = "ux_goal_window" ]; then
   tmux -S "$SOCK" send-keys -t goal C-x
   tmux -S "$SOCK" send-keys -t goal z
   wait_for_goal_text "ctrl+x z minimize" "$WORK/snaps/ux-goal-reexpanded.txt" || true
+
+  echo "==> wait for a wrapped long worker reply"
+  # Slow runners can reach the toggles before the first worker reply lands;
+  # poll until the wrap fixture spans at least two rows in one frame.
+  while [ "$SECONDS" -lt "$UX_DEADLINE" ]; do
+    capture_goal_pane "$WORK/snaps/ux-wrap.txt"
+    if [ "$(grep -cE "intentionally a very long|word wrapping inside the|clipped single row" "$WORK/snaps/ux-wrap.txt" || true)" -ge 2 ]; then
+      break
+    fi
+    sleep 0.5
+  done
 elif [ "$SCENARIO" = "ux_queued_cancel" ]; then
   UX_WINDOW="$WATCH"
   if [ "$UX_WINDOW" -gt 45 ]; then
@@ -540,9 +551,7 @@ if [ "$SCENARIO" = "ux_goal_window" ]; then
   else
     ux_fail "durable goal remains active when the worker never claims completion"
   fi
-  # The re-expanded snapshot is captured last, after the first worker reply
-  # has certainly landed; the initial expanded capture can precede it.
-  wrap_rows="$(grep -chE "intentionally a very long|word wrapping inside the|clipped single row" "$reexpanded" "$expanded" 2>/dev/null | paste -sd+ - | bc || true)"
+  wrap_rows="$(grep -cE "intentionally a very long|word wrapping inside the|clipped single row" "$WORK/snaps/ux-wrap.txt" 2>/dev/null || true)"
   if [ "${wrap_rows:-0}" -ge 2 ]; then
     ux_ok "long assistant output wraps across multiple rows"
   else
