@@ -4,6 +4,7 @@ export type TuiPaths = Readonly<{
   cwd: string
   home: string
   state: string
+  log: string
   worktree: string
 }>
 

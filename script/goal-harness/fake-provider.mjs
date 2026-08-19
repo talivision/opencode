@@ -17,7 +17,7 @@
 //   REVIEWER_INPUT/OUTPUT fake reviewer usage (default 12000 / 58)
 //   REVIEWER_MODE         met | not_met | not_met_history | turns | interrupted | cache-stable | goal-events |
 //                         met_tool | not_met_tool | unclaimed | retrieval | permission_blocked | goal_check | invalid |
-//                         silent | slow | soak | busy | http500 | ux_goal_window | ux_queued_cancel
+//                         silent | slow | soak | busy | http500 | ux_goal_window | ux_queued_cancel | overflow_loop
 //   REVIEWER_NOT_MET_N    first N reviews return NOT_MET, then MET (default 0)
 //   REVIEWER_READ_PATH    controlled absolute path read by permission_blocked
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
@@ -35,6 +35,11 @@ const REVIEWER_USAGE = {
 const REVIEWER_MODE = process.env.REVIEWER_MODE ?? "not_met"
 const REVIEWER_NOT_MET_N = Number(process.env.REVIEWER_NOT_MET_N ?? 0)
 const REVIEWER_READ_PATH = process.env.REVIEWER_READ_PATH ?? "/etc/hosts"
+const OVERFLOW_LIMIT_CHARS = 60_000
+const OVERFLOW_WORKER_TEXT =
+  "Continuing careful work while preserving concrete observations, checking assumptions, and recording enough detail for the next turn. ".repeat(
+    15,
+  )
 
 let reviewCount = 0
 let workerCount = 0
@@ -157,6 +162,12 @@ const server = http.createServer(async (req, res) => {
   try {
     parsed = JSON.parse(raw || "{}")
   } catch {}
+  if (REVIEWER_MODE === "overflow_loop" && raw.length > OVERFLOW_LIMIT_CHARS) {
+    log({ role: "overflow-400", size: raw.length })
+    res.writeHead(400, { "content-type": "application/json" })
+    res.end(JSON.stringify({ error: { code: "context_length_exceeded", message: "maximum context length exceeded" } }))
+    return
+  }
   const classification = classifyRequest(parsed)
   const flat = classification.flat
   const nonce = classification.nonce
@@ -166,6 +177,12 @@ const server = http.createServer(async (req, res) => {
   if (req.url?.startsWith("/v1/models")) {
     res.writeHead(200, { "content-type": "application/json" })
     res.end(JSON.stringify({ data: [] }))
+    return
+  }
+
+  if (REVIEWER_MODE === "overflow_loop" && !isWorker) {
+    log({ role: "auxiliary", mode: REVIEWER_MODE, size: raw.length, url: req.url, body: parsed })
+    textReply(res, "summarized.", { input: Math.ceil(raw.length / 4), output: 3 })
     return
   }
 
@@ -457,6 +474,13 @@ const server = http.createServer(async (req, res) => {
       WORKER_TEXT === "Lima" ? "Continuing careful work without claiming completion." : WORKER_TEXT,
       WORKER_USAGE,
     )
+    return
+  }
+  if (REVIEWER_MODE === "overflow_loop") {
+    textReply(res, OVERFLOW_WORKER_TEXT, {
+      input: Math.ceil(raw.length / 4),
+      output: Math.ceil(OVERFLOW_WORKER_TEXT.length / 4),
+    })
     return
   }
   if (REVIEWER_MODE === "soak" && workerCount <= 6) {

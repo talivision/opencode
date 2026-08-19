@@ -205,6 +205,11 @@ jobs:
           run_scenario subagent-harness ux_navigation 20 4907 5
           run_scenario subagent-harness bad_marker 45 4912 2
           run_scenario subagent-harness marker_text_escape 45 4913 3
+          run_scenario subagent-harness spiral 75 4917 3
+          run_scenario subagent-harness sync_child 60 4915 4
+          run_scenario subagent-harness busy_parent 75 4916 3
+          run_scenario goal-harness overflow_loop 90 4914 4
+          run_scenario goal-harness desync_recovery 45 4918 5
 
           exit "$fail"
 

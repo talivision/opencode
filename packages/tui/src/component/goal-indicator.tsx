@@ -8,7 +8,7 @@ import { useTerminalDimensions } from "@opentui/solid"
 import { useTuiConfig } from "../config"
 import { useCommandShortcut } from "../keymap"
 
-export function GoalIndicator(props: { sessionID: string; minimized: boolean }) {
+export function GoalIndicator(props: { sessionID: string; minimized: boolean; onPoll?: () => void }) {
   const goals = useGoal()
   const goal = goals.get(props.sessionID)
   const { theme } = useTheme()
@@ -37,8 +37,12 @@ export function GoalIndicator(props: { sessionID: string; minimized: boolean }) 
   })
 
   onMount(() => {
-    void goals.refresh(props.sessionID)
-    const timer = setInterval(() => void goals.refresh(props.sessionID), 1000)
+    const poll = () => {
+      props.onPoll?.()
+      void goals.refresh(props.sessionID)
+    }
+    poll()
+    const timer = setInterval(poll, 1000)
     onCleanup(() => clearInterval(timer))
   })
 

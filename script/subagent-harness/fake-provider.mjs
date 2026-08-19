@@ -12,7 +12,7 @@
 // env:
 //   PORT      listen port (default 4599)
 //   LOG       path to append one JSON line per request
-//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | bad_marker | marker_text_escape | ux_navigation (default notify)
+//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | bad_marker | marker_text_escape | spiral | sync_child | busy_parent | ux_navigation (default notify)
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
 import http from "node:http"
 import fs from "node:fs"
@@ -114,7 +114,7 @@ function toolReplies(res, calls) {
   ])
 }
 
-function slowTextReply(req, res, text, duration, track = false, complete) {
+function slowTextReply(req, res, text, duration, track = false, complete, toolCall) {
   const pieces = text.split(" ")
   if (track) firstChildOpen = true
   res.writeHead(200, {
@@ -134,7 +134,37 @@ function slowTextReply(req, res, text, duration, track = false, complete) {
       }
       clearInterval(timer)
       if (track) firstChildOpen = false
-      res.write(`data: ${JSON.stringify(chunk({ finish: "stop", usage: USAGE }))}\n\n`)
+      if (toolCall) {
+        const input = JSON.stringify(toolCall.args)
+        const split = Math.ceil(input.length / 2)
+        res.write(
+          `data: ${JSON.stringify(
+            chunk({
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: toolCall.id,
+                    type: "function",
+                    function: { name: toolCall.name, arguments: "" },
+                  },
+                ],
+              },
+            }),
+          )}\n\n`,
+        )
+        res.write(
+          `data: ${JSON.stringify(
+            chunk({ delta: { tool_calls: [{ index: 0, function: { arguments: input.slice(0, split) } }] } }),
+          )}\n\n`,
+        )
+        res.write(
+          `data: ${JSON.stringify(
+            chunk({ delta: { tool_calls: [{ index: 0, function: { arguments: input.slice(split) } }] } }),
+          )}\n\n`,
+        )
+      }
+      res.write(`data: ${JSON.stringify(chunk({ finish: toolCall ? "tool_calls" : "stop", usage: USAGE }))}\n\n`)
       res.write("data: [DONE]\n\n")
       complete?.()
       res.end()
@@ -336,16 +366,67 @@ const server = http.createServer(async (req, res) => {
       textReply(res, "task completion confirmed")
       return
     }
+    if (SCENARIO === "sync_child") {
+      slowTextReply(
+        req,
+        res,
+        "foreground child work progressing and completing cleanly",
+        8_000,
+        false,
+        undefined,
+        {
+          name: "task_done",
+          args: { summary: "sync child completed cleanly" },
+          id: `call_task_done_${childCount}`,
+        },
+      )
+      return
+    }
+    if (SCENARIO === "busy_parent") {
+      slowTextReply(
+        req,
+        res,
+        "quick child work completing cleanly",
+        5_000,
+        false,
+        () => log({ role: "busy-child-complete", scenario: SCENARIO, at: Date.now() }),
+        {
+          name: "task_done",
+          args: { summary: "busy child completed cleanly" },
+          id: `call_task_done_${childCount}`,
+        },
+      )
+      return
+    }
     if (SCENARIO === "bad_marker") {
-      if (childCount === 1) {
-        taskDoneReply(res, 42)
+      // Coercion contract: a numeric summary is ACCEPTED (stringified), so
+      // the very first call completes the task — no repair, no reprompt.
+      taskDoneReply(res, 42)
+      return
+    }
+    if (SCENARIO === "sync_spiral") {
+      // Foreground child that spirals: the parent turn is blocked inside the
+      // task tool while the child burns unknown-tool retries. Old builds
+      // never escape; the breaker + escape offer bound it on fixed builds.
+      const informed = flat.includes("TASK_DONE:")
+      if (informed) {
+        textReply(res, "Tool calls keep failing.\nTASK_DONE: sync spiral corrected via escape")
         return
       }
-      if (doneMarkerMissing) {
-        taskDoneReply(res, "recovered after invalid task_done arguments")
+      toolReply(res, "task_finish", { summary: "wrong tool name" }, `call_sync_finish_${childCount}`)
+      return
+    }
+    if (SCENARIO === "spiral") {
+      // A real model repeats its mistake until TOLD what was wrong. The
+      // summary coercion makes malformed task_done args succeed, so the
+      // remaining spiral fuel is an UNKNOWN tool name — unfixable by repair.
+      // The child corrects only when the reprompt offers the escape line.
+      const informed = flat.includes("TASK_DONE:")
+      if (informed) {
+        textReply(res, "Tool calls keep failing.\nTASK_DONE: corrected after the escape offer")
         return
       }
-      textReply(res, "invalid marker attempt finished without a valid completion marker")
+      toolReply(res, "task_finish", { summary: "wrong tool name" }, `call_finish_${childCount}`)
       return
     }
     if (SCENARIO === "marker_text_escape") {
@@ -443,6 +524,7 @@ const server = http.createServer(async (req, res) => {
     role: isParentB ? "parent-b" : "parent",
     n: parentCount,
     scenario: SCENARIO,
+    at: Date.now(),
     childID,
     url: req.url,
     body: parsed,
@@ -454,7 +536,57 @@ const server = http.createServer(async (req, res) => {
   // so every request body mentions the phrase and a substring match fired on
   // the parent's very first turn — before it had spawned anything.
   if (flat.includes("<task-notification task_id=")) {
-    textReply(res, SCENARIO === "inspect" ? "stopped it" : "acknowledged background completion")
+    textReply(
+      res,
+      SCENARIO === "inspect"
+        ? "stopped it"
+        : SCENARIO === "busy_parent"
+          ? "acknowledged completion mid-turn"
+          : "acknowledged background completion",
+    )
+    return
+  }
+
+  if (SCENARIO === "sync_child") {
+    if (flat.includes("<task id=") && flat.includes("sync child completed cleanly")) {
+      textReply(res, "foreground child result received")
+      return
+    }
+    toolReply(res, "task", {
+      description: "foreground child task",
+      prompt: `${CHILD_MARKER}: complete the foreground cache investigation cleanly`,
+      subagent_type: "general",
+    })
+    return
+  }
+
+  if (SCENARIO === "sync_spiral") {
+    if (flat.includes("<task id=")) {
+      textReply(res, "foreground spiral child eventually returned")
+      return
+    }
+    toolReply(res, "task", {
+      description: "foreground spiraling task",
+      prompt: `${CHILD_MARKER}: attempt work with a broken tool habit`,
+      subagent_type: "general",
+    })
+    return
+  }
+
+  if (SCENARIO === "busy_parent") {
+    if (flat.includes("<task id=")) {
+      log({ role: "busy-parent-slow-start", scenario: SCENARIO, at: Date.now() })
+      slowTextReply(req, res, "parent remains busy while the background child finishes", 25_000, false, () =>
+        log({ role: "busy-parent-slow-complete", scenario: SCENARIO, at: Date.now() }),
+      )
+      return
+    }
+    toolReply(res, "task", {
+      description: "busy parent child task",
+      prompt: `${CHILD_MARKER}: complete quickly while the parent remains busy`,
+      subagent_type: "general",
+      background: true,
+    })
     return
   }
 

@@ -63,16 +63,36 @@ function taskDoneBackoffMs(consecutive: number) {
   return Math.min(TASK_DONE_BACKOFF_INITIAL * Math.pow(2, consecutive - 2), TASK_DONE_BACKOFF_MAX)
 }
 
+// Mirrors the tool's Postel-style coercion: the stored part input is the raw
+// call payload, so a numeric/object summary that the tool accepted must also
+// count as a marker here.
+function coercedSummary(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined
+  const text =
+    typeof value === "string"
+      ? value
+      : typeof value === "object"
+        ? (() => {
+            try {
+              return JSON.stringify(value)
+            } catch {
+              return String(value)
+            }
+          })()
+        : String(value)
+  const trimmed = text.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
 function completionSummary(parts: SessionV1.Part[]) {
   const tool = parts.findLast(
     (item) =>
       item.type === "tool" &&
       item.tool === TaskDoneTool.id &&
       item.state.status === "completed" &&
-      typeof item.state.input.summary === "string" &&
-      item.state.input.summary.trim().length > 0,
+      coercedSummary(item.state.input.summary) !== undefined,
   )
-  if (tool?.type === "tool" && tool.state.status === "completed") return tool.state.input.summary.trim()
+  if (tool?.type === "tool" && tool.state.status === "completed") return coercedSummary(tool.state.input.summary)
 
   return parts
     .filter((item): item is SessionV1.TextPart => item.type === "text")

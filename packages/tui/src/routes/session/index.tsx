@@ -88,6 +88,9 @@ import { GoalIndicator } from "../../component/goal-indicator"
 import { DialogRunningTasks } from "../../component/dialog-running-tasks"
 import { TranscriptSearch, type TranscriptSearchRef } from "../../component/transcript-search"
 import { segmentTranscriptMatches } from "../../util/transcript-search"
+import { KeepMounted } from "../../component/keep-mounted"
+import { createRenderRecovery } from "../../util/render-recovery"
+import { recordFlight } from "../../util/flight-recorder"
 
 addDefaultParsers(parsers.parsers)
 
@@ -124,6 +127,7 @@ const sessionBindingCommands = [
   "session.rename",
   "session.timeline",
   "session.search",
+  "session.refresh",
   "session.fork",
   "session.compact",
   "session.unshare",
@@ -254,6 +258,20 @@ export function Session() {
   )
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
 
+  let visibilitySnapshot = ""
+  createEffect(() => {
+    const fields = {
+      visible: visible(),
+      disabled: disabled(),
+      permissions: permissions().length,
+      questions: questions().length,
+    }
+    const next = JSON.stringify(fields)
+    if (next === visibilitySnapshot) return
+    visibilitySnapshot = next
+    recordFlight(paths.log, "session input state changed", { sessionID: route.sessionID, ...fields })
+  })
+
   const pending = createMemo(() => {
     const completed = messages().findLastIndex((message) => message.role === "assistant" && message.time.completed)
     const pending = messages().findLastIndex(
@@ -308,9 +326,25 @@ export function Session() {
   const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
   const toast = useToast()
   const sdk = useSDK()
+  const recovery = createRenderRecovery(sdk.dispatchErrors)
+  const refreshShortcut = useCommandShortcut("session.refresh")
   const goals = useGoal()
   const goal = goals.get(route.sessionID)
   const editor = useEditorContext()
+
+  createEffect(
+    on(
+      sdk.dispatchErrors,
+      (value, previous) => {
+        if (value <= (previous ?? 0)) return
+        recordFlight(paths.log, "session display recovery requested", {
+          sessionID: route.sessionID,
+          dispatchErrors: value,
+        })
+      },
+      { defer: true },
+    ),
+  )
 
   createEffect(() => {
     const sessionID = route.sessionID
@@ -373,6 +407,7 @@ export function Session() {
   let scroll: ScrollBoxRenderable
   let prompt: PromptRef | undefined
   let transcriptSearch: TranscriptSearchRef | undefined
+  let transcriptDiverged = false
   const bind = (r: PromptRef | undefined) => {
     prompt = r
     promptRef.set(r)
@@ -455,6 +490,24 @@ export function Session() {
       if (!scroll || scroll.isDestroyed) return
       scroll.scrollTo(scroll.scrollHeight)
     }, 50)
+  }
+
+  function probeTranscript() {
+    if (!scroll || scroll.isDestroyed) return
+    const stored = messages().length
+    const rendered = scroll.getChildren().filter((child) => child.id?.startsWith("transcript-message-")).length
+    if (stored === rendered) {
+      transcriptDiverged = false
+      return
+    }
+    if (transcriptDiverged) return
+    transcriptDiverged = true
+    recordFlight(paths.log, "session transcript diverged", {
+      sessionID: route.sessionID,
+      stored,
+      rendered,
+      renderEpoch: recovery.renderEpoch(),
+    })
   }
 
   const local = useLocal()
@@ -566,6 +619,16 @@ export function Session() {
   }
 
   const sessionCommandList = createMemo(() => [
+    {
+      title: "Refresh session display",
+      value: "session.refresh",
+      category: "Session",
+      run: () => {
+        recovery.recover()
+        recordFlight(paths.log, "session display refresh requested", { sessionID: route.sessionID })
+        dialog.clear()
+      },
+    },
     {
       title: goal() ? "View goal" : "Set goal",
       value: "session.goal",
@@ -1325,199 +1388,226 @@ export function Session() {
       >
         <box flexDirection="row" flexGrow={1} minHeight={0}>
           <box flexGrow={1} minHeight={0} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1}>
-            <Show when={session()}>
-              <scrollbox
-                ref={(r) => (scroll = r)}
-                viewportOptions={{
-                  paddingRight: showScrollbar() ? 1 : 0,
-                }}
-                verticalScrollbarOptions={{
-                  paddingLeft: 1,
-                  visible: showScrollbar(),
-                  trackOptions: {
-                    backgroundColor: theme.backgroundElement,
-                    foregroundColor: theme.border,
-                  },
-                }}
-                stickyScroll={true}
-                stickyStart="bottom"
-                flexGrow={1}
-                scrollAcceleration={scrollAcceleration()}
-              >
-                <box height={1} />
-                <For each={messages()}>
-                  {(message, index) => (
-                    <Switch>
-                      <Match when={message.id === revert()?.messageID}>
-                        {(function () {
-                          const redoShortcut = useCommandShortcut("session.redo")
-                          const [hover, setHover] = createSignal(false)
-                          const dialog = useDialog()
+            <Show when={recovery.renderEpoch()} keyed>
+              {(epoch) => (
+                <>
+                  <RenderRecoveryProbe epoch={epoch} onReady={recovery.resolve} />
+                  <Show when={session()}>
+                    <scrollbox
+                      ref={(r) => (scroll = r)}
+                      viewportOptions={{
+                        paddingRight: showScrollbar() ? 1 : 0,
+                      }}
+                      verticalScrollbarOptions={{
+                        paddingLeft: 1,
+                        visible: showScrollbar(),
+                        trackOptions: {
+                          backgroundColor: theme.backgroundElement,
+                          foregroundColor: theme.border,
+                        },
+                      }}
+                      stickyScroll={true}
+                      stickyStart="bottom"
+                      flexGrow={1}
+                      scrollAcceleration={scrollAcceleration()}
+                    >
+                      <box height={1} />
+                      <For each={messages()}>
+                        {(message, index) => (
+                          <>
+                            <box id={`transcript-message-${message.id}`} height={0} />
+                            <Switch>
+                              <Match when={message.id === revert()?.messageID}>
+                                {(function () {
+                                  const redoShortcut = useCommandShortcut("session.redo")
+                                  const [hover, setHover] = createSignal(false)
+                                  const dialog = useDialog()
 
-                          const handleUnrevert = async () => {
-                            const confirmed = await DialogConfirm.show(
-                              dialog,
-                              "Confirm Redo",
-                              "Are you sure you want to restore the reverted messages?",
-                            )
-                            if (confirmed) {
-                              keymap.dispatchCommand("session.redo")
-                            }
-                          }
+                                  const handleUnrevert = async () => {
+                                    const confirmed = await DialogConfirm.show(
+                                      dialog,
+                                      "Confirm Redo",
+                                      "Are you sure you want to restore the reverted messages?",
+                                    )
+                                    if (confirmed) {
+                                      keymap.dispatchCommand("session.redo")
+                                    }
+                                  }
 
-                          return (
-                            <box
-                              onMouseOver={() => setHover(true)}
-                              onMouseOut={() => setHover(false)}
-                              onMouseUp={handleUnrevert}
-                              marginTop={1}
-                              flexShrink={0}
-                              border={["left"]}
-                              customBorderChars={SplitBorder.customBorderChars}
-                              borderColor={theme.backgroundPanel}
-                            >
-                              <box
-                                paddingTop={1}
-                                paddingBottom={1}
-                                paddingLeft={2}
-                                backgroundColor={hover() ? theme.backgroundElement : theme.backgroundPanel}
-                              >
-                                <text fg={theme.textMuted}>{revert()!.reverted.length} message reverted</text>
-                                <text fg={theme.textMuted}>
-                                  <span style={{ fg: theme.text }}>{redoShortcut()}</span> or /redo to restore
-                                </text>
-                                <Show when={revert()!.diffFiles?.length}>
-                                  <box marginTop={1}>
-                                    <For each={revert()!.diffFiles}>
-                                      {(file) => (
-                                        <text fg={theme.text}>
-                                          {file.filename}
-                                          <Show when={file.additions > 0}>
-                                            <span style={{ fg: theme.diffAdded }}> +{file.additions}</span>
-                                          </Show>
-                                          <Show when={file.deletions > 0}>
-                                            <span style={{ fg: theme.diffRemoved }}> -{file.deletions}</span>
-                                          </Show>
+                                  return (
+                                    <box
+                                      onMouseOver={() => setHover(true)}
+                                      onMouseOut={() => setHover(false)}
+                                      onMouseUp={handleUnrevert}
+                                      marginTop={1}
+                                      flexShrink={0}
+                                      border={["left"]}
+                                      customBorderChars={SplitBorder.customBorderChars}
+                                      borderColor={theme.backgroundPanel}
+                                    >
+                                      <box
+                                        paddingTop={1}
+                                        paddingBottom={1}
+                                        paddingLeft={2}
+                                        backgroundColor={hover() ? theme.backgroundElement : theme.backgroundPanel}
+                                      >
+                                        <text fg={theme.textMuted}>{revert()!.reverted.length} message reverted</text>
+                                        <text fg={theme.textMuted}>
+                                          <span style={{ fg: theme.text }}>{redoShortcut()}</span> or /redo to restore
                                         </text>
-                                      )}
-                                    </For>
-                                  </box>
-                                </Show>
-                              </box>
-                            </box>
-                          )
-                        })()}
-                      </Match>
-                      <Match
-                        when={revert()?.messageID && revertMessageIndex() !== -1 && index() >= revertMessageIndex()}
-                      >
-                        <></>
-                      </Match>
-                      <Match when={message.role === "user"}>
-                        <UserMessage
-                          index={index()}
-                          onMouseUp={() => {
-                            if (renderer.getSelection()?.getSelectedText()) return
-                            dialog.replace(() => (
-                              <DialogMessage
-                                messageID={message.id}
-                                sessionID={route.sessionID}
-                                queued={
-                                  pending() !== undefined &&
-                                  index() > pending()!.index &&
-                                  !(sync.data.part[message.id] ?? []).some(
-                                    (part) => part.type === "text" && part.metadata?.taskNotification === true,
+                                        <Show when={revert()!.diffFiles?.length}>
+                                          <box marginTop={1}>
+                                            <For each={revert()!.diffFiles}>
+                                              {(file) => (
+                                                <text fg={theme.text}>
+                                                  {file.filename}
+                                                  <Show when={file.additions > 0}>
+                                                    <span style={{ fg: theme.diffAdded }}> +{file.additions}</span>
+                                                  </Show>
+                                                  <Show when={file.deletions > 0}>
+                                                    <span style={{ fg: theme.diffRemoved }}> -{file.deletions}</span>
+                                                  </Show>
+                                                </text>
+                                              )}
+                                            </For>
+                                          </box>
+                                        </Show>
+                                      </box>
+                                    </box>
                                   )
+                                })()}
+                              </Match>
+                              <Match
+                                when={
+                                  revert()?.messageID && revertMessageIndex() !== -1 && index() >= revertMessageIndex()
                                 }
-                                setPrompt={(promptInfo) => prompt?.set(promptInfo)}
-                              />
-                            ))
+                              >
+                                <></>
+                              </Match>
+                              <Match when={message.role === "user"}>
+                                <UserMessage
+                                  index={index()}
+                                  onMouseUp={() => {
+                                    if (renderer.getSelection()?.getSelectedText()) return
+                                    dialog.replace(() => (
+                                      <DialogMessage
+                                        messageID={message.id}
+                                        sessionID={route.sessionID}
+                                        queued={
+                                          pending() !== undefined &&
+                                          index() > pending()!.index &&
+                                          !(sync.data.part[message.id] ?? []).some(
+                                            (part) => part.type === "text" && part.metadata?.taskNotification === true,
+                                          )
+                                        }
+                                        setPrompt={(promptInfo) => prompt?.set(promptInfo)}
+                                      />
+                                    ))
+                                  }}
+                                  message={message as UserMessage}
+                                  parts={sync.data.part[message.id] ?? []}
+                                  pending={pending()?.index}
+                                  pendingFallback={pending()?.fallback ?? false}
+                                  searchMatchID={searchMatchID()}
+                                  searchQuery={searchQuery()}
+                                />
+                              </Match>
+                              <Match when={message.role === "assistant"}>
+                                <AssistantMessage
+                                  last={lastAssistant()?.id === message.id}
+                                  message={message as AssistantMessage}
+                                  parts={sync.data.part[message.id] ?? []}
+                                  searchMatchID={searchMatchID()}
+                                />
+                              </Match>
+                            </Switch>
+                          </>
+                        )}
+                      </For>
+                    </scrollbox>
+                    <box flexShrink={0}>
+                      <Show when={permissions().length > 0}>
+                        <PermissionPrompt
+                          request={permissions()[0]}
+                          directory={sync.session.get(permissions()[0].sessionID)?.directory}
+                        />
+                      </Show>
+                      <Show when={permissions().length === 0 && questions().length > 0}>
+                        <QuestionPrompt
+                          request={questions()[0]}
+                          directory={sync.session.get(questions()[0].sessionID)?.directory}
+                        />
+                      </Show>
+                      <Show when={session()?.parentID}>
+                        <SubagentFooter />
+                      </Show>
+                      <Show when={searchOpen()}>
+                        <TranscriptSearch
+                          ref={(value) => (transcriptSearch = value)}
+                          messages={messages()}
+                          partsByMessage={sync.data.part}
+                          onMatch={(match) => {
+                            setSearchMatchID(match.id)
+                            setSearchQuery(match.query)
                           }}
-                          message={message as UserMessage}
-                          parts={sync.data.part[message.id] ?? []}
-                          pending={pending()?.index}
-                          pendingFallback={pending()?.fallback ?? false}
-                          searchMatchID={searchMatchID()}
-                          searchQuery={searchQuery()}
+                          jumpTo={(id) => {
+                            const child = scroll.getChildren().find((child) => child.id === id)
+                            if (child) scroll.scrollBy(child.y - scroll.y - 1)
+                          }}
+                          onClose={() => {
+                            setSearchOpen(false)
+                            setTimeout(() => prompt?.focus(), 1)
+                          }}
                         />
-                      </Match>
-                      <Match when={message.role === "assistant"}>
-                        <AssistantMessage
-                          last={lastAssistant()?.id === message.id}
-                          message={message as AssistantMessage}
-                          parts={sync.data.part[message.id] ?? []}
-                          searchMatchID={searchMatchID()}
-                        />
-                      </Match>
-                    </Switch>
-                  )}
-                </For>
-              </scrollbox>
-              <box flexShrink={0}>
-                <Show when={permissions().length > 0}>
-                  <PermissionPrompt
-                    request={permissions()[0]}
-                    directory={sync.session.get(permissions()[0].sessionID)?.directory}
-                  />
-                </Show>
-                <Show when={permissions().length === 0 && questions().length > 0}>
-                  <QuestionPrompt
-                    request={questions()[0]}
-                    directory={sync.session.get(questions()[0].sessionID)?.directory}
-                  />
-                </Show>
-                <Show when={session()?.parentID}>
-                  <SubagentFooter />
-                </Show>
-                <Show when={searchOpen()}>
-                  <TranscriptSearch
-                    ref={(value) => (transcriptSearch = value)}
-                    messages={messages()}
-                    partsByMessage={sync.data.part}
-                    onMatch={(match) => {
-                      setSearchMatchID(match.id)
-                      setSearchQuery(match.query)
-                    }}
-                    jumpTo={(id) => {
-                      const child = scroll.getChildren().find((child) => child.id === id)
-                      if (child) scroll.scrollBy(child.y - scroll.y - 1)
-                    }}
-                    onClose={() => {
-                      setSearchOpen(false)
-                      setTimeout(() => prompt?.focus(), 1)
-                    }}
-                  />
-                </Show>
-                <Show when={visible()}>
-                  <GoalIndicator sessionID={route.sessionID} minimized={goalMinimized()} />
-                  <Show when={session()?.parentID && sync.data.session_status[route.sessionID]?.type === "busy"}>
-                    <box paddingLeft={1} paddingRight={1} backgroundColor={theme.backgroundPanel}>
-                      <text fg={theme.textMuted}>
-                        Agent is running — your message will be delivered at its next step.
-                      </text>
+                      </Show>
+                      <Show when={session()?.metadata?.goalReviewer !== true}>
+                        <KeepMounted visible={visible()}>
+                          <GoalIndicator
+                            sessionID={route.sessionID}
+                            minimized={goalMinimized()}
+                            onPoll={probeTranscript}
+                          />
+                          <Show
+                            when={session()?.parentID && sync.data.session_status[route.sessionID]?.type === "busy"}
+                          >
+                            <box paddingLeft={1} paddingRight={1} backgroundColor={theme.backgroundPanel}>
+                              <text fg={theme.textMuted}>
+                                Agent is running — your message will be delivered at its next step.
+                              </text>
+                            </box>
+                          </Show>
+                          <pluginRuntime.Slot
+                            name="session_prompt"
+                            mode="replace"
+                            session_id={route.sessionID}
+                            visible={visible()}
+                            disabled={disabled()}
+                            on_submit={toBottom}
+                            ref={bind}
+                          >
+                            <Prompt
+                              visible={visible()}
+                              ref={bind}
+                              disabled={disabled()}
+                              onSubmit={() => {
+                                toBottom()
+                              }}
+                              sessionID={route.sessionID}
+                              right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
+                            />
+                          </pluginRuntime.Slot>
+                        </KeepMounted>
+                      </Show>
                     </box>
                   </Show>
-                  <pluginRuntime.Slot
-                    name="session_prompt"
-                    mode="replace"
-                    session_id={route.sessionID}
-                    visible={visible()}
-                    disabled={disabled()}
-                    on_submit={toBottom}
-                    ref={bind}
-                  >
-                    <Prompt
-                      visible={visible()}
-                      ref={bind}
-                      disabled={disabled()}
-                      onSubmit={() => {
-                        toBottom()
-                      }}
-                      sessionID={route.sessionID}
-                      right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
-                    />
-                  </pluginRuntime.Slot>
-                </Show>
+                </>
+              )}
+            </Show>
+            <Show when={recovery.desynced()}>
+              <box flexShrink={0} paddingLeft={1} paddingRight={1} backgroundColor={theme.error}>
+                <text fg={selectedForeground(theme, theme.error)}>
+                  Display desynced after an internal error — press {refreshShortcut()} to refresh
+                </text>
               </box>
             </Show>
             <Toast />
@@ -1546,6 +1636,14 @@ export function Session() {
       </context.Provider>
     </LocationProvider>
   )
+}
+
+function RenderRecoveryProbe(props: { epoch: number; onReady: (epoch: number) => void }) {
+  onMount(() => {
+    const timer = setTimeout(() => props.onReady(props.epoch), 100)
+    onCleanup(() => clearTimeout(timer))
+  })
+  return <></>
 }
 
 function UserMessage(props: {
@@ -1587,9 +1685,7 @@ function UserMessage(props: {
     const timer = setInterval(() => setNow(Date.now()), 500)
     onCleanup(() => clearInterval(timer))
   })
-  const queued = createMemo(
-    () => candidate() && (!props.pendingFallback || props.message.time.created + 700 < now()),
-  )
+  const queued = createMemo(() => candidate() && (!props.pendingFallback || props.message.time.created + 700 < now()))
   const color = createMemo(() => local.agent.color(props.message.agent))
   const queuedFg = createMemo(() => selectedForeground(theme, color()))
   const metadataVisible = createMemo(() => queued() || ctx.showTimestamps())

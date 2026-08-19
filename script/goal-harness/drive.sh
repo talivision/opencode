@@ -40,6 +40,10 @@
 #   ux_goal_window worker never claims completion; drives goal minimize/expand and pane assertions
 #   ux_queued_cancel worker claims completion, slow review stays busy while a queued message is cancelled
 #   ux_search worker replies with two searchable texts; drives leader+f and /find, counter cycling, escape
+#   overflow_loop grows the real transcript until compaction; provider-side 400s must stay bounded
+#   desync_recovery ux_queued_cancel flow with OPENCODE_TEST_POISON_DISPATCH making the
+#             cancel's message.removed dispatch throw (the historical field bug); asserts the
+#             flight-recorder beacons, automatic render recovery, and a rendered post-recovery probe
 #
 # Useful overrides:
 #   BIN=... path to the binary (default: the darwin-arm64 build in dist/)
@@ -54,6 +58,9 @@ WATCH="${2:-30}"
 if [ "$SCENARIO" = "soak" ] && [ "$#" -lt 2 ]; then
   WATCH=480
 fi
+if [ "$SCENARIO" = "overflow_loop" ] && [ "$#" -lt 2 ]; then
+  WATCH=90
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
@@ -62,6 +69,8 @@ OBJECTIVE="${OBJECTIVE:-Return control at least twice after saying lima once per
 LONG_OBJECTIVE="Amber cartographers carefully trace winding rivers through forgotten valleys while patient engineers compare every landmark, verify each bridge, document unusual weather, and preserve clear notes so future explorers can reproduce the journey, inspect hidden assumptions, correct subtle mistakes, and finally reach the distant observatory beneath a brilliant winter constellation named Zephyr."
 OBJECTIVE_ROW_PATTERN="Amber|cartographers|carefully|trace|winding|rivers|forgotten|valleys|patient|engineers|landmark|bridge|document|unusual|weather|preserve|notes|future|explorers|reproduce|journey|inspect|hidden|assumptions|correct|subtle|mistakes|finally|distant|observatory|brilliant|winter|constellation|Zephyr"
 QUEUED_MESSAGE="cancel me before the review finishes"
+PROBE_TEXT="desync probe after recovery"
+POISON_DISPATCH="${POISON_DISPATCH:-}"
 PORT="${PORT:-4599}"
 WORK="${WORK:-${TMPDIR:-/tmp}/opencode-goal-harness}"
 SOCK="${SOCK:-/tmp/opencode-goal-harness.sock}"
@@ -75,9 +84,9 @@ if [ "$SCENARIO" = "ux_goal_window" ]; then
 fi
 
 case "$SCENARIO" in
-  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow | soak | ux_goal_window | ux_queued_cancel | ux_search) ;;
+  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow | soak | ux_goal_window | ux_queued_cancel | ux_search | overflow_loop | desync_recovery) ;;
   *)
-    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow|soak|ux_goal_window|ux_queued_cancel|ux_search> [seconds]" >&2
+    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow|soak|ux_goal_window|ux_queued_cancel|ux_search|overflow_loop|desync_recovery> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -194,6 +203,9 @@ const port = process.argv[2]
 const scenario = process.argv[3]
 const config = JSON.parse(fs.readFileSync(file, "utf8"))
 config.provider.fake.options.baseURL = `http://127.0.0.1:${port}/v1`
+if (scenario === "overflow_loop") {
+  config.provider.fake.models["fake-model"].limit = { context: 15000, output: 2000 }
+}
 if (["permission_blocked", "silent"].includes(scenario)) {
   config.goal = { ...config.goal, review: { ...config.goal?.review, timeout: 5000 } }
 }
@@ -231,7 +243,16 @@ if [ "$SCENARIO" = "unclaimed" ]; then
   REVIEWER_NOT_MET_N="${REVIEWER_NOT_MET_N:-0}"
 fi
 
-echo "==> fake provider (:$PORT, REVIEWER_MODE=$SCENARIO)"
+# desync_recovery reuses ux_queued_cancel's provider behavior (worker claims
+# completion, slow review leaves a window to queue + cancel); the scenario's
+# own twist is the poisoned message.removed dispatch inside the TUI.
+PROVIDER_MODE="$SCENARIO"
+if [ "$SCENARIO" = "desync_recovery" ]; then
+  PROVIDER_MODE="ux_queued_cancel"
+  POISON_DISPATCH="${POISON_DISPATCH:-message.removed:1}"
+fi
+
+echo "==> fake provider (:$PORT, REVIEWER_MODE=$PROVIDER_MODE)"
 PORT="$PORT" \
 LOG="$WORK/provider.log" \
 WORKER_TEXT="${WORKER_TEXT:-Lima}" \
@@ -239,7 +260,7 @@ WORKER_INPUT="${WORKER_INPUT:-9000}" \
 WORKER_OUTPUT="${WORKER_OUTPUT:-4}" \
 REVIEWER_INPUT="${REVIEWER_INPUT:-12000}" \
 REVIEWER_OUTPUT="${REVIEWER_OUTPUT:-58}" \
-REVIEWER_MODE="$SCENARIO" \
+REVIEWER_MODE="$PROVIDER_MODE" \
 REVIEWER_NOT_MET_N="${REVIEWER_NOT_MET_N:-1}" \
 REVIEWER_READ_PATH="$REVIEWER_READ_PATH" \
   node "$HERE/fake-provider.mjs" >"$WORK/provider.out" 2>&1 &
@@ -258,6 +279,7 @@ tmux -S "$SOCK" new-session -d -x 160 -y "$PANE_ROWS" -s goal -c "$WORK/proj" \
    OPENCODE_DISABLE_AUTOUPDATE=1 \
    ${TIMEOUT_MS:+OPENCODE_GOAL_REVIEW_TIMEOUT_MS=$TIMEOUT_MS} \
    ${MAX_MS:+OPENCODE_GOAL_REVIEW_MAX_MS=$MAX_MS} \
+   ${POISON_DISPATCH:+OPENCODE_TEST_POISON_DISPATCH=$POISON_DISPATCH} \
    '$BIN' --pure 2>&1 | tee $WORK/tui.log"
 
 sleep 15
@@ -396,6 +418,47 @@ elif [ "$SCENARIO" = "ux_search" ]; then
   tmux -S "$SOCK" send-keys -l -t goal -- "/find"
   tmux -S "$SOCK" send-keys -t goal Enter
   wait_for_goal_text "esc close" "$WORK/snaps/ux-search-slash.txt" || true
+elif [ "$SCENARIO" = "desync_recovery" ]; then
+  UX_WINDOW="$WATCH"
+  if [ "$UX_WINDOW" -gt 45 ]; then
+    UX_WINDOW=45
+  fi
+  UX_DEADLINE=$((SECONDS + UX_WINDOW))
+  OCLOG_DIR="$WORK/home/.local/share/opencode/log"
+
+  echo "==> wait for slow independent review"
+  wait_for_goal_regex "review running|Independent review" "$WORK/snaps/desync-review-running.txt" || true
+
+  echo "==> queue message during review"
+  tmux -S "$SOCK" send-keys -l -t goal -- "$QUEUED_MESSAGE"
+  tmux -S "$SOCK" send-keys -t goal Enter
+  wait_for_queued_message "$WORK/snaps/desync-queued.txt" || true
+
+  queued_row="$(grep -nF "cancel me before" "$WORK/snaps/desync-queued.txt" | tail -1 | cut -d: -f1 || true)"
+  if [ -n "$queued_row" ]; then
+    echo "==> cancel queued message at row $queued_row (its message.removed dispatch is poisoned)"
+    tmux -S "$SOCK" send-keys -t goal -- $'\e[<0;8;'"$queued_row"$'M'
+    sleep 0.2
+    tmux -S "$SOCK" send-keys -t goal -- $'\e[<0;8;'"$queued_row"$'m'
+  fi
+  wait_for_goal_text "Message Actions" "$WORK/snaps/desync-actions.txt" || true
+  tmux -S "$SOCK" send-keys -t goal Enter
+
+  echo "==> wait for the automatic recovery beacon"
+  while [ "$SECONDS" -lt "$UX_DEADLINE" ]; do
+    if grep -aq "session display recovery requested" "$OCLOG_DIR"/*.log 2>/dev/null; then
+      break
+    fi
+    sleep 0.5
+  done
+
+  echo "==> probe input after recovery"
+  tmux -S "$SOCK" send-keys -l -t goal -- "$PROBE_TEXT"
+  tmux -S "$SOCK" send-keys -t goal Enter
+  # Give Enter a beat to clear the composer so a match below is a transcript
+  # row (or queued row), not the composer echo.
+  sleep 1
+  wait_for_goal_text "$PROBE_TEXT" "$WORK/snaps/desync-probe.txt" || true
 elif [ "$SCENARIO" = "permission_blocked" ]; then
   echo "==> wait for reviewer permission block"
   blocked=0
@@ -451,7 +514,7 @@ else
   done
 fi
 
-if [ "$SCENARIO" = "soak" ]; then
+if [ "$SCENARIO" = "soak" ] || [ "$SCENARIO" = "overflow_loop" ]; then
   capture_goal_pane "$WORK/snaps/final.txt" || true
 fi
 
@@ -471,7 +534,7 @@ if [ "$SCENARIO" = "retrieval" ]; then
 fi
 
 case "$SCENARIO" in
-  unclaimed | not_met_history | turns | interrupted | cache-stable | goal-events | permission_blocked | goal_check | silent | http500 | soak)
+  unclaimed | not_met_history | turns | interrupted | cache-stable | goal-events | permission_blocked | goal_check | silent | http500 | soak | overflow_loop)
     echo "==> $SCENARIO assertions"
     DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
     node "$HERE/assert-scenarios.mjs" \
@@ -483,6 +546,37 @@ case "$SCENARIO" in
       "$WORK/interrupted-goal.json"
     ;;
 esac
+
+if [ "$SCENARIO" = "desync_recovery" ]; then
+  OCLOG_DIR="$WORK/home/.local/share/opencode/log"
+  DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
+
+  if grep -aq "test dispatch poison" "$OCLOG_DIR"/*.log 2>/dev/null; then
+    ux_ok "injected message.removed dispatch throw hit the emit path"
+  else
+    ux_fail "injected message.removed dispatch throw hit the emit path" "no 'test dispatch poison' beacon in $OCLOG_DIR"
+  fi
+  if grep -aq "tui event dispatch failed" "$OCLOG_DIR"/*.log 2>/dev/null; then
+    ux_ok "flight recorder captured the dispatch failure"
+  else
+    ux_fail "flight recorder captured the dispatch failure" "no 'tui event dispatch failed' line"
+  fi
+  if grep -aq "session display recovery requested" "$OCLOG_DIR"/*.log 2>/dev/null; then
+    ux_ok "session route observed the dispatch error and requested recovery"
+  else
+    ux_fail "session route observed the dispatch error and requested recovery" "no recovery beacon"
+  fi
+  if grep -Fq "$PROBE_TEXT" "$WORK/snaps/desync-probe.txt" 2>/dev/null; then
+    ux_ok "post-recovery probe rendered (no input black hole)"
+  else
+    ux_fail "post-recovery probe rendered (no input black hole)" "probe text missing from pane"
+  fi
+  if [ -n "$DB" ] && [ "$(sqlite3 "$DB" "SELECT count(*) FROM part WHERE json_extract(data,'\$.text') LIKE '%${PROBE_TEXT}%';" 2>/dev/null || echo 0)" -ge 1 ]; then
+    ux_ok "post-recovery probe persisted server-side"
+  else
+    ux_fail "post-recovery probe persisted server-side" "probe not found in db parts"
+  fi
+fi
 
 if [ "$SCENARIO" = "ux_goal_window" ]; then
   expanded="$WORK/snaps/ux-goal-expanded.txt"

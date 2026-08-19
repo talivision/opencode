@@ -260,6 +260,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                       cwd: process.cwd(),
                       home: global.home,
                       state: global.state,
+                      log: global.log,
                       worktree: global.data + "/worktree",
                     }}
                   >
@@ -300,6 +301,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                                         <SDKProvider
                                           url={input.url}
                                           directory={input.directory}
+                                          log={global.log}
                                           fetch={input.fetch}
                                           headers={input.headers}
                                           events={input.events}

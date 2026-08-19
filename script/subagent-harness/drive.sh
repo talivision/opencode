@@ -26,6 +26,10 @@
 #           validation detail in the reprompt, then completes with corrected arguments
 #   marker_text_escape child never calls task_done and completes through the fallback
 #           after the second missing-marker reprompt advertises TASK_DONE
+#   sync_child a foreground child completes inline; the blocked parent resumes with
+#           the rendered task result and receives no background notification
+#   busy_parent a quick background child completes during a slow parent stream;
+#           the notification is injected into that run at its next step boundary
 #   ux_navigation drives leader+down into the live child, then leader+up back to the parent
 #
 # Useful overrides:
@@ -41,6 +45,12 @@ WATCH="${2:-35}"
 if [ "$SCENARIO" = "soak" ] && [ "$#" -lt 2 ]; then
   WATCH=360
 fi
+if [ "$SCENARIO" = "sync_child" ] && [ "$#" -lt 2 ]; then
+  WATCH=60
+fi
+if [ "$SCENARIO" = "busy_parent" ] && [ "$#" -lt 2 ]; then
+  WATCH=75
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
@@ -51,9 +61,9 @@ WORK="${WORK:-${TMPDIR:-/tmp}/opencode-subagent-harness}"
 SOCK="${SOCK:-/tmp/opencode-subagent-harness.sock}"
 
 case "$SCENARIO" in
-  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | bad_marker | marker_text_escape | ux_navigation) ;;
+  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | bad_marker | marker_text_escape | spiral | sync_spiral | sync_child | busy_parent | ux_navigation) ;;
   *)
-    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership|drop|soak|bad_marker|marker_text_escape|ux_navigation> [seconds]" >&2
+    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership|drop|soak|bad_marker|marker_text_escape|spiral|sync_spiral|sync_child|busy_parent|ux_navigation> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -250,7 +260,7 @@ else
   done
 fi
 
-if [ "$SCENARIO" = "soak" ]; then
+if [ "$SCENARIO" = "soak" ] || [ "$SCENARIO" = "sync_child" ] || [ "$SCENARIO" = "busy_parent" ]; then
   capture_subagent_pane "$WORK/snaps/final.txt" || true
 fi
 
@@ -452,7 +462,7 @@ if [ "$SCENARIO" = "stop-one" ]; then
 fi
 
 case "$SCENARIO" in
-  fanout | stop-one | ownership | drop | soak | bad_marker | marker_text_escape)
+  fanout | stop-one | ownership | drop | soak | bad_marker | marker_text_escape | spiral | sync_spiral | sync_child | busy_parent)
     echo "==> $SCENARIO assertions"
     node "$HERE/assert-scenarios.mjs" \
       "$SCENARIO" \

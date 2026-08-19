@@ -3,6 +3,7 @@ import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { createSimpleContext } from "./helper"
 import { batch, createSignal, onCleanup, onMount, type Accessor } from "solid-js"
+import { recordFlight } from "../util/flight-recorder"
 
 export type EventSource = {
   subscribe: (handler: (event: GlobalEvent) => void) => Promise<() => void>
@@ -17,11 +18,13 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     fetch?: typeof fetch
     headers?: RequestInit["headers"]
     events?: EventSource
+    log?: string
   }) => {
     const abort = new AbortController()
     let sse: AbortController | undefined
     const [reconnects, setReconnects] = createSignal(0)
     const [dispatchErrors, setDispatchErrors] = createSignal(0)
+    const [streamErrors, setStreamErrors] = createSignal(0)
     let onSSEConnected: (() => void) | undefined
 
     function createSDK() {
@@ -42,19 +45,38 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     let sdk = createSDK()
 
     const handlers = new Set<(event: GlobalEvent) => void>()
+    // Test-only fault injection: OPENCODE_TEST_POISON_DISPATCH="<eventType>:<count>"
+    // makes the first <count> dispatches of <eventType> throw, so the harness can
+    // drive the desync-recovery path (status line + render-epoch rebuild) against
+    // the real compiled binary. Inert unless the env var is set.
+    const poison = (() => {
+      const spec = process.env["OPENCODE_TEST_POISON_DISPATCH"]
+      if (!spec) return undefined
+      const index = spec.lastIndexOf(":")
+      const type = index === -1 ? spec : spec.slice(0, index)
+      const count = index === -1 ? 1 : Number(spec.slice(index + 1)) || 1
+      return { type, remaining: count }
+    })()
     const emitter = {
       emit(_type: "event", event: GlobalEvent, remainingInBatch = 0) {
         for (const handler of handlers) {
           try {
+            if (poison && poison.remaining > 0 && event.payload.type === poison.type) {
+              poison.remaining -= 1
+              throw new Error("test dispatch poison")
+            }
             handler(event)
           } catch (error) {
             setDispatchErrors((value) => value + 1)
-            console.error("tui event dispatch failed", {
+            const detail = {
               eventType: event.payload.type,
               error: error instanceof Error ? error.message : String(error),
               stack: error instanceof Error ? error.stack : undefined,
               remainingInBatch,
-            })
+              reconnect_cause: "dispatch_throw",
+            }
+            recordFlight(props.log, "tui event dispatch failed", detail)
+            console.error("tui event dispatch failed", detail)
           }
         }
       },
@@ -105,6 +127,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       ;(async () => {
         let attempt = 0
         let established = false
+        let eventType: GlobalEvent["payload"]["type"] | undefined
         while (true) {
           if (abort.signal.aborted || ctrl.signal.aborted) break
 
@@ -127,14 +150,21 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
 
             for await (const event of events.stream) {
               if (ctrl.signal.aborted) break
+              eventType = event.payload.type
               handleEvent(event)
+              eventType = undefined
             }
           } catch (error) {
             if (!abort.signal.aborted && !ctrl.signal.aborted) {
-              console.error("tui event stream failed", {
+              setStreamErrors((value) => value + 1)
+              const detail = {
+                eventType: eventType ?? "unknown",
                 error: error instanceof Error ? error.message : String(error),
                 stack: error instanceof Error ? error.stack : undefined,
-              })
+                reconnect_cause: eventType ? "dispatch_throw" : "stream_error",
+              }
+              recordFlight(props.log, "tui event stream failed", detail)
+              console.error("tui event stream failed", detail)
             }
           } finally {
             onSSEConnected = undefined
@@ -188,6 +218,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       event: emitter,
       reconnects: props.events?.reconnects ?? reconnects,
       dispatchErrors,
+      streamErrors,
       fetch: props.fetch ?? fetch,
       url: props.url,
     }

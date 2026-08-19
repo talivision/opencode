@@ -20,6 +20,7 @@ export function TestTuiContexts(
         cwd: props.cwd ?? props.directory ?? "/tmp/opencode/packages/opencode",
         home: "/tmp/opencode/home",
         state: "/tmp/opencode/state",
+        log: "/tmp/opencode/log",
         worktree: "/tmp/opencode",
         ...props.paths,
       }}

@@ -178,6 +178,51 @@ if (scenario === "soak") {
   )
 }
 
+if (scenario === "overflow_loop") {
+  const overflowLimitChars = 24_000
+  const summaries = db
+    .prepare("SELECT data FROM message WHERE json_extract(data, '$.role') = 'assistant' AND json_extract(data, '$.summary') = 1")
+    .all()
+    .map((row) => JSON.parse(row.data))
+  const successful = summaries.filter((message) => message.finish && !message.error)
+  const terminal = db
+    .prepare("SELECT id, data FROM message")
+    .all()
+    .filter((row) => /too large to compact/i.test(row.data))
+  const summarizeRequests = entries.filter(
+    (entry) =>
+      entry.role === "auxiliary" &&
+      /Create a new anchored summary from the conversation history|The <prior-summary> summarizes everything/.test(
+        JSON.stringify(entry.body ?? {}),
+      ),
+  )
+  const overflows = entries.filter((entry) => entry.role === "overflow-400")
+  const finalPane = fs.existsSync(path.join(snapDir, "final.txt"))
+    ? fs.readFileSync(path.join(snapDir, "final.txt"), "utf8")
+    : ""
+  const overflowSizes = overflows.map((entry) => entry.size).join(",") || "none"
+  check(
+    "overflow_loop attempted real compaction",
+    summarizeRequests.length > 0 || summaries.length > 0,
+    `summarize requests=${summarizeRequests.length}, summary rows=${summaries.length}, auxiliary sizes=${summarizeRequests.map((entry) => entry.size).join(",") || "none"}`,
+  )
+  check(
+    "overflow_loop completed a summary and recorded at most one terminal too-large-to-compact failure",
+    successful.length > 0 && terminal.length <= 1,
+    `successful summaries=${successful.length}, terminal errors=${terminal.length}, terminal message ids=${terminal.map((row) => row.id).join(",") || "none"}`,
+  )
+  check(
+    "overflow_loop bounded provider context-overflow thrash to at most six responses",
+    overflows.length <= 6,
+    `overflow-400 count=${overflows.length}, threshold=${overflowLimitChars} chars, request sizes=${overflowSizes}`,
+  )
+  check(
+    "overflow_loop left the TUI alive with stable footer chrome",
+    finalPane.includes("ctrl+p") || finalPane.includes("shift+tab"),
+    `final pane chars=${finalPane.length}, ctrl+p=${finalPane.includes("ctrl+p")}, shift+tab=${finalPane.includes("shift+tab")}`,
+  )
+}
+
 if (scenario === "not_met_history") {
   const later = workers.find((entry) => JSON.stringify(entry.body).includes("Earlier attempts were also rejected"))
   const body = JSON.stringify(later?.body ?? {})

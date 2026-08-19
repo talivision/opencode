@@ -2015,7 +2015,7 @@ const layer = Layer.effect(
           // A denied permission is the one stop reason that leaves no trace on
           // the assistant message, so it is carried out of the step explicitly.
           let denied = false
-          const outcome: "break" | "continue" = yield* Effect.gen(function* () {
+          let outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
@@ -2133,6 +2133,46 @@ const layer = Layer.effect(
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
+          // Death-spiral breaker: a model that keeps calling the same tool
+          // with invalid arguments loops through repair steps at provider
+          // speed (measured ~19 requests/second) and never reaches a turn
+          // boundary — so none of the boundary-layer recovery (error-quoting
+          // reprompts, the TASK_DONE escape, goal reminders) can engage.
+          // Three consecutive failed executions of one tool end the turn.
+          if (outcome === "continue" && !handle.message.error) {
+            // Each spiral step is its own assistant message, so the streak is
+            // counted across the trailing MESSAGES, not within one.
+            const recent = yield* sessions.messages({ sessionID, limit: 8 }).pipe(Effect.orDie)
+            let streakTool: string | undefined
+            let streak = 0
+            scan: for (const message of recent) {
+              if (message.info.role !== "assistant") break
+              for (let index = message.parts.length - 1; index >= 0; index--) {
+                const part = message.parts[index]
+                if (part.type !== "tool") continue
+                const invalidRepair =
+                  part.tool === "invalid" &&
+                  part.state.status === "completed" &&
+                  typeof (part.state.input as { error?: unknown })?.error === "string"
+                const failed = part.state.status === "error" || invalidRepair
+                if (!failed) break scan
+                const name = invalidRepair
+                  ? String((part.state.input as { tool?: unknown })?.tool ?? "invalid")
+                  : part.tool
+                if (streakTool === undefined) streakTool = name
+                if (name !== streakTool) break scan
+                streak += 1
+              }
+            }
+            if (streak >= 3) {
+              yield* Effect.logWarning("ending turn after consecutive failed tool calls", {
+                "session.id": sessionID,
+                tool: streakTool,
+                streak,
+              })
+              outcome = "break"
+            }
+          }
           const interrupted = handle.message.error ? formatMessageError(handle.message.error) : undefined
           if (goalTurn) {
             // A turn that died on a provider error, an exhausted retry, or an

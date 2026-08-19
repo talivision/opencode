@@ -60,6 +60,7 @@ import { useLocation } from "../../context/location"
 import { parseGoalCommand, useGoal } from "../../context/goal"
 import { DialogGoal } from "../dialog-goal"
 import { PermissionBadge } from "./permission-badge"
+import { recordFlight } from "../../util/flight-recorder"
 
 registerOpencodeSpinner()
 
@@ -105,6 +106,7 @@ const money = new Intl.NumberFormat("en-US", {
 })
 
 const DRAFT_RETENTION_MIN_CHARS = 20
+const GOAL_SUBMIT_TIMEOUT = 15_000
 
 function randomIndex(count: number) {
   if (count <= 0) return 0
@@ -938,6 +940,11 @@ export function Prompt(props: PromptProps) {
   })
 
   let submitting = false
+  const refuse = (reason: string) => {
+    recordFlight(paths.log, "submit refused", { reason, sessionID: props.sessionID })
+    return false
+  }
+
   async function submit() {
     // Prevent overlapping invocations (e.g. a double-pressed Enter, or the
     // input's native onSubmit racing another dispatch). Without this guard,
@@ -945,7 +952,7 @@ export function Prompt(props: PromptProps) {
     // clears `store.prompt.input`, then awaits its own `session.create` and
     // ultimately reads the now-empty store — sending a phantom empty prompt
     // to a freshly created session.
-    if (submitting) return false
+    if (submitting) return refuse("submitting")
     submitting = true
     try {
       return await submitInner()
@@ -964,21 +971,23 @@ export function Prompt(props: PromptProps) {
       setStore("prompt", "input", input.plainText)
       syncExtmarksWithPromptParts()
     }
-    if (props.disabled) return false
-    if (workspace.creating() || move.creating()) return false
-    if (auto()?.visible) return false
-    if (!store.prompt.input) return false
+    if (props.disabled) return refuse("disabled")
+    if (workspace.creating()) return refuse("workspace_creating")
+    if (move.creating()) return refuse("move_creating")
+    if (auto()?.visible) return refuse("autocomplete_visible")
+    if (!store.prompt.input) return refuse("empty")
     const agent = local.agent.current()
-    if (!agent) return false
+    if (!agent) return refuse("agent_missing")
     const trimmed = store.prompt.input.trim()
     if (trimmed === "exit" || trimmed === "quit" || trimmed === ":q") {
+      recordFlight(paths.log, "submit handled", { reason: "exit_command", sessionID: props.sessionID })
       void exit()
       return true
     }
     const selectedModel = local.model.current()
     if (!selectedModel) {
       void promptModelWarning()
-      return false
+      return refuse("model_missing")
     }
 
     const workspaceSession = props.sessionID ? sync.session.get(props.sessionID) : undefined
@@ -993,7 +1002,7 @@ export function Prompt(props: PromptProps) {
           }}
         />
       ))
-      return false
+      return refuse("workspace_unavailable")
     }
 
     const variant = local.model.variant.current()
@@ -1004,7 +1013,7 @@ export function Prompt(props: PromptProps) {
       const workspaceID = selectedWorkspace?.type === "existing" ? selectedWorkspace.workspaceID : undefined
 
       const directory = await move.getDirectory(store.prompt.input)
-      if (move.pending() && !directory) return false
+      if (move.pending() && !directory) return refuse("move_pending")
       finishMoveProgress = Boolean(move.progress())
 
       const res = await sdk.client.session.create({
@@ -1027,6 +1036,7 @@ export function Prompt(props: PromptProps) {
           variant: "error",
         })
 
+        refuse("session_create_failed")
         return true
       }
 
@@ -1086,8 +1096,7 @@ export function Prompt(props: PromptProps) {
       setStore("mode", "normal")
     } else if (goalInput !== undefined) {
       move.startSubmit()
-      await goals
-        .execute(sessionID, goalInput)
+      await withTimeout(goals.execute(sessionID, goalInput), GOAL_SUBMIT_TIMEOUT, "Goal command timed out")
         .then((result) => {
           if (result.action === "show" || result.action === "edit") {
             dialog.replace(() => <DialogGoal sessionID={sessionID} />)
@@ -1134,7 +1143,7 @@ export function Prompt(props: PromptProps) {
       })
     } else {
       move.startSubmit()
-      sdk.client.session
+      void sdk.client.session
         .prompt(
           {
             sessionID,
@@ -1153,6 +1162,9 @@ export function Prompt(props: PromptProps) {
           },
           { throwOnError: true },
         )
+        .then(() => {
+          recordFlight(paths.log, "prompt sent", { sessionID })
+        })
         .catch((error) => {
           toast.show({
             title: "Failed to send prompt",
@@ -1769,4 +1781,16 @@ export function Prompt(props: PromptProps) {
       />
     </>
   )
+}
+
+function withTimeout<T>(promise: Promise<T>, timeout: number, message: string) {
+  let timer: Timer | undefined
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeout)
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
 }

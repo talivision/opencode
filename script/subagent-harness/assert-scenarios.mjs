@@ -1,4 +1,5 @@
-// Assertions for fanout, stop-one, ownership, drop, soak, bad_marker, and marker_text_escape.
+// Assertions for fanout, stop-one, ownership, drop, soak, bad_marker,
+// marker_text_escape, spiral, sync_child, and busy_parent.
 //
 // Uses provider request logs plus SQLite's snake_case session_id, parent_id,
 // and message_id columns. stop-one also consumes the provider's live-state
@@ -270,10 +271,7 @@ if (scenario === "soak") {
 
 if (scenario === "bad_marker") {
   const childRequests = entries.filter((entry) => entry.role === "child")
-  const reprompt = childRequests.find((entry) => {
-    const body = JSON.stringify(entry.body).toLowerCase()
-    return entry.doneMarkerMissing === true && body.includes("summary") && body.includes("string")
-  })
+  const reprompts = childRequests.filter((entry) => entry.doneMarkerMissing === true)
   const notifications = db
     .prepare(
       `SELECT json_extract(p.data, '$.text') AS text
@@ -285,16 +283,33 @@ if (scenario === "bad_marker") {
          AND json_extract(p.data, '$.text') LIKE '%<task-notification task_id=%status="completed"%'`,
     )
     .all()
+  // Postel coercion: a numeric summary is accepted and stringified, so the
+  // FIRST call completes the task with zero reprompts and zero repair churn.
+  check("bad_marker coerces the numeric summary with no reprompt", reprompts.length === 0, `${reprompts.length} reprompts`)
   check(
-    "bad_marker reprompt carries the task_done summary validation error",
-    reprompt !== undefined,
-    JSON.stringify(childRequests.map((entry) => ({ n: entry.n, doneMarkerMissing: entry.doneMarkerMissing }))),
+    "bad_marker completes on the first call with the stringified summary",
+    childRequests.length <= 2 && notifications.some((row) => row.text?.includes("<summary>") && row.text?.includes("42")),
+    `${childRequests.length} child requests; ${JSON.stringify(notifications.map((row) => row.text?.slice(0, 120)))}`,
   )
-  check(
-    "bad_marker completes after the corrected task_done call",
-    notifications.some((row) => row.text?.includes("recovered after invalid task_done arguments")),
-    JSON.stringify(notifications),
-  )
+}
+
+if (scenario === "spiral") {
+  const child = entries.filter((entry) => entry.role === "child")
+  const informed = child.filter((entry) => JSON.stringify(entry.body).includes("TASK_DONE:"))
+  const notifications = db
+    .prepare(
+      `SELECT json_extract(p.data, '$.text') AS text
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'user'
+         AND json_extract(p.data, '$.text') LIKE '%<task-notification task_id=%status="completed"%'`,
+    )
+    .all()
+  check("the escape-offering reprompt reached the spiral child", informed.length >= 1, `${informed.length} informed reprompts`)
+  check("the informed child completed exactly once", notifications.length === 1, `${notifications.length} notifications`)
+  check("the spiral stayed bounded", child.length <= 10, `${child.length} child requests`)
 }
 
 if (scenario === "marker_text_escape") {
@@ -329,6 +344,131 @@ if (scenario === "marker_text_escape") {
     "marker_text_escape completion notification carries the text summary",
     notifications.some((row) => row.text?.includes("escaped via text marker")),
     JSON.stringify(notifications),
+  )
+}
+
+if (scenario === "sync_child") {
+  const children = db.prepare("SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL").all()
+  const notifications = db
+    .prepare(
+      `SELECT p.id
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'user'
+         AND json_extract(p.data, '$.text') LIKE '%<task-notification%'`,
+    )
+    .all()
+  const taskParts = db
+    .prepare(
+      `SELECT json_extract(p.data, '$.state.output') AS output
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'assistant'
+         AND json_extract(p.data, '$.tool') = 'task'
+         AND json_extract(p.data, '$.state.status') = 'completed'`,
+    )
+    .all()
+  const postResult = db
+    .prepare(
+      `SELECT count(*) AS count
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'assistant'
+         AND json_extract(p.data, '$.text') LIKE '%foreground child result received%'`,
+    )
+    .get()
+  const finalPane = fs.existsSync(path.join(snapDir, "final.txt"))
+    ? fs.readFileSync(path.join(snapDir, "final.txt"), "utf8")
+    : ""
+  check(
+    "sync_child creates exactly one child and sends no parent notification",
+    children.length === 1 && notifications.length === 0,
+    `${children.length} children, ${notifications.length} notifications`,
+  )
+  check(
+    // The foreground return path renders the summary inside <task_result>,
+    // not as a <summary> tag — assert the content, not the tag.
+    "the foreground task completes inline with its rendered child summary",
+    taskParts.length === 1 &&
+      taskParts[0].output?.includes('state="completed"') &&
+      taskParts[0].output?.includes("sync child completed cleanly"),
+    JSON.stringify(taskParts),
+  )
+  check("the parent answers after receiving the foreground result", postResult.count === 1, `${postResult.count} replies`)
+  check(
+    "sync_child leaves the TUI alive with prompt chrome",
+    finalPane.includes("ctrl+p") || finalPane.includes("shift+tab"),
+  )
+}
+
+if (scenario === "busy_parent") {
+  const notifications = db
+    .prepare(
+      `SELECT p.id
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'user'
+         AND json_extract(p.data, '$.text') LIKE '%<task-notification task_id=%status="completed"%'`,
+    )
+    .all()
+  const parentUsers = db
+    .prepare(
+      `SELECT count(*) AS count
+       FROM message m
+       JOIN session s ON s.id = m.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'user'`,
+    )
+    .get()
+  const acknowledgments = db
+    .prepare(
+      `SELECT count(*) AS count
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'assistant'
+         AND json_extract(p.data, '$.text') LIKE '%acknowledged completion mid-turn%'`,
+    )
+    .get()
+  const slowStart = entries.find((entry) => entry.role === "busy-parent-slow-start")
+  const slowComplete = entries.find((entry) => entry.role === "busy-parent-slow-complete")
+  const childComplete = entries.find((entry) => entry.role === "busy-child-complete")
+  const notificationRequest = entries.find(
+    (entry) => entry.role === "parent" && JSON.stringify(entry.body).includes("<task-notification task_id="),
+  )
+  const finalPane = fs.existsSync(path.join(snapDir, "final.txt"))
+    ? fs.readFileSync(path.join(snapDir, "final.txt"), "utf8")
+    : ""
+  check(
+    "busy_parent records exactly one completed parent notification",
+    notifications.length === 1,
+    `${notifications.length} notifications`,
+  )
+  check(
+    "the completion lands during the busy stream and is acknowledged in the same parent run",
+    Number.isFinite(slowStart?.at) &&
+      Number.isFinite(slowComplete?.at) &&
+      Number.isFinite(childComplete?.at) &&
+      Number.isFinite(notificationRequest?.at) &&
+      slowStart.at <= childComplete.at &&
+      childComplete.at < slowComplete.at &&
+      slowStart.at <= notificationRequest.at &&
+      parentUsers.count === 2 &&
+      acknowledgments.count === 1,
+    `timing=${JSON.stringify({ slowStart: slowStart?.at, childComplete: childComplete?.at, slowComplete: slowComplete?.at, notificationRequest: notificationRequest?.at })}, users=${parentUsers.count}, acknowledgments=${acknowledgments.count}`,
+  )
+  check(
+    "busy_parent leaves the TUI alive with prompt chrome",
+    finalPane.includes("ctrl+p") || finalPane.includes("shift+tab"),
   )
 }
 
