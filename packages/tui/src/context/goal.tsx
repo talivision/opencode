@@ -15,6 +15,8 @@ type GoalContext = {
   refresh(sessionID: string): Promise<Goal>
   resume(sessionID: string, send: () => Promise<unknown>): Promise<Goal>
   execute(sessionID: string, input: string): Promise<CommandResult>
+  suppressContinuation(sessionID: string): Promise<void>
+  suppressedAt(sessionID: string): number
 }
 
 const context = createContext<GoalContext>()
@@ -52,6 +54,25 @@ export function GoalProvider(props: ParentProps) {
     await send()
     return current
   }
+
+  // Esc must stop the run without cancelling the goal: the server keeps the
+  // goal active and freezes its clock, and the TUI suppresses only the
+  // continuation for the very state its own abort produced. Any later goal
+  // update (a new message, /goal edit, a resumed run) has a newer
+  // time.updated and re-enables continuation naturally.
+  const suppressed = new Map<string, number>()
+  const suppressContinuation = async (sessionID: string) => {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const current = await refresh(sessionID).catch(() => null)
+      if (!current) return
+      if (current.status !== "active" || !current.time.running) {
+        suppressed.set(sessionID, current.time.updated)
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  }
+  const suppressedAt = (sessionID: string) => suppressed.get(sessionID) ?? 0
 
   const execute = async (sessionID: string, input: string): Promise<CommandResult> => {
     const args = input.trim()
@@ -121,6 +142,8 @@ export function GoalProvider(props: ParentProps) {
         get: (sessionID) => () => goals().get(sessionID),
         refresh,
         resume,
+        suppressContinuation,
+        suppressedAt,
         execute,
       }}
     >

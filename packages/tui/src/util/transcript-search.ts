@@ -6,6 +6,31 @@ export type TranscriptMatch = {
   preview: string
 }
 
+export type TranscriptHighlightSegment = {
+  text: string
+  match: boolean
+}
+
+export function segmentTranscriptMatches(text: string, query: string) {
+  if (!query) return [{ text, match: false }]
+  const source = text.toLowerCase()
+  const needle = query.toLowerCase()
+  const first = source.indexOf(needle)
+  if (first === -1) return [{ text, match: false }]
+
+  const segments: TranscriptHighlightSegment[] = []
+  let offset = 0
+  let index = first
+  while (index !== -1) {
+    if (index > offset) segments.push({ text: text.slice(offset, index), match: false })
+    segments.push({ text: text.slice(index, index + query.length), match: true })
+    offset = index + query.length
+    index = source.indexOf(needle, offset)
+  }
+  if (offset < text.length) segments.push({ text: text.slice(offset), match: false })
+  return segments
+}
+
 export function findMatches(messages: Message[], partsByMessage: Record<string, Part[]>, query: string) {
   if (!query) return []
   const needle = query.toLowerCase()

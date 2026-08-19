@@ -18,7 +18,7 @@ export function TranscriptSearch(props: {
   partsByMessage: Record<string, Part[]>
   jumpTo: (id: string) => void
   onClose: () => void
-  onMatch?: (id: string | undefined) => void
+  onMatch?: (match: { id: string | undefined; query: string }) => void
   ref?: (ref: TranscriptSearchRef | undefined) => void
 }) {
   const { theme } = useTheme()
@@ -46,12 +46,12 @@ export function TranscriptSearch(props: {
     setSelected(index)
     const match = matches()[index]
     const id = match ? (match.partID ?? match.messageID) : undefined
-    props.onMatch?.(id)
+    props.onMatch?.({ id, query: query() })
     if (id) props.jumpTo(id)
   }
 
   createEffect(() => select(matches().length - 1))
-  onCleanup(() => props.onMatch?.(undefined))
+  onCleanup(() => props.onMatch?.({ id: undefined, query: "" }))
 
   const move = (direction: -1 | 1) => {
     const total = matches().length

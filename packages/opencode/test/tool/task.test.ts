@@ -190,6 +190,26 @@ function textReply(input: SessionPrompt.PromptInput, text: string): SessionV1.Wi
   return { ...result, parts: result.parts.filter((part) => part.type !== "tool") }
 }
 
+function markerErrorReply(input: SessionPrompt.PromptInput, error: string): SessionV1.WithParts {
+  const result = reply(input, "invalid marker attempt")
+  return {
+    ...result,
+    parts: result.parts.map((part) =>
+      part.type === "tool"
+        ? {
+            ...part,
+            state: {
+              status: "error" as const,
+              input: { summary: 42 },
+              error,
+              time: { start: Date.now(), end: Date.now() },
+            },
+          }
+        : part,
+    ),
+  }
+}
+
 describe("tool.task", () => {
   it.instance("task_done refuses top-level sessions and empty summaries", () =>
     Effect.gen(function* () {
@@ -306,6 +326,97 @@ describe("tool.task", () => {
         },
       })
       expect(result.metadata).toMatchObject({ doneMarkerMisses: 1, recovered: true })
+    }),
+  )
+
+  it.instance("accepts TASK_DONE only on an assistant text part's final non-empty line", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.sync(() => {
+            prompts.push(input)
+            if (prompts.length === 1) return textReply(input, "TASK_DONE: mentioned too early\nstill explaining")
+            return textReply(input, "Work is complete.\nTASK_DONE: escaped through text\n\n")
+          }),
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "escape broken marker",
+          prompt: "inspect the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(prompts).toHaveLength(2)
+      expect(result.output).toContain("escaped through text")
+      expect(result.output).not.toContain("mentioned too early")
+    }),
+  )
+
+  it.instance("reports failed task_done validation and does not accept its invalid input as the marker", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const metadata: { title?: string; metadata?: Record<string, unknown> }[] = []
+      const error =
+        "The task_done tool was called with invalid arguments: Expected string, actual 42.\nPlease rewrite the input so it satisfies the expected schema."
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.sync(() => {
+            prompts.push(input)
+            if (prompts.length === 1) return markerErrorReply(input, error)
+            return reply(input, "corrected marker summary")
+          }),
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "repair invalid marker",
+          prompt: "inspect the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: (input) =>
+            Effect.sync(() => {
+              metadata.push(input)
+            }),
+          ask: () => Effect.void,
+        },
+      )
+
+      const reprompt = prompts[1]?.parts.find((part) => part.type === "text")
+      expect(prompts).toHaveLength(2)
+      expect(reprompt?.text).toContain("Expected string, actual 42")
+      expect(reprompt?.text).toContain("Call task_done again with corrected arguments")
+      expect(reprompt?.text).not.toContain("\nPlease rewrite")
+      expect(metadata[1]?.metadata?.lastMarkerError).toContain("Expected string, actual 42")
+      expect(result.output).toContain("corrected marker summary")
+      expect(result.output).not.toContain("invalid marker attempt")
     }),
   )
 

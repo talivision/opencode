@@ -39,7 +39,7 @@
 #             tool-based review completes; watches pacing and TUI health for ~8 minutes
 #   ux_goal_window worker never claims completion; drives goal minimize/expand and pane assertions
 #   ux_queued_cancel worker claims completion, slow review stays busy while a queued message is cancelled
-#   ux_search worker replies with two searchable texts; drives leader+f find bar, counter cycling, escape
+#   ux_search worker replies with two searchable texts; drives leader+f and /find, counter cycling, escape
 #
 # Useful overrides:
 #   BIN=... path to the binary (default: the darwin-arm64 build in dist/)
@@ -68,6 +68,10 @@ SOCK="${SOCK:-/tmp/opencode-goal-harness.sock}"
 
 if [ "$SCENARIO" = "ux_goal_window" ]; then
   OBJECTIVE="$LONG_OBJECTIVE"
+  # Long worker replies double as the word-wrap regression fixture: a row-flex
+  # sibling next to <markdown> once clipped output to a single line.
+  WORKER_TEXT="${WORKER_TEXT:-The assistant reply fixture is intentionally a very long single paragraph so that any regression in markdown word wrapping inside the transcript surfaces as a clipped single row instead of a wrapped block spanning multiple rows}"
+  export WORKER_TEXT
 fi
 
 case "$SCENARIO" in
@@ -348,22 +352,39 @@ elif [ "$SCENARIO" = "ux_search" ]; then
   echo "==> cycle to the older match"
   tmux -S "$SOCK" send-keys -t goal Enter
   wait_for_goal_text "1/2" "$WORK/snaps/ux-search-cycled.txt" || true
-  # The streaming markdown beside the marker re-renders asynchronously after
-  # the highlight moves; poll until the marker and the matched text share a
-  # settled frame rather than asserting on the counter snapshot.
-  wait_for_goal_regex "▍.*amber zebra" "$WORK/snaps/ux-search-cycled-marker.txt" || true
-
-  echo "==> close search"
-  tmux -S "$SOCK" send-keys -t goal Escape
-  UX_SEARCH_CLOSED=0
+  # The streaming markdown below the marker re-renders asynchronously after
+  # the highlight moves; poll until the marker AND the matched text share a
+  # settled frame.
   while [ "$SECONDS" -lt "$UX_DEADLINE" ]; do
-    capture_goal_pane "$WORK/snaps/ux-search-closed.txt"
-    if ! grep -Fq "Find in transcript" "$WORK/snaps/ux-search-closed.txt"; then
-      UX_SEARCH_CLOSED=1
+    capture_goal_pane "$WORK/snaps/ux-search-cycled-marker.txt"
+    if grep -A2 -F "▍ match" "$WORK/snaps/ux-search-cycled-marker.txt" | grep -Fq "amber zebra"; then
       break
     fi
     sleep 0.25
   done
+
+  echo "==> close search"
+  # "esc close" is the bar's stable marker; the placeholder vanishes as soon
+  # as a query is typed, so polling on it declared victory with the bar open.
+  UX_SEARCH_CLOSED=0
+  for esc_try in 1 2 3; do
+    tmux -S "$SOCK" send-keys -t goal Escape
+    ESC_WAIT=$((SECONDS + 4))
+    while [ "$SECONDS" -lt "$ESC_WAIT" ] && [ "$SECONDS" -lt "$UX_DEADLINE" ]; do
+      capture_goal_pane "$WORK/snaps/ux-search-closed.txt"
+      if ! grep -Fq "esc close" "$WORK/snaps/ux-search-closed.txt"; then
+        UX_SEARCH_CLOSED=1
+        break
+      fi
+      sleep 0.25
+    done
+    [ "$UX_SEARCH_CLOSED" -eq 1 ] && break
+  done
+
+  echo "==> reopen transcript search with /find"
+  tmux -S "$SOCK" send-keys -l -t goal -- "/find"
+  tmux -S "$SOCK" send-keys -t goal Enter
+  wait_for_goal_text "esc close" "$WORK/snaps/ux-search-slash.txt" || true
 elif [ "$SCENARIO" = "permission_blocked" ]; then
   echo "==> wait for reviewer permission block"
   blocked=0
@@ -519,6 +540,14 @@ if [ "$SCENARIO" = "ux_goal_window" ]; then
   else
     ux_fail "durable goal remains active when the worker never claims completion"
   fi
+  # The re-expanded snapshot is captured last, after the first worker reply
+  # has certainly landed; the initial expanded capture can precede it.
+  wrap_rows="$(grep -chE "intentionally a very long|word wrapping inside the|clipped single row" "$reexpanded" "$expanded" 2>/dev/null | paste -sd+ - | bc || true)"
+  if [ "${wrap_rows:-0}" -ge 2 ]; then
+    ux_ok "long assistant output wraps across multiple rows"
+  else
+    ux_fail "long assistant output wraps across multiple rows" "${wrap_rows:-0} matching rows"
+  fi
 fi
 
 if [ "$SCENARIO" = "ux_queued_cancel" ]; then
@@ -582,6 +611,7 @@ if [ "$SCENARIO" = "ux_search" ]; then
   opened="$WORK/snaps/ux-search-open.txt"
   counter="$WORK/snaps/ux-search-counter.txt"
   cycled="$WORK/snaps/ux-search-cycled.txt"
+  slash="$WORK/snaps/ux-search-slash.txt"
 
   if grep -Fq "amber zebra" "$transcript" && grep -Fq "xylophone hummed" "$transcript"; then
     ux_ok "both searchable assistant replies render in the transcript"
@@ -603,7 +633,7 @@ if [ "$SCENARIO" = "ux_search" ]; then
   else
     ux_fail "typing a two-hit query lands on the most recent match with a 2/2 counter"
   fi
-  if grep -F "near the harbor" "$counter" | grep -Fq "▍ "; then
+  if grep -A2 -F "▍ match" "$counter" | grep -Fq "near the harbor"; then
     ux_ok "the most recent match has a visible gutter marker"
   else
     ux_fail "the most recent match has a visible gutter marker"
@@ -613,7 +643,9 @@ if [ "$SCENARIO" = "ux_search" ]; then
   else
     ux_fail "enter cycles the counter to the older match"
   fi
-  if grep -F "amber zebra" "$WORK/snaps/ux-search-cycled-marker.txt" | grep -Fq "▍"; then
+  # The marker is its own one-line row ABOVE the matched text (a row-flex
+  # sibling next to <markdown> clips wrapping — see TextPart).
+  if grep -A2 -F "▍ match" "$WORK/snaps/ux-search-cycled-marker.txt" | grep -Fq "amber zebra"; then
     ux_ok "cycling moves the visible gutter marker to the older match"
   else
     ux_fail "cycling moves the visible gutter marker to the older match"
@@ -622,6 +654,18 @@ if [ "$SCENARIO" = "ux_search" ]; then
     ux_ok "escape closes the search bar"
   else
     ux_fail "escape closes the search bar"
+  fi
+  if grep -Fq "esc close" "$slash"; then
+    ux_ok "/find reopens the transcript search bar"
+  else
+    ux_fail "/find reopens the transcript search bar"
+  fi
+  # The hints row is covered by goal pacing status once a goal runs, so the
+  # find hint is asserted on the idle pre-goal startup capture.
+  if grep -Fq "f find" "$WORK/snaps/00-startup.txt"; then
+    ux_ok "the session footer advertises the find shortcut"
+  else
+    ux_fail "the session footer advertises the find shortcut"
   fi
 fi
 

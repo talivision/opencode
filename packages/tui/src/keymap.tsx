@@ -247,14 +247,29 @@ export function useLeaderActive(): Accessor<boolean> {
   return useKeymapSelector((keymap: OpenTuiKeymap) => keymap.getPendingSequence()[0]?.tokenName === LEADER_TOKEN)
 }
 
+// Layer-registered bindings resolve after their route mounts, and opentui
+// text children do not re-render a hint whose first evaluation was empty —
+// so a registration-only lookup leaves late-registering hints permanently
+// blank. Fall back to the CONFIGURED binding so the first render is already
+// correct; the registered form (which reflects live rebinds) wins once known.
+function formatConfiguredShortcut(command: string, config: FormatConfig) {
+  const key = config.keybinds.get(command)?.[0]?.key
+  if (!key) return ""
+  const raw = typeof key === "string" ? key : stringifyKeyStroke(key)
+  const first = raw.split(",")[0]?.trim() ?? ""
+  if (!first || first === "none") return ""
+  return first.replace("<leader>", leaderDisplay(config) + " ")
+}
+
 export function useCommandShortcut(command: string): Accessor<string> {
   const config = useTuiConfig()
-  return useKeymapSelector((keymap: OpenTuiKeymap) =>
+  const registered = useKeymapSelector((keymap: OpenTuiKeymap) =>
     formatKeySequence(
       keymap.getCommandBindings({ visibility: "registered", commands: [command] }).get(command)?.[0]?.sequence,
       config,
     ),
   )
+  return () => registered() || formatConfiguredShortcut(command, config)
 }
 
 export function useCommandSlashes(): Accessor<readonly CommandSlashEntry[]> {

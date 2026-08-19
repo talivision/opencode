@@ -87,6 +87,7 @@ import { DialogGoal } from "../../component/dialog-goal"
 import { GoalIndicator } from "../../component/goal-indicator"
 import { DialogRunningTasks } from "../../component/dialog-running-tasks"
 import { TranscriptSearch, type TranscriptSearchRef } from "../../component/transcript-search"
+import { segmentTranscriptMatches } from "../../util/transcript-search"
 
 addDefaultParsers(parsers.parsers)
 
@@ -288,6 +289,7 @@ export function Session() {
   const [goalMinimized, setGoalMinimized] = kv.signal(`goal_minimized_${route.sessionID}`, false)
   const [searchOpen, setSearchOpen] = createSignal(false)
   const [searchMatchID, setSearchMatchID] = createSignal<string>()
+  const [searchQuery, setSearchQuery] = createSignal("")
   const [diffWrapMode] = kv.signal<"word" | "none">("diff_wrap_mode", "word")
   const [_animationsEnabled, _setAnimationsEnabled] = kv.signal("animations_enabled", true)
   const [showGenericToolOutput, setShowGenericToolOutput] = kv.signal("generic_tool_output_visibility", false)
@@ -481,6 +483,10 @@ export function Session() {
     if (continuingGoal) return
     if (!current || current.status !== "active") return
     if (current.time.updated <= startedGoalUpdate) return
+    // Esc-must-not-cancel-the-goal: the goal stays active after an abort, but
+    // the continuation for exactly that aborted state is suppressed — the
+    // next real update re-enables it.
+    if (current.time.updated <= goals.suppressedAt(route.sessionID)) return
     if (status && status.type !== "idle") return
     const agent = local.agent.current()
     const model = local.model.current()
@@ -576,6 +582,9 @@ export function Session() {
       title: "Find in transcript",
       value: "session.search",
       category: "Session",
+      slash: {
+        name: "find",
+      },
       run: () => {
         dialog.clear()
         if (searchOpen()) {
@@ -1429,6 +1438,7 @@ export function Session() {
                           pending={pending()?.index}
                           pendingFallback={pending()?.fallback ?? false}
                           searchMatchID={searchMatchID()}
+                          searchQuery={searchQuery()}
                         />
                       </Match>
                       <Match when={message.role === "assistant"}>
@@ -1464,7 +1474,10 @@ export function Session() {
                     ref={(value) => (transcriptSearch = value)}
                     messages={messages()}
                     partsByMessage={sync.data.part}
-                    onMatch={setSearchMatchID}
+                    onMatch={(match) => {
+                      setSearchMatchID(match.id)
+                      setSearchQuery(match.query)
+                    }}
                     jumpTo={(id) => {
                       const child = scroll.getChildren().find((child) => child.id === id)
                       if (child) scroll.scrollBy(child.y - scroll.y - 1)
@@ -1543,6 +1556,7 @@ function UserMessage(props: {
   pending?: number
   pendingFallback: boolean
   searchMatchID?: string
+  searchQuery: string
 }) {
   const ctx = use()
   const local = useLocal()
@@ -1633,7 +1647,17 @@ function UserMessage(props: {
               <Show when={props.searchMatchID === props.message.id}>
                 <span style={{ fg: theme.primary }}>▍ </span>
               </Show>
-              {text()}
+              <Show when={props.searchMatchID === props.message.id && props.searchQuery} fallback={text()}>
+                <For each={segmentTranscriptMatches(text(), props.searchQuery)}>
+                  {(segment) => (
+                    <Show when={segment.match} fallback={segment.text}>
+                      <span style={{ bg: theme.primary, fg: selectedForeground(theme, theme.primary) }}>
+                        {segment.text}
+                      </span>
+                    </Show>
+                  )}
+                </For>
+              </Show>
             </text>
             <Show when={files().length}>
               <box flexDirection="row" paddingBottom={metadataVisible() ? 1 : 0} paddingTop={1} gap={1} flexWrap="wrap">
@@ -1908,16 +1932,18 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
         paddingLeft={3}
         marginTop={1}
         flexShrink={0}
-        flexDirection="row"
         backgroundColor={props.searchMatchID === props.part.id ? theme.backgroundElement : undefined}
       >
+        {/* Column layout only: a row-flex sibling next to <markdown> collapses
+            its height to one line and CLIPS long output instead of wrapping.
+            The match marker is its own one-line row above the text. */}
         <Show when={props.searchMatchID === props.part.id}>
           <text fg={theme.primary} flexShrink={0}>
-            ▍{" "}
+            ▍ match
           </text>
         </Show>
+        {/* Markdown cannot style arbitrary matched ranges, so assistant search remains part-level. */}
         <markdown
-          flexGrow={1}
           syntaxStyle={syntax()}
           streaming={true}
           internalBlockMode="top-level"

@@ -22,6 +22,10 @@
 #           task_done and only then delivers a completed notification
 #   soak    three child turns drop and recover markerless before a paced fourth
 #           turn calls task_done; watches notification and TUI stability for ~6 minutes
+#   bad_marker child first calls task_done with a numeric summary, receives the
+#           validation detail in the reprompt, then completes with corrected arguments
+#   marker_text_escape child never calls task_done and completes through the fallback
+#           after the second missing-marker reprompt advertises TASK_DONE
 #   ux_navigation drives leader+down into the live child, then leader+up back to the parent
 #
 # Useful overrides:
@@ -47,9 +51,9 @@ WORK="${WORK:-${TMPDIR:-/tmp}/opencode-subagent-harness}"
 SOCK="${SOCK:-/tmp/opencode-subagent-harness.sock}"
 
 case "$SCENARIO" in
-  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | ux_navigation) ;;
+  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | bad_marker | marker_text_escape | ux_navigation) ;;
   *)
-    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership|drop|soak|ux_navigation> [seconds]" >&2
+    echo "usage: $0 <notify|steer|inspect|fanout|stop-one|ownership|drop|soak|bad_marker|marker_text_escape|ux_navigation> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -448,7 +452,7 @@ if [ "$SCENARIO" = "stop-one" ]; then
 fi
 
 case "$SCENARIO" in
-  fanout | stop-one | ownership | drop | soak)
+  fanout | stop-one | ownership | drop | soak | bad_marker | marker_text_escape)
     echo "==> $SCENARIO assertions"
     node "$HERE/assert-scenarios.mjs" \
       "$SCENARIO" \

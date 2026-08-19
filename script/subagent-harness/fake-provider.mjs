@@ -12,7 +12,7 @@
 // env:
 //   PORT      listen port (default 4599)
 //   LOG       path to append one JSON line per request
-//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | ux_navigation (default notify)
+//   SCENARIO  notify | steer | inspect | fanout | stop-one | ownership | drop | soak | bad_marker | marker_text_escape | ux_navigation (default notify)
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
 import http from "node:http"
 import fs from "node:fs"
@@ -305,6 +305,7 @@ const server = http.createServer(async (req, res) => {
     childCount += 1
     const corrected = flat.includes("change of plan: only inspect the cache layer")
     const doneMarkerMissing = flat.includes("done-marker-missing")
+    const markerTextEscape = flat.includes("TASK_DONE: <one-line summary>")
     log({
       role: "child",
       n: childCount,
@@ -312,6 +313,7 @@ const server = http.createServer(async (req, res) => {
       marker: flat.includes(CHILD_MARKER),
       corrected,
       doneMarkerMissing,
+      markerTextEscape,
       ...(SCENARIO === "soak"
         ? {
             at: Date.now(),
@@ -332,6 +334,26 @@ const server = http.createServer(async (req, res) => {
     })
     if (flat.includes("Completion recorded. This task is now finished.")) {
       textReply(res, "task completion confirmed")
+      return
+    }
+    if (SCENARIO === "bad_marker") {
+      if (childCount === 1) {
+        taskDoneReply(res, 42)
+        return
+      }
+      if (doneMarkerMissing) {
+        taskDoneReply(res, "recovered after invalid task_done arguments")
+        return
+      }
+      textReply(res, "invalid marker attempt finished without a valid completion marker")
+      return
+    }
+    if (SCENARIO === "marker_text_escape") {
+      if (markerTextEscape) {
+        textReply(res, "Tool completion remains unavailable.\nTASK_DONE: escaped via text marker")
+        return
+      }
+      textReply(res, `markerless child turn ${childCount}`)
       return
     }
     if (SCENARIO === "drop") {

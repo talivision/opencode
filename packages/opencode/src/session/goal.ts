@@ -388,13 +388,11 @@ const layer = Layer.effect(
     const suspendForInterrupt = Effect.fn("SessionGoal.suspendForInterrupt")(function* (sessionID: SessionID) {
       return yield* update(sessionID, (draft, now) => {
         if (draft.status !== "active") return
-        // An aborted run must neither keep the elapsed clock ticking on a dead
-        // session nor let the TUI continuation silently restart what the user
-        // just interrupted. Paused-with-reason makes the stop visible and
-        // /goal resume the explicit way back.
+        // An aborted run must not keep the elapsed clock ticking on a dead
+        // session — but esc must NOT cancel or pause the goal either: it stays
+        // active with a frozen clock, and the next message (or the TUI's own
+        // continuation, which suppresses only the abort it issued) resumes it.
         stopClock(draft, now)
-        draft.status = "paused"
-        draft.pauseReason = "interrupted"
       })
     })
 

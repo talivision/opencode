@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { AssistantMessage, Part, UserMessage } from "@opencode-ai/sdk/v2"
-import { findMatches } from "../../src/util/transcript-search"
+import { findMatches, segmentTranscriptMatches } from "../../src/util/transcript-search"
 
 const user: UserMessage = {
   id: "message-user",
@@ -107,5 +107,28 @@ describe("findMatches", () => {
 
   test("returns no matches for an empty query", () => {
     expect(findMatches([user, assistant], {}, "")).toEqual([])
+  })
+})
+
+describe("segmentTranscriptMatches", () => {
+  test("segments multiple case-insensitive occurrences", () => {
+    expect(segmentTranscriptMatches("Alpha and ALPHA again", "alpha")).toEqual([
+      { text: "Alpha", match: true },
+      { text: " and ", match: false },
+      { text: "ALPHA", match: true },
+      { text: " again", match: false },
+    ])
+  })
+
+  test("passes through text without a match", () => {
+    expect(segmentTranscriptMatches("plain text", "missing")).toEqual([{ text: "plain text", match: false }])
+  })
+
+  test("advances past matches without emitting overlapping ranges", () => {
+    expect(segmentTranscriptMatches("banana", "ana")).toEqual([
+      { text: "b", match: false },
+      { text: "ana", match: true },
+      { text: "na", match: false },
+    ])
   })
 })

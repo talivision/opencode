@@ -53,12 +53,67 @@ const SUBAGENT_CONTRACT =
   "<subagent-contract>When you have fully completed this task, call task_done with a summary of the outcome as your FINAL tool call. Your work is not considered finished until you do. If you cannot finish, still call task_done and explain why in the summary.</subagent-contract>"
 const DONE_MARKER_MISSING =
   "<done-marker-missing>Your previous turn ended without a task_done call. If the task is finished, call task_done with your summary now. If it is not finished, continue working and call task_done when it is.</done-marker-missing>"
+const DONE_MARKER_ESCAPE =
+  "If the task_done tool is unavailable or its calls keep failing, end your reply with a single final line: TASK_DONE: <one-line summary>."
 const TASK_DONE_BACKOFF_INITIAL = 5_000
 const TASK_DONE_BACKOFF_MAX = 300_000
 
 function taskDoneBackoffMs(consecutive: number) {
   if (consecutive <= 1) return 0
   return Math.min(TASK_DONE_BACKOFF_INITIAL * Math.pow(2, consecutive - 2), TASK_DONE_BACKOFF_MAX)
+}
+
+function completionSummary(parts: SessionV1.Part[]) {
+  const tool = parts.findLast(
+    (item) =>
+      item.type === "tool" &&
+      item.tool === TaskDoneTool.id &&
+      item.state.status === "completed" &&
+      typeof item.state.input.summary === "string" &&
+      item.state.input.summary.trim().length > 0,
+  )
+  if (tool?.type === "tool" && tool.state.status === "completed") return tool.state.input.summary.trim()
+
+  return parts
+    .filter((item): item is SessionV1.TextPart => item.type === "text")
+    .map((item) =>
+      item.text
+        .split(/\r?\n/)
+        .findLast((line) => line.trim().length > 0)
+        ?.trim(),
+    )
+    .map((line) => line?.match(/^TASK_DONE:\s*(.+)$/)?.[1]?.trim())
+    .findLast((summary) => summary !== undefined && summary.length > 0)
+}
+
+function markerError(parts: SessionV1.Part[]) {
+  const failed = parts.findLast((item) => {
+    if (item.type !== "tool") return false
+    if (item.tool === TaskDoneTool.id) return item.state.status === "error"
+    return (
+      item.tool === "invalid" &&
+      item.state.status === "completed" &&
+      item.state.input.tool === TaskDoneTool.id &&
+      typeof item.state.input.error === "string"
+    )
+  })
+  if (failed?.type !== "tool") return
+  const error =
+    failed.state.status === "error"
+      ? failed.state.error
+      : typeof failed.state.input.error === "string"
+        ? failed.state.input.error
+        : undefined
+  if (!error) return
+  const line = error.replace(/\s+/g, " ").trim()
+  return line.length > 200 ? line.slice(0, 197) + "..." : line
+}
+
+function doneMarkerReprompt(missing: number, error?: string) {
+  const message = error
+    ? `<done-marker-missing>Your previous task_done call failed: ${error} Call task_done again with corrected arguments and a non-empty string summary.</done-marker-missing>`
+    : DONE_MARKER_MISSING
+  return missing < 2 ? message : [message, DONE_MARKER_ESCAPE].join("\n")
 }
 
 const ParameterFields = {
@@ -319,49 +374,44 @@ export const TaskTool = Tool.define(
         })
         let missing = 1
         while (true) {
-          // An empty summary must not count as the marker: the tool refuses it
-          // and asks the child to call again, so accepting it here would let a
-          // malformed call end the task with no report.
-          const isMarker = (item: (typeof result.parts)[number]) =>
-            item.type === "tool" &&
-            item.tool === TaskDoneTool.id &&
-            item.state.status === "completed" &&
-            typeof item.state.input.summary === "string" &&
-            item.state.input.summary.trim().length > 0
-          let done = result.parts.findLast(isMarker)
+          let summary = completionSummary(result.parts)
+          let transcriptParts: SessionV1.Part[] = []
           // A normal provider finish after a tool call is a newer assistant
           // message, so prompt() returns that message rather than the preceding
           // one that owns task_done. Search only this prompt's transcript tail;
           // older markers from a resumed child must not complete new work.
-          if (!done) {
+          if (!summary) {
             // Position, not ID comparison: the transcript is (time, id)-sorted
             // and IDs are only monotonic per process under a steady clock —
             // upstream's ordering campaign retired ID ordering as a time proxy.
             const transcript = yield* sessions.messages({ sessionID: nextSession.id })
             const promptIndex = transcript.findIndex((message) => message.info.id === promptMessageID)
-            done = transcript
-              .slice(promptIndex + 1)
+            transcriptParts = (promptIndex < 0 ? [] : transcript.slice(promptIndex + 1))
+              .filter((message) => message.info.role === "assistant")
               .flatMap((message) => message.parts)
-              .findLast(isMarker)
+            summary = completionSummary(transcriptParts)
           }
-          if (done?.type === "tool" && done.state.status === "completed") {
-            const summary = done.state.input.summary
-            if (typeof summary === "string" && summary.trim()) {
-              if (doneMarkerMisses > 0) {
-                yield* ctx.metadata({
-                  title: params.description,
-                  metadata: { ...taskPartMetadata(), doneMarkerMisses, recovered: true },
-                })
-              }
-              return summary.trim()
+          if (summary) {
+            if (doneMarkerMisses > 0) {
+              yield* ctx.metadata({
+                title: params.description,
+                metadata: { ...taskPartMetadata(), doneMarkerMisses, recovered: true },
+              })
             }
+            return summary
           }
+          const lastMarkerError = markerError([...transcriptParts, ...result.parts])
           const backoff = taskDoneBackoffMs(missing)
           const nextReprompt = Date.now() + backoff
           doneMarkerMisses = missing
           yield* ctx.metadata({
             title: `${params.description} · recovering (no completion marker, attempt ${missing})`,
-            metadata: { ...taskPartMetadata(), doneMarkerMisses: missing, nextReprompt },
+            metadata: {
+              ...taskPartMetadata(),
+              doneMarkerMisses: missing,
+              nextReprompt,
+              ...(lastMarkerError ? { lastMarkerError } : {}),
+            },
           })
           yield* status.set(nextSession.id, {
             type: "retry",
@@ -384,7 +434,7 @@ export const TaskTool = Tool.define(
               {
                 type: "text",
                 synthetic: true,
-                text: DONE_MARKER_MISSING,
+                text: doneMarkerReprompt(missing, lastMarkerError),
               },
             ],
           })

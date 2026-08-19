@@ -451,7 +451,12 @@ const server = http.createServer(async (req, res) => {
     body: parsed,
   })
   if (REVIEWER_MODE === "ux_goal_window") {
-    textReply(res, "Continuing careful work without claiming completion.", WORKER_USAGE)
+    // WORKER_TEXT override lets wrap/render checks feed arbitrary long text.
+    textReply(
+      res,
+      WORKER_TEXT === "Lima" ? "Continuing careful work without claiming completion." : WORKER_TEXT,
+      WORKER_USAGE,
+    )
     return
   }
   if (REVIEWER_MODE === "soak" && workerCount <= 6) {

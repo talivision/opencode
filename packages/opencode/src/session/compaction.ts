@@ -22,6 +22,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { outputFloor, safety } from "./output-window"
 
 export const Event = SessionCompactionEvent
 
@@ -31,6 +32,7 @@ const TOOL_OUTPUT_MAX_CHARS = 2_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
+const ESTIMATE_MARGIN = 1.15
 type Turn = {
   start: number
   end: number
@@ -50,6 +52,24 @@ type CompletedCompaction = {
 
 const truncate = (value: string) =>
   value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
+
+const conservativeTokens = (value: string) => Math.ceil(Token.estimate(value) * ESTIMATE_MARGIN)
+
+const replayPlaceholder = (value: string) =>
+  `[Oversized text omitted from replay: ${new TextEncoder().encode(value).byteLength} bytes]`
+
+const splitText = (value: string, index: number) => {
+  const point =
+    index > 0 &&
+    index < value.length &&
+    value.charCodeAt(index - 1) >= 0xd800 &&
+    value.charCodeAt(index - 1) <= 0xdbff &&
+    value.charCodeAt(index) >= 0xdc00 &&
+    value.charCodeAt(index) <= 0xdfff
+      ? index + 1
+      : index
+  return [value.slice(0, point), value.slice(point)] as const
+}
 
 const serialize = (message: SessionV1.WithParts) => {
   if (message.info.role === "user") {
@@ -166,6 +186,8 @@ export interface Interface {
   readonly isOverflow: (input: {
     tokens: SessionV1.Assistant["tokens"]
     model: Provider.Model
+    sessionID?: SessionID
+    messages?: SessionV1.WithParts[]
   }) => Effect.Effect<boolean>
   readonly prune: (input: { sessionID: SessionID }) => Effect.Effect<void>
   readonly process: (input: {
@@ -199,11 +221,34 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    // A failed size remains suppressed while the transcript only grows. A
+    // raised model limit or an actual history shrink makes auto-compaction
+    // eligible again without requiring durable schema changes.
+    const failed = new Map<SessionID, { limit: number; size: number }>()
+
+    const transcriptSize = (messages: SessionV1.WithParts[]) =>
+      Token.estimate(messages.map(serialize).filter(Boolean).join("\n\n"))
+
+    const suppressed = (input: { sessionID?: SessionID; messages?: SessionV1.WithParts[]; model: Provider.Model }) => {
+      if (!input.sessionID || !input.messages) return false
+      const marker = failed.get(input.sessionID)
+      if (!marker) return false
+      const limit = input.model.limit.input || input.model.limit.context
+      const size = transcriptSize(input.messages)
+      if (limit > marker.limit || size < marker.size) {
+        failed.delete(input.sessionID)
+        return false
+      }
+      return true
+    }
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
       model: Provider.Model
+      sessionID?: SessionID
+      messages?: SessionV1.WithParts[]
     }) {
+      if (suppressed(input)) return false
       return overflow({
         cfg: yield* config.get(),
         tokens: input.tokens,
@@ -361,6 +406,7 @@ const layer = Layer.effect(
         : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
       const cfg = yield* config.get()
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
+      if (input.auto && suppressed({ sessionID: input.sessionID, messages: history, model })) return "stop"
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
@@ -378,17 +424,6 @@ const layer = Layer.effect(
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
-      const nextPrompt =
-        compacting.prompt ??
-        [
-          buildPrompt({
-            previousSummary,
-            context: [conversation],
-          }),
-          ...compacting.context,
-        ]
-          .filter(Boolean)
-          .join("\n\n")
       const ctx = yield* InstanceState.context
       // Summarizing does not need extended thinking, and inheriting the user's
       // variant is actively dangerous: on pre-4.6 Claude the "max" variant sets
@@ -399,7 +434,15 @@ const layer = Layer.effect(
         ...userMessage,
         model: { ...userMessage.model, variant: undefined },
       }
-      const msg: SessionV1.Assistant = {
+      const prompt = (head: string, anchor: string | undefined) =>
+        compacting.prompt
+          ? [compacting.prompt, ...compacting.context, "The following is the conversation history:", head]
+              .filter(Boolean)
+              .join("\n\n")
+          : [buildPrompt({ previousSummary: anchor, context: [head] }), ...compacting.context]
+              .filter(Boolean)
+              .join("\n\n")
+      const makeAssistant = (): SessionV1.Assistant => ({
         id: MessageID.ascending(),
         role: "assistant",
         parentID: input.parentID,
@@ -408,64 +451,105 @@ const layer = Layer.effect(
         agent: "compaction",
         variant: summaryUser.model.variant,
         summary: true,
-        path: {
-          cwd: ctx.directory,
-          root: ctx.worktree,
-        },
+        path: { cwd: ctx.directory, root: ctx.worktree },
         cost: 0,
-        tokens: {
-          output: 0,
-          input: 0,
-          reasoning: 0,
-          cache: { read: 0, write: 0 },
-        },
+        tokens: { output: 0, input: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         modelID: model.id,
         providerID: model.providerID,
-        time: {
-          created: Date.now(),
-        },
-      }
-      yield* session.updateMessage(msg)
-      const processor = yield* processors.create({
-        assistantMessage: msg,
-        sessionID: input.sessionID,
-        model,
+        time: { created: Date.now() },
       })
-      const result = yield* processor.process({
-        user: summaryUser,
-        agent,
-        sessionID: input.sessionID,
-        tools: {},
-        system: [],
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: [
-                  nextPrompt,
-                  ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                ]
-                  .filter(Boolean)
-                  .join("\n\n"),
-              },
-            ],
-          },
-        ],
-        model,
+      const run = Effect.fn("SessionCompaction.runSummary")(function* (head: string, anchor: string | undefined) {
+        const msg = yield* session.updateMessage(makeAssistant())
+        const processor = yield* processors.create({ assistantMessage: msg, sessionID: input.sessionID, model })
+        const text = prompt(head, anchor)
+        const result = yield* processor.process({
+          user: summaryUser,
+          agent,
+          sessionID: input.sessionID,
+          tools: {},
+          system: [],
+          messages: [{ role: "user", content: [{ type: "text", text }] }],
+          model,
+        })
+        return { processor, result, text }
       })
+      const remove = (messageID: MessageID) =>
+        session.removeMessage({ sessionID: input.sessionID, messageID }).pipe(Effect.orDie)
+      const runWithShrink = Effect.fn("SessionCompaction.runSummaryWithShrink")(function* (
+        head: string,
+        anchor: string | undefined,
+      ) {
+        const first = yield* run(head, anchor)
+        if (first.result !== "compact") return first
+        yield* remove(first.processor.message.id)
+        return yield* run(splitText(head, Math.floor(head.length / 2))[1], anchor)
+      })
+      const floor = outputFloor({
+        model,
+        outputTokenMax: flags.outputTokenMax,
+        floor: cfg.compaction?.output_floor,
+      })
+      const headBudget = (anchor: string | undefined) =>
+        // usable() already protects normal turns. Compaction additionally
+        // reserves the retained tail, prompt scaffolding, summary output, and
+        // estimator slack before admitting any serialized head text.
+        Math.max(
+          1,
+          usable({ cfg, model, outputTokenMax: flags.outputTokenMax }) -
+            preserveRecentBudget({ cfg, model }) -
+            conservativeTokens(prompt("", anchor)) -
+            floor -
+            safety(model.limit.context),
+        )
+      const charsFor = (tokens: number) => Math.max(1, Math.floor((tokens * 4) / ESTIMATE_MARGIN))
+      let remaining = conversation
+      let anchor = previousSummary
+      let terminal:
+        | {
+            processor: SessionProcessor.Handle
+            result: SessionProcessor.Result
+            text: string
+          }
+        | undefined
 
-      if (result === "compact") {
-        processor.message.error = new SessionV1.ContextOverflowError({
-          message: replay
-            ? "Conversation history too large to compact - exceeds model context limit"
-            : "Session too large to compact - context exceeds model limit even after stripping media",
+      while (conservativeTokens(remaining) > headBudget(anchor)) {
+        const size = charsFor(headBudget(anchor))
+        const [chunk, rest] = splitText(remaining, size)
+        const current = yield* runWithShrink(chunk, anchor)
+        if (current.result === "compact") {
+          terminal = current
+          break
+        }
+        const saved = (yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
+          (item) => item.info.id === current.processor.message.id,
+        )
+        anchor = saved ? summaryText(saved) : undefined
+        // Intermediate summaries only exist to anchor the next map-reduce
+        // request; the final summary is the sole durable compaction boundary.
+        yield* remove(current.processor.message.id)
+        remaining = rest
+      }
+
+      const completed = terminal ?? (yield* runWithShrink(remaining, anchor))
+      if (completed.result === "compact") {
+        const limit = model.limit.input || model.limit.context
+        const requestSize = Token.estimate(completed.text) + floor
+        const size = transcriptSize(history)
+        failed.set(input.sessionID, { limit, size })
+        completed.processor.message.error = new SessionV1.ContextOverflowError({
+          message: `Session too large to compact after a smaller retry. Configured context limit: ${limit} tokens; measured transcript size: ${size} tokens; last compaction request estimate: ${requestSize} tokens. Raise the model context limit, prune session history, or start a new session.`,
         }).toObject()
-        processor.message.finish = "error"
-        yield* session.updateMessage(processor.message)
+        completed.processor.message.finish = "error"
+        yield* session.updateMessage(completed.processor.message)
+        yield* events.publish(Session.Event.Error, {
+          sessionID: input.sessionID,
+          error: completed.processor.message.error,
+        })
         return "stop"
       }
+      failed.delete(input.sessionID)
+      const processor = completed.processor
+      const result = completed.result
 
       if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
         yield* session.updatePart({
@@ -476,6 +560,14 @@ const layer = Layer.effect(
 
       if (result === "continue" && input.auto) {
         if (replay) {
+          const summary = (yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
+            (item) => item.info.id === processor.message.id,
+          )
+          let replayBudget = Math.max(
+            0,
+            usable({ cfg, model, outputTokenMax: flags.outputTokenMax }) -
+              conservativeTokens(summary ? summaryText(summary) ?? "" : ""),
+          )
           const original = replay.info
           const replayMsg = yield* session.updateMessage({
             id: MessageID.ascending(),
@@ -493,7 +585,15 @@ const layer = Layer.effect(
             const replayPart =
               part.type === "file" && MessageV2.isMedia(part.mime)
                 ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
+                : part.type === "text" && conservativeTokens(part.text) > replayBudget
+                  ? { type: "text" as const, text: replayPlaceholder(part.text) }
                 : part
+            // Text that would make the freshly compacted transcript overflow
+            // is replaced wholesale so it cannot autonomously compact again.
+            replayBudget = Math.max(
+              0,
+              replayBudget - (replayPart.type === "text" ? conservativeTokens(replayPart.text) : 0),
+            )
             yield* session.updatePart({
               ...replayPart,
               id: PartID.ascending(),

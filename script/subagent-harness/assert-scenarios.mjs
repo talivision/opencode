@@ -1,4 +1,4 @@
-// Assertions for fanout, stop-one, ownership, drop, and soak.
+// Assertions for fanout, stop-one, ownership, drop, soak, bad_marker, and marker_text_escape.
 //
 // Uses provider request logs plus SQLite's snake_case session_id, parent_id,
 // and message_id columns. stop-one also consumes the provider's live-state
@@ -265,6 +265,70 @@ if (scenario === "soak") {
     // Model" mixed-case, and the command hints are the stable alive marker.
     unfinishedParent.count === 0 && (finalPane.includes("ctrl+p") || finalPane.includes("shift+tab")),
     `unfinished parent messages=${unfinishedParent.count}`,
+  )
+}
+
+if (scenario === "bad_marker") {
+  const childRequests = entries.filter((entry) => entry.role === "child")
+  const reprompt = childRequests.find((entry) => {
+    const body = JSON.stringify(entry.body).toLowerCase()
+    return entry.doneMarkerMissing === true && body.includes("summary") && body.includes("string")
+  })
+  const notifications = db
+    .prepare(
+      `SELECT json_extract(p.data, '$.text') AS text
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'user'
+         AND json_extract(p.data, '$.text') LIKE '%<task-notification task_id=%status="completed"%'`,
+    )
+    .all()
+  check(
+    "bad_marker reprompt carries the task_done summary validation error",
+    reprompt !== undefined,
+    JSON.stringify(childRequests.map((entry) => ({ n: entry.n, doneMarkerMissing: entry.doneMarkerMissing }))),
+  )
+  check(
+    "bad_marker completes after the corrected task_done call",
+    notifications.some((row) => row.text?.includes("recovered after invalid task_done arguments")),
+    JSON.stringify(notifications),
+  )
+}
+
+if (scenario === "marker_text_escape") {
+  const childRequests = entries.filter((entry) => entry.role === "child")
+  const notifications = db
+    .prepare(
+      `SELECT json_extract(p.data, '$.text') AS text
+       FROM part p
+       JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NULL
+         AND json_extract(m.data, '$.role') = 'user'
+         AND json_extract(p.data, '$.text') LIKE '%<task-notification task_id=%status="completed"%'`,
+    )
+    .all()
+  const taskDoneCalls = db
+    .prepare(
+      `SELECT count(*) AS count
+       FROM part p
+       JOIN session s ON s.id = p.session_id
+       WHERE s.parent_id IS NOT NULL
+         AND json_extract(p.data, '$.tool') = 'task_done'`,
+    )
+    .get()
+  check(
+    "marker_text_escape second reprompt advertises TASK_DONE",
+    childRequests[2]?.markerTextEscape === true,
+    JSON.stringify(childRequests.map((entry) => ({ n: entry.n, markerTextEscape: entry.markerTextEscape }))),
+  )
+  check("marker_text_escape child never calls task_done", taskDoneCalls.count === 0, `${taskDoneCalls.count} calls`)
+  check(
+    "marker_text_escape completion notification carries the text summary",
+    notifications.some((row) => row.text?.includes("escaped via text marker")),
+    JSON.stringify(notifications),
   )
 }
 

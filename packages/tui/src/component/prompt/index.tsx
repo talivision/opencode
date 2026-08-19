@@ -171,6 +171,7 @@ export function Prompt(props: PromptProps) {
   const agentShortcut = useCommandShortcut("agent.cycle")
   const paletteShortcut = useCommandShortcut("command.palette.show")
   const permissionShortcut = useCommandShortcut("permission.cycle")
+  const searchShortcut = useCommandShortcut("session.search")
   const renderer = useRenderer()
   const exit = useExit()
   const dimensions = useTerminalDimensions()
@@ -420,6 +421,10 @@ export function Prompt(props: PromptProps) {
             void sdk.client.session.abort({
               sessionID: props.sessionID,
             })
+            // Esc stops the run, not the goal: suppress only the continuation
+            // for the state this abort produces, so the goal stays active and
+            // resumes on the next message instead of restarting itself now.
+            void goals.suppressContinuation(props.sessionID)
             setStore("interrupt", 0)
           }
           dialog.clear()
@@ -1714,6 +1719,11 @@ export function Prompt(props: PromptProps) {
                   <text fg={theme.text}>
                     {paletteShortcut()} <span style={{ fg: theme.textMuted }}>commands</span>
                   </text>
+                  <Show when={searchShortcut()}>
+                    <text fg={theme.text}>
+                      {searchShortcut()} <span style={{ fg: theme.textMuted }}>find</span>
+                    </text>
+                  </Show>
                   {/* The permission ladder was undiscoverable without this. A
                       user has no way to learn shift+tab exists, and it is the
                       only route to auto-approve and plan mode from the
