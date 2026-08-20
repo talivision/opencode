@@ -29,13 +29,6 @@ export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_MAX_RETRIES = 5
-export const RETRY_PARK_THRESHOLD_MS = iife(() => {
-  const value = process.env.OPENCODE_RETRY_PARK_MAX_MS
-  if (!value?.trim()) return 300_000
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed) || parsed < 0) return 300_000
-  return parsed
-})
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
@@ -120,7 +113,18 @@ export function retryable(error: Err, provider: string) {
       const workspace = str(body?.metadata?.workspace)
       const limitName = str(body?.metadata?.limitName)
       const retryAfter = num(error.data.responseHeaders?.["retry-after"])
-      const resetIn = retryAfter === undefined ? "" : formatWait(Math.max(0, Math.ceil(retryAfter)))
+      const resetIn = iife(() => {
+        if (retryAfter === undefined) return ""
+        const seconds = Math.max(0, Math.ceil(retryAfter))
+        const days = Math.floor(seconds / 86_400)
+        const hours = Math.floor((seconds % 86_400) / 3_600)
+        const minutes = Math.ceil((seconds % 3_600) / 60)
+        const unit = (value: number, name: string) => `${value} ${name}${value === 1 ? "" : "s"}`
+
+        if (days > 0) return hours > 0 ? `${unit(days, "day")} ${unit(hours, "hour")}` : unit(days, "day")
+        if (hours > 0) return minutes > 0 ? `${unit(hours, "hour")} ${unit(minutes, "minute")}` : unit(hours, "hour")
+        return minutes > 0 ? unit(minutes, "minute") : "less than a minute"
+      })
 
       const message = `${limitName ? `${limitName} usage limit` : "Usage limit"} reached. It will reset in ${resetIn}. To continue using this model now, enable usage from your available balance`
 
@@ -175,22 +179,10 @@ function parseJSON(value: unknown) {
   })
 }
 
-function formatWait(seconds: number) {
-  const days = Math.floor(seconds / 86_400)
-  const hours = Math.floor((seconds % 86_400) / 3_600)
-  const minutes = Math.ceil((seconds % 3_600) / 60)
-  const unit = (value: number, name: string) => `${value} ${name}${value === 1 ? "" : "s"}`
-
-  if (days > 0) return hours > 0 ? `${unit(days, "day")} ${unit(hours, "hour")}` : unit(days, "day")
-  if (hours > 0) return minutes > 0 ? `${unit(hours, "hour")} ${unit(minutes, "minute")}` : unit(hours, "hour")
-  return minutes > 0 ? unit(minutes, "minute") : "less than a minute"
-}
-
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
-  parkThresholdMs?: number
 }) {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
@@ -201,15 +193,6 @@ export function policy(opts: {
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
-        if (wait > (opts.parkThresholdMs ?? RETRY_PARK_THRESHOLD_MS)) {
-          yield* opts.set({
-            attempt: meta.attempt,
-            message: `Provider asks to retry in ${formatWait(Math.ceil(wait / 1000))} — stopping this turn; it can be resumed once the quota resets`,
-            action: retry.action,
-            next: now,
-          })
-          return yield* Cause.done(meta.attempt)
-        }
         yield* opts.set({
           attempt: meta.attempt,
           message: retry.message,

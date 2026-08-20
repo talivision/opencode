@@ -4,7 +4,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Cause, Duration, Effect, Schedule, Schema } from "effect"
+import { Effect, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -121,72 +121,6 @@ describe("session.retry.delay", () => {
         attempt: 2,
         message: "boom",
       })
-    }),
-  )
-
-  it.instance("policy schedules retry-after below the park threshold", () =>
-    Effect.gen(function* () {
-      const updates: { attempt: number; message: string; next: number }[] = []
-      const error = apiError({ "retry-after": "8" })
-      const step = yield* Schedule.toStep(
-        SessionRetry.policy({
-          provider: "test",
-          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
-          set: (info) =>
-            Effect.sync(() => {
-              updates.push(info)
-            }),
-        }),
-      )
-
-      const [attempt, duration] = yield* step(0, error)
-
-      expect(attempt).toBe(1)
-      expect(Duration.toMillis(duration)).toBe(8000)
-      expect(updates).toHaveLength(1)
-    }),
-  )
-
-  it.instance("policy stops instead of parking above the threshold", () =>
-    Effect.gen(function* () {
-      const updates: { attempt: number; message: string; next: number }[] = []
-      const error = apiError({ "retry-after": "47000" })
-      const step = yield* Schedule.toStep(
-        SessionRetry.policy({
-          provider: "test",
-          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
-          set: (info) =>
-            Effect.sync(() => {
-              updates.push(info)
-            }),
-        }),
-      )
-
-      const done = yield* Effect.flip(step(0, error))
-
-      expect(Cause.isDone(done)).toBe(true)
-      expect(updates).toHaveLength(1)
-      expect(updates[0]?.message).toBe(
-        "Provider asks to retry in 13 hours 4 minutes — stopping this turn; it can be resumed once the quota resets",
-      )
-    }),
-  )
-
-  it.instance("policy respects the park threshold override", () =>
-    Effect.gen(function* () {
-      const error = apiError({ "retry-after": "8" })
-      const step = yield* Schedule.toStep(
-        SessionRetry.policy({
-          provider: "test",
-          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
-          set: () => Effect.void,
-          // The exported default is parsed once from OPENCODE_RETRY_PARK_MAX_MS;
-          // this injection keeps the module-scope environment behavior deterministic in tests.
-          parkThresholdMs: 7000,
-        }),
-      )
-
-      expect(Cause.isDone(yield* Effect.flip(step(0, error)))).toBe(true)
     }),
   )
 
