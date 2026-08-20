@@ -427,7 +427,40 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
         }
         mount()
         watchdog.start()
+        // opentui registers a global uncaughtException/unhandledRejection trap
+        // that console.error's into its INTERNAL overlay and continues — the
+        // error never reaches a terminal, a log, or any beacon. By the time it
+        // fires, the unwind has already torn through Solid's runUpdates and
+        // discarded the pending-effect queue: a silent zombie (dead transcript,
+        // dead root — the field "vanishing input" and full-freeze reports).
+        // These listeners run alongside opentui's and turn every member of
+        // that invisible class into a flight-recorded, recovery-triggering
+        // event: noteGraphError feeds the session epoch rebuild, the desync
+        // banner, and the watchdog's heartbeat counters.
+        const onUncaught = (error: unknown) => {
+          recordFlight(global.log, "uncaught exception reached the process trap", {
+            error: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+          })
+          noteGraphError(global.log, error)
+          // A sync unwind may have discarded root effects the echo probe
+          // can't see — remount (rate-limited) rather than hope the subtree
+          // rebuild was enough. Async rejections cannot discard the queue and
+          // deliberately do not escalate.
+          watchdog.requestRemount("uncaught_exception")
+        }
+        const onUnhandled = (reason: unknown) => {
+          recordFlight(global.log, "unhandled rejection reached the process trap", {
+            error: reason instanceof Error ? reason.message : String(reason),
+            stack: reason instanceof Error ? reason.stack : undefined,
+          })
+          noteGraphError(global.log, reason)
+        }
+        process.on("uncaughtException", onUncaught)
+        process.on("unhandledRejection", onUnhandled)
         renderer.once("destroy", () => {
+          process.off("uncaughtException", onUncaught)
+          process.off("unhandledRejection", onUnhandled)
           watchdog.stop()
           try {
             dispose?.()
@@ -478,17 +511,28 @@ function RenderGuard(props: ParentProps<{ log?: string; watchdog: Watchdog }>) {
         })
       }
     })
+    // mode "caught" (default): the kill site catches the unwind — models a
+    // throw whose caller survives. mode "uncaught": the throw escapes the
+    // timer callback and reaches the process-level trap (opentui's swallowing
+    // handler + our beacon listeners) — the invisible field class.
+    const killMode = process.env["OPENCODE_TEST_KILL_GRAPH_MODE"] ?? "caught"
     setTimeout(() => {
       setBomb(true) // arm: the cleanup now exists and throws on the next re-run
       setTimeout(() => {
-        recordFlight(props.log, "test graph kill executed", {})
-        try {
+        recordFlight(props.log, "test graph kill executed", { mode: killMode })
+        const detonate = () =>
           batch(() => {
             // bomb first: its throwing cleanup runs before the echo effect,
             // which is left pending in the discarded queue — the zombie.
             setBomb(false)
             setProbe((value) => value + 0.5)
           })
+        if (killMode === "uncaught") {
+          detonate()
+          return
+        }
+        try {
+          detonate()
         } catch {
           // the unwind is expected; the damage to the graph is already done
         }

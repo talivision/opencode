@@ -121,6 +121,31 @@ export function createWatchdog(options: WatchdogOptions) {
       timer = interval(run, tickInterval)
       if (typeof timer === "object" && timer && "unref" in timer) timer.unref()
     },
+    // A synchronous uncaughtException unwound through unknown territory and
+    // may have discarded root effects that DON'T include the echo probe (a
+    // partially dead root: e.g. resize handling gone, echo alive). Escalate
+    // to a full remount, honoring the same rate limit and ineffective-stop.
+    requestRemount(reason: string) {
+      if (stoppedRemounting) return
+      if (now() - lastRemount < remountInterval) return
+      lastRemount = now()
+      consecutiveRemounts += 1
+      remountTotal += 1
+      const remounts = remountTotal
+      Promise.resolve(options.remount()).then(
+        () =>
+          recordFlight(options.log, "render graph remounted on request", {
+            reason,
+            remounts,
+            graphErrors: graphErrorCount(),
+          }),
+        (error) =>
+          recordFlight(options.log, "render graph remount failed", {
+            error: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+          }),
+      )
+    },
     stop() {
       if (!timer) return
       clear(timer)

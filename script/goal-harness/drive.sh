@@ -45,6 +45,9 @@
 #             (throwing onCleanup discards Solid's pending queue, killing the watchdog echo);
 #             asserts the watchdog detects it, remounts the app, the goal clock resumes,
 #             input still lands, and a resize reflows — the complete-freeze regression
+#   uncaught_zombie same graph kill as watchdog_remount but the throw ESCAPES to the
+#             process-level uncaughtException trap (opentui swallows these invisibly);
+#             asserts the trap beacon, recovery, and a working post-event probe
 #   desync_recovery ux_queued_cancel flow with OPENCODE_TEST_POISON_DISPATCH making the
 #             cancel's message.removed dispatch throw (the historical field bug); asserts the
 #             flight-recorder beacons, automatic render recovery, a rendered post-recovery
@@ -77,6 +80,7 @@ QUEUED_MESSAGE="cancel me before the review finishes"
 PROBE_TEXT="desync probe after recovery"
 POISON_DISPATCH="${POISON_DISPATCH:-}"
 KILL_GRAPH_MS="${KILL_GRAPH_MS:-}"
+KILL_GRAPH_MODE="${KILL_GRAPH_MODE:-}"
 PORT="${PORT:-4599}"
 WORK="${WORK:-${TMPDIR:-/tmp}/opencode-goal-harness}"
 SOCK="${SOCK:-/tmp/opencode-goal-harness.sock}"
@@ -90,9 +94,9 @@ if [ "$SCENARIO" = "ux_goal_window" ]; then
 fi
 
 case "$SCENARIO" in
-  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow | soak | ux_goal_window | ux_queued_cancel | ux_search | overflow_loop | desync_recovery | watchdog_remount) ;;
+  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow | soak | ux_goal_window | ux_queued_cancel | ux_search | overflow_loop | desync_recovery | watchdog_remount | uncaught_zombie) ;;
   *)
-    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow|soak|ux_goal_window|ux_queued_cancel|ux_search|overflow_loop|desync_recovery|watchdog_remount> [seconds]" >&2
+    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow|soak|ux_goal_window|ux_queued_cancel|ux_search|overflow_loop|desync_recovery|watchdog_remount|uncaught_zombie> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -265,6 +269,11 @@ if [ "$SCENARIO" = "watchdog_remount" ]; then
   # goal stays active (and its clock ticking) for the whole scenario.
   PROVIDER_MODE="ux_goal_window"
 fi
+if [ "$SCENARIO" = "uncaught_zombie" ]; then
+  KILL_GRAPH_MS="${KILL_GRAPH_MS:-25000}"
+  KILL_GRAPH_MODE="uncaught"
+  PROVIDER_MODE="ux_goal_window"
+fi
 
 echo "==> fake provider (:$PORT, REVIEWER_MODE=$PROVIDER_MODE)"
 PORT="$PORT" \
@@ -295,6 +304,7 @@ tmux -S "$SOCK" new-session -d -x 160 -y "$PANE_ROWS" -s goal -c "$WORK/proj" \
    ${MAX_MS:+OPENCODE_GOAL_REVIEW_MAX_MS=$MAX_MS} \
    ${POISON_DISPATCH:+OPENCODE_TEST_POISON_DISPATCH=$POISON_DISPATCH} \
    ${KILL_GRAPH_MS:+OPENCODE_TEST_KILL_GRAPH_AFTER_MS=$KILL_GRAPH_MS} \
+   ${KILL_GRAPH_MODE:+OPENCODE_TEST_KILL_GRAPH_MODE=$KILL_GRAPH_MODE} \
    '$BIN' --pure 2>&1 | tee $WORK/tui.log"
 
 sleep 15
@@ -433,7 +443,7 @@ elif [ "$SCENARIO" = "ux_search" ]; then
   tmux -S "$SOCK" send-keys -l -t goal -- "/find"
   tmux -S "$SOCK" send-keys -t goal Enter
   wait_for_goal_text "esc close" "$WORK/snaps/ux-search-slash.txt" || true
-elif [ "$SCENARIO" = "watchdog_remount" ]; then
+elif [ "$SCENARIO" = "watchdog_remount" ] || [ "$SCENARIO" = "uncaught_zombie" ]; then
   UX_WINDOW="$WATCH"
   if [ "$UX_WINDOW" -gt 60 ]; then
     UX_WINDOW=60
@@ -451,9 +461,12 @@ elif [ "$SCENARIO" = "watchdog_remount" ]; then
   sleep 4
   WD_CLOCK_B="$(goal_clock)"
 
-  echo "==> wait for the injected graph kill, then the watchdog remount"
+  echo "==> wait for the injected graph kill, then recovery (remount or beaconed rebuild)"
   while [ "$SECONDS" -lt "$UX_DEADLINE" ]; do
     if grep -aq "render graph dead — remounted app" "$OCLOG_DIR"/*.log 2>/dev/null; then
+      break
+    fi
+    if [ "$SCENARIO" = "uncaught_zombie" ] && grep -aq "session display recovery requested" "$OCLOG_DIR"/*.log 2>/dev/null; then
       break
     fi
     sleep 0.5
@@ -617,6 +630,42 @@ case "$SCENARIO" in
       "$WORK/interrupted-goal.json"
     ;;
 esac
+
+if [ "$SCENARIO" = "uncaught_zombie" ]; then
+  OCLOG_DIR="$WORK/home/.local/share/opencode/log"
+  DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
+
+  if grep -aq "test graph kill executed" "$OCLOG_DIR"/*.log 2>/dev/null; then
+    ux_ok "injected uncaught graph kill executed"
+  else
+    ux_fail "injected uncaught graph kill executed" "no kill beacon"
+  fi
+  if grep -aq "uncaught exception reached the process trap" "$OCLOG_DIR"/*.log 2>/dev/null; then
+    ux_ok "process trap beacon fired (previously swallowed invisibly by opentui)"
+  else
+    ux_fail "process trap beacon fired" "the uncaught throw left no beacon — the invisible class is open"
+  fi
+  if grep -aqE "session display recovery requested|render graph dead — remounted app|render graph remounted on request" "$OCLOG_DIR"/*.log 2>/dev/null; then
+    ux_ok "recovery engaged from the trap beacon"
+  else
+    ux_fail "recovery engaged from the trap beacon" "no recovery/remount beacon"
+  fi
+  if [ -n "$WD_CLOCK_C" ] && [ -n "$WD_CLOCK_D" ] && [ "$WD_CLOCK_C" != "$WD_CLOCK_D" ]; then
+    ux_ok "goal clock ticks after recovery"
+  else
+    ux_fail "goal clock ticks after recovery" "C='$WD_CLOCK_C' D='$WD_CLOCK_D'"
+  fi
+  if grep -Fq "$WD_PROBE" "$WORK/snaps/wd-probe.txt" 2>/dev/null; then
+    ux_ok "post-recovery input renders (no silent black hole)"
+  else
+    ux_fail "post-recovery input renders (no silent black hole)" "probe text missing"
+  fi
+  if [ -n "$DB" ] && [ "$(sqlite3 "$DB" "SELECT count(*) FROM part WHERE json_extract(data,'\$.text') LIKE '%${WD_PROBE}%';" 2>/dev/null || echo 0)" -ge 1 ]; then
+    ux_ok "post-recovery input persisted server-side"
+  else
+    ux_fail "post-recovery input persisted server-side"
+  fi
+fi
 
 if [ "$SCENARIO" = "watchdog_remount" ]; then
   OCLOG_DIR="$WORK/home/.local/share/opencode/log"
