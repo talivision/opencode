@@ -28,6 +28,8 @@
 #   goal-events reviewer accepts; asserts the rendered Goal achieved indication and durable completion
 #   invalid   verdict carries the wrong nonce         -> forged verdict must be refused
 #   http500   provider fails the reviewer request     -> reviewer failure inline
+#   retry_park worker gets a 13-hour retry-after, which must end the turn; a later
+#             8-second retry accepts and persists input submitted during its countdown
 #   silent    reviewer never responds                 -> inactivity timeout
 #   permission_blocked reviewer waits on an external-directory permission beyond
 #             both 5s watchdog limits, then accepts after the UI grants it
@@ -66,6 +68,9 @@ fi
 if [ "$SCENARIO" = "overflow_loop" ] && [ "$#" -lt 2 ]; then
   WATCH=90
 fi
+if [ "$SCENARIO" = "retry_park" ] && [ "$#" -lt 2 ]; then
+  WATCH=60
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
@@ -88,11 +93,15 @@ if [ "$SCENARIO" = "ux_goal_window" ]; then
   WORKER_TEXT="${WORKER_TEXT:-The assistant reply fixture is intentionally a very long single paragraph so that any regression in markdown word wrapping inside the transcript surfaces as a clipped single row instead of a wrapped block spanning multiple rows}"
   export WORKER_TEXT
 fi
+if [ "$SCENARIO" = "retry_park" ]; then
+  WORKER_TEXT="${WORKER_TEXT:-retry park worker reply}"
+  export WORKER_TEXT
+fi
 
 case "$SCENARIO" in
-  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow | soak | ux_goal_window | ux_queued_cancel | ux_search | overflow_loop | desync_recovery | watchdog_remount) ;;
+  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | retry_park | silent | permission_blocked | goal_check | busy | slow | soak | ux_goal_window | ux_queued_cancel | ux_search | overflow_loop | desync_recovery | watchdog_remount) ;;
   *)
-    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow|soak|ux_goal_window|ux_queued_cancel|ux_search|overflow_loop|desync_recovery|watchdog_remount> [seconds]" >&2
+    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|retry_park|silent|permission_blocked|goal_check|busy|slow|soak|ux_goal_window|ux_queued_cancel|ux_search|overflow_loop|desync_recovery|watchdog_remount> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -322,7 +331,53 @@ if [ "$SCENARIO" = "interrupted" ]; then
   done
 fi
 
-if [ "$SCENARIO" = "ux_goal_window" ]; then
+if [ "$SCENARIO" = "retry_park" ]; then
+  UX_DEADLINE=$((SECONDS + WATCH))
+  PHASE1_DEADLINE=$((SECONDS + 30))
+  if [ "$PHASE1_DEADLINE" -gt "$UX_DEADLINE" ]; then
+    PHASE1_DEADLINE="$UX_DEADLINE"
+  fi
+  RETRY_PARK_TURN_ENDED=0
+  RETRY_PARK_ERROR_VISIBLE=0
+  : >"$WORK/snaps/retry-park-all.txt"
+
+  echo "==> phase 1: oversized retry-after must end the provider turn"
+  while [ "$SECONDS" -lt "$PHASE1_DEADLINE" ]; do
+    capture_goal_pane "$WORK/snaps/retry-park-phase1.txt"
+    cat "$WORK/snaps/retry-park-phase1.txt" >>"$WORK/snaps/retry-park-all.txt"
+    state="$(ls "$WORK/home/.local/share/opencode/storage/goal/"*.json 2>/dev/null | head -1 || true)"
+    if grep -Eq "FreeUsageLimitError|Free usage exceeded|Provider asks to retry" "$WORK/snaps/retry-park-phase1.txt"; then
+      RETRY_PARK_ERROR_VISIBLE=1
+    fi
+    if [ -n "$state" ] && node -e '
+const fs = require("fs")
+const goal = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+process.exit(goal.status !== "active" || goal.interrupted ? 0 : 1)
+' "$state"; then
+      RETRY_PARK_TURN_ENDED=1
+      cp "$state" "$WORK/retry-park-phase1-goal.json"
+    fi
+    if [ "$RETRY_PARK_TURN_ENDED" -eq 1 ] && [ "$RETRY_PARK_ERROR_VISIBLE" -eq 1 ]; then
+      break
+    fi
+    sleep 0.25
+  done
+
+  echo "==> phase 2: submit input before and during the bounded retry"
+  tmux -S "$SOCK" send-keys -l -t goal -- "resume after bounded retry park"
+  tmux -S "$SOCK" send-keys -t goal Enter
+  wait_for_goal_regex "retrying in [1-9][0-9]*s" "$WORK/snaps/retry-park-countdown.txt" || true
+  cat "$WORK/snaps/retry-park-countdown.txt" >>"$WORK/snaps/retry-park-all.txt"
+
+  RETRY_PARK_PROBE="park probe input"
+  tmux -S "$SOCK" send-keys -l -t goal -- "$RETRY_PARK_PROBE"
+  tmux -S "$SOCK" send-keys -t goal Enter
+  sleep 1
+  wait_for_goal_text "$RETRY_PARK_PROBE" "$WORK/snaps/retry-park-probe.txt" || true
+  cat "$WORK/snaps/retry-park-probe.txt" >>"$WORK/snaps/retry-park-all.txt"
+  wait_for_goal_text "${WORKER_TEXT:-Lima}" "$WORK/snaps/retry-park-worker-reply.txt" || true
+  cat "$WORK/snaps/retry-park-worker-reply.txt" >>"$WORK/snaps/retry-park-all.txt"
+elif [ "$SCENARIO" = "ux_goal_window" ]; then
   UX_WINDOW="$WATCH"
   if [ "$UX_WINDOW" -gt 45 ]; then
     UX_WINDOW=45
@@ -617,6 +672,64 @@ case "$SCENARIO" in
       "$WORK/interrupted-goal.json"
     ;;
 esac
+
+if [ "$SCENARIO" = "retry_park" ]; then
+  DB="$(ls "$WORK/home/.local/share/opencode/"*.db 2>/dev/null | head -1 || true)"
+  OCLOG_DIR="$WORK/home/.local/share/opencode/log"
+
+  if ! grep -REq "retrying in [0-9]+h" "$WORK/snaps"; then
+    ux_ok "oversized retry-after never renders an hours-long countdown"
+  else
+    ux_fail "oversized retry-after never renders an hours-long countdown" "found 'retrying in <hours>h' in snapshots"
+  fi
+  if [ "$RETRY_PARK_ERROR_VISIBLE" -eq 1 ]; then
+    ux_ok "provider quota error renders instead of parking the turn"
+  else
+    ux_fail "provider quota error renders instead of parking the turn" "no FreeUsageLimitError/free-usage wording in phase-1 pane"
+  fi
+  if [ "$RETRY_PARK_TURN_ENDED" -eq 1 ]; then
+    ux_ok "oversized retry-after leaves the active running turn boundary"
+  else
+    ux_fail "oversized retry-after leaves the active running turn boundary" "goal stayed active with no durable interrupted turn"
+  fi
+  if node -e '
+const fs = require("fs")
+const entries = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
+process.exit(entries.filter((entry) => entry.role === "worker").some((entry) => entry.n >= 3) ? 0 : 1)
+' "$WORK/provider.log"; then
+    ux_ok "provider receives the long failure, bounded retry, and successful retry request"
+  else
+    ux_fail "provider receives the long failure, bounded retry, and successful retry request"
+  fi
+  if grep -Eq "retrying in [1-9][0-9]*s" "$WORK/snaps/retry-park-countdown.txt"; then
+    ux_ok "below-threshold retry-after renders a seconds countdown"
+  else
+    ux_fail "below-threshold retry-after renders a seconds countdown" "no bounded retry countdown"
+  fi
+  if grep -Fq "$RETRY_PARK_PROBE" "$WORK/snaps/retry-park-probe.txt"; then
+    ux_ok "input submitted during retry renders in the pane"
+    RETRY_PARK_PROBE_RENDERED=1
+  else
+    ux_fail "input submitted during retry renders in the pane" "park probe input missing"
+    RETRY_PARK_PROBE_RENDERED=0
+  fi
+  if [ -n "$DB" ] && [ "$(sqlite3 "$DB" "SELECT count(*) FROM part WHERE json_extract(data,'\$.text') LIKE '%park probe input%';" 2>/dev/null || echo 0)" -ge 1 ]; then
+    ux_ok "input submitted during retry persists in the database"
+    RETRY_PARK_PROBE_PERSISTED=1
+  else
+    ux_fail "input submitted during retry persists in the database" "park probe input missing from part text"
+    RETRY_PARK_PROBE_PERSISTED=0
+  fi
+  if grep -Fq "${WORKER_TEXT:-Lima}" "$WORK/snaps/retry-park-worker-reply.txt"; then
+    ux_ok "worker reply renders after the bounded retry succeeds"
+  else
+    ux_fail "worker reply renders after the bounded retry succeeds" "${WORKER_TEXT:-Lima} missing from pane"
+  fi
+  if [ "$RETRY_PARK_PROBE_RENDERED" -eq 0 ] || [ "$RETRY_PARK_PROBE_PERSISTED" -eq 0 ]; then
+    echo "==> retry_park submit flight log"
+    grep -ahE "submit refused|prompt sent" "$OCLOG_DIR"/*.log 2>/dev/null || echo "(no submit beacons found)"
+  fi
+fi
 
 if [ "$SCENARIO" = "watchdog_remount" ]; then
   OCLOG_DIR="$WORK/home/.local/share/opencode/log"

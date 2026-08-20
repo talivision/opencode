@@ -211,6 +211,7 @@ jobs:
           run_scenario goal-harness overflow_loop 90 4914 4
           run_scenario goal-harness desync_recovery 45 4918 6
           run_scenario goal-harness watchdog_remount 60 4919 7
+          run_scenario goal-harness retry_park 60 4920 8
 
           exit "$fail"
 

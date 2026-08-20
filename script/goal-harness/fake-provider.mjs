@@ -17,7 +17,8 @@
 //   REVIEWER_INPUT/OUTPUT fake reviewer usage (default 12000 / 58)
 //   REVIEWER_MODE         met | not_met | not_met_history | turns | interrupted | cache-stable | goal-events |
 //                         met_tool | not_met_tool | unclaimed | retrieval | permission_blocked | goal_check | invalid |
-//                         silent | slow | soak | busy | http500 | ux_goal_window | ux_queued_cancel | overflow_loop
+//                         silent | slow | soak | busy | http500 | retry_park | ux_goal_window | ux_queued_cancel |
+//                         overflow_loop
 //   REVIEWER_NOT_MET_N    first N reviews return NOT_MET, then MET (default 0)
 //   REVIEWER_READ_PATH    controlled absolute path read by permission_blocked
 //   CLASSIFIER_SELF_TEST  1 prints positive/control classifier checks and exits
@@ -467,6 +468,18 @@ const server = http.createServer(async (req, res) => {
     url: req.url,
     body: parsed,
   })
+  if (REVIEWER_MODE === "retry_park" && workerCount <= 2) {
+    res.writeHead(429, {
+      "content-type": "application/json",
+      "retry-after": workerCount === 1 ? "47000" : "8",
+    })
+    res.end(JSON.stringify({ error: { message: "FreeUsageLimitError: Free usage exceeded" } }))
+    return
+  }
+  if (REVIEWER_MODE === "retry_park") {
+    textReply(res, WORKER_TEXT, WORKER_USAGE)
+    return
+  }
   if (REVIEWER_MODE === "ux_goal_window") {
     // WORKER_TEXT override lets wrap/render checks feed arbitrary long text.
     textReply(
