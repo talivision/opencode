@@ -22,19 +22,28 @@ export type PluginRoute = {
 
 export type Route = HomeRoute | SessionRoute | PluginRoute
 
+// Survives a watchdog remount: the whole provider tree is rebuilt after a dead
+// render graph, and without this stash the user would land on home mid-session.
+// Module state resets per process, so a fresh boot is unaffected.
+let lastRoute: Route | undefined
+
 export const { use: useRoute, provider: RouteProvider } = createSimpleContext({
   name: "Route",
-  init: (props: { initialRoute?: Route }) => {
+  init: (props: { initialRoute?: Route; restoreStash?: boolean }) => {
     const startup = useTuiStartup()
     const [store, setStore] = createStore<Route>(
-      props.initialRoute ?? initialRoute(startup.initialRoute) ?? { type: "home" },
+      (props.restoreStash ? lastRoute : undefined) ??
+        props.initialRoute ??
+        initialRoute(startup.initialRoute) ?? { type: "home" },
     )
+    lastRoute = JSON.parse(JSON.stringify(store))
 
     return {
       get data() {
         return store
       },
       navigate(route: Route) {
+        lastRoute = JSON.parse(JSON.stringify(route))
         setStore(reconcile(route))
       },
     }

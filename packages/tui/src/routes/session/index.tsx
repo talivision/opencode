@@ -90,6 +90,7 @@ import { TranscriptSearch, type TranscriptSearchRef } from "../../component/tran
 import { segmentTranscriptMatches } from "../../util/transcript-search"
 import { KeepMounted } from "../../component/keep-mounted"
 import { createRenderRecovery } from "../../util/render-recovery"
+import { graphErrors } from "../../util/zombie-guard"
 import { recordFlight } from "../../util/flight-recorder"
 
 addDefaultParsers(parsers.parsers)
@@ -326,7 +327,7 @@ export function Session() {
   const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
   const toast = useToast()
   const sdk = useSDK()
-  const recovery = createRenderRecovery(sdk.dispatchErrors)
+  const recovery = createRenderRecovery(() => sdk.dispatchErrors() + graphErrors())
   const refreshShortcut = useCommandShortcut("session.refresh")
   const goals = useGoal()
   const goal = goals.get(route.sessionID)

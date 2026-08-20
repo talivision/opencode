@@ -625,6 +625,7 @@ export function Prompt(props: PromptProps) {
   }
 
   onMount(() => {
+    recordFlight(paths.log, "composer mounted", { sessionID: props.sessionID })
     const saved = stashed
     stashed = undefined
     if (store.prompt.input) return

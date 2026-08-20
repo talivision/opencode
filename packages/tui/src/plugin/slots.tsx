@@ -22,17 +22,36 @@ function isHostSlotPlugin(value: unknown): value is HostSlotPlugin<Record<string
   return isRecord(value.slots)
 }
 
+const slotContexts = new WeakMap<object, TuiSlotContext>()
+
 export function createSlots() {
   const empty: SlotView = () => null
   const [view, setView] = createSignal<SlotView>(empty)
-  const Slot: SlotView = (props) => view()(props)
+  // The view() read must live in a tracked JSX expression, not the component
+  // body (Solid untracks component bodies): a Slot rendered before the plugin
+  // host finishes loading — e.g. a session restored immediately after a
+  // watchdog remount — would otherwise latch the empty view forever and
+  // silently drop its children.
+  const Slot: SlotView = (props) => <>{view()(props)}</>
 
   return {
     Slot,
     setup(api: HostPluginApi): HostSlots {
+      // opentui keeps one slot registry per renderer and requires the SAME
+      // context object on every createSolidSlotRegistry call for that
+      // renderer. A watchdog remount re-runs setup with a fresh theme, so the
+      // context object is cached per renderer and refreshed in place — a new
+      // object here throws and silently kills every Slot's children.
+      let context = slotContexts.get(api.renderer)
+      if (!context) {
+        context = { theme: api.theme }
+        slotContexts.set(api.renderer, context)
+      } else {
+        context.theme = api.theme
+      }
       const registry = createSolidSlotRegistry<RuntimeSlotMap, TuiSlotContext>(
         api.renderer,
-        { theme: api.theme },
+        context,
         {
           onPluginError(event) {
             console.error("[tui.slot] plugin error", {
