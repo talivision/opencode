@@ -179,6 +179,9 @@ export const RecordRequirementsInput = Schema.Struct({
   sessionID: SessionID,
   reviewerSessionID: SessionID,
   requirements: Schema.mutable(Schema.Array(Schema.Struct({ id: Schema.String, text: Schema.String }))),
+  // A later reviewer may replace a checklist that clearly misinterprets the
+  // objective. The tool layer demands a stated reason before setting this.
+  revise: Schema.optional(Schema.Boolean),
 })
 export type RecordRequirementsInput = Schema.Schema.Type<typeof RecordRequirementsInput>
 
@@ -485,10 +488,11 @@ const layer = Layer.effect(
     const recordRequirements = Effect.fn("SessionGoal.recordRequirements")(function* (input: RecordRequirementsInput) {
       return yield* update(input.sessionID, (draft, now) => {
         // Same gate as submitVerdict: only the reviewer session named by the
-        // running review may write, and only once per goal.
+        // running review may write. Once written, replacement requires the
+        // explicit revise flag (the tool demands a stated misreading first).
         if (draft.review?.status !== "running") return
         if (draft.review.reviewerSessionID !== input.reviewerSessionID) return
-        if (draft.requirements?.length) return
+        if (draft.requirements?.length && !input.revise) return
         if (!input.requirements.length) return
         draft.requirements = input.requirements.map((item) => ({
           id: item.id,

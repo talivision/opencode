@@ -263,7 +263,7 @@ describe("SessionGoal", () => {
       expect(first?.requirements?.map((item) => item.id)).toEqual(["R1", "R2"])
       expect(first?.requirements?.every((item) => item.status === "unverified" && item.attempt === 0)).toBe(true)
 
-      // First write wins, exactly like submitVerdict.
+      // First write wins by default, exactly like submitVerdict.
       const second = yield* goal.recordRequirements({
         sessionID,
         reviewerSessionID: reviewerID,
@@ -273,6 +273,27 @@ describe("SessionGoal", () => {
         "the exporter exists",
         "the exporter is covered by tests",
       ])
+
+      // An explicit revision (tool layer demands a stated misreading first)
+      // replaces the decomposition; the reviewer gate still applies.
+      const forgedRevision = yield* goal.recordRequirements({
+        sessionID,
+        reviewerSessionID: SessionID.create(),
+        requirements: [{ id: "R1", text: "forged revision" }],
+        revise: true,
+      })
+      expect(forgedRevision?.requirements?.map((item) => item.text)).toEqual([
+        "the exporter exists",
+        "the exporter is covered by tests",
+      ])
+      const revised = yield* goal.recordRequirements({
+        sessionID,
+        reviewerSessionID: reviewerID,
+        requirements: [{ id: "R1", text: "the corrected reading of the objective" }],
+        revise: true,
+      })
+      expect(revised?.requirements?.map((item) => item.text)).toEqual(["the corrected reading of the objective"])
+      expect(revised?.requirements?.every((item) => item.status === "unverified" && item.attempt === 0)).toBe(true)
 
       // A new objective invalidates the decomposition of the old one.
       const edited = yield* goal.edit({ sessionID, objective: "ship something else entirely" })

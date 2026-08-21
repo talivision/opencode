@@ -1227,8 +1227,11 @@ it.instance("reviewers index the parent session, retrieve on demand, and hand co
     expect(reviewerBodies[0]).not.toContain("Completion is pending independent review")
     const last = reviewerBodies.at(-1)!
     expect(last).toContain("Earlier reviewers recorded this checklist")
-    expect(last).toContain("R2 [unmet, attempt 1] prove it twice")
-    expect(last).toContain("prior evidence: only one proof was retrieved")
+    expect(last).toContain("R2 prove it twice")
+    // Frame only: prior verdicts and evidence are deliberately withheld so a
+    // later reviewer grades the state, not the delta since the last balk.
+    expect(last).not.toContain("[unmet")
+    expect(last).not.toContain("prior evidence:")
     expect(last).not.toContain("Completion is pending independent review")
   }),
 )

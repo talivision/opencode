@@ -177,12 +177,14 @@ function goalReviewChecklist(requirements: SessionGoal.Info["requirements"]) {
       "If goal_checklist is unavailable, review the objective as a whole instead.",
     ]
   }
+  // Frame only — no prior statuses, attempts, or evidence. Showing where the
+  // last reviewer balked steers this one toward grading the delta ("my
+  // predecessor's complaints were addressed") instead of the state; evidence
+  // of progress is not evidence of completion.
   return [
-    "Earlier reviewers recorded this checklist. It is write-once — verify every item against current state, including items an earlier attempt marked met.",
-    ...requirements.flatMap((item) => [
-      `${item.id} [${item.status}${item.attempt ? `, attempt ${item.attempt}` : ""}] ${item.text}`,
-      ...(item.evidence ? [`    prior evidence: ${item.evidence}`] : []),
-    ]),
+    "Earlier reviewers recorded this checklist. Verify every item against authoritative current state, as if reviewing for the first time — prior attempts' outcomes are deliberately not shown.",
+    "If, and only if, the checklist clearly misinterprets the objective, replace it with goal_checklist stating the misreading in revised_because; otherwise review against it exactly as written.",
+    ...requirements.map((item) => `${item.id} ${item.text}`),
   ]
 }
 

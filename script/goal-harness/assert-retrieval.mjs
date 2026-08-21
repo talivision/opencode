@@ -57,9 +57,11 @@ check("attempt 1 is told no checklist exists", first.includes("No requirement ch
 
 const inherited = seeds.filter((body) => body.includes("Earlier reviewers recorded this checklist"))
 check("attempt 2 inherits the persisted checklist", inherited.length > 0)
+// Frame only: prior verdicts/evidence are deliberately withheld from later
+// reviewers so they grade the state, not the delta since the last balk.
 check(
-  "attempt 2 inherits per-requirement conclusions",
-  inherited.some((body) => body.includes("R2 [unmet, attempt 1]")),
+  "attempt 2 inherits the requirement frame without prior conclusions",
+  inherited.some((body) => body.includes("R2 ") && !body.includes("[unmet") && !body.includes("prior evidence:")),
 )
 
 // The index names tool calls but never their output. The goal tool's own

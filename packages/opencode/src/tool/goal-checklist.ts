@@ -16,6 +16,10 @@ export const Parameters = Schema.Struct({
   ).annotate({
     description: "Every explicit requirement in the objective, decomposed into independently verifiable items",
   }),
+  revised_because: Schema.optional(Schema.String).annotate({
+    description:
+      "Only when replacing an inherited checklist that clearly misinterprets the objective: what exactly was misread. Without this, an existing checklist is never replaced.",
+  }),
 })
 
 type Metadata = {
@@ -34,8 +38,9 @@ export const GoalChecklistTool = define<typeof Parameters, Metadata, SessionGoal
     return {
       description: [
         "Record the requirement checklist for this goal — the decomposition of the objective into independently verifiable requirements, ids R1..Rn.",
-        "Write-once per goal: the first reviewer creates it and every later reviewer inherits it in its first message, with the per-requirement verdicts earlier reviewers reached.",
-        "Call this once, before you start gathering evidence, and only if your first message says the checklist is missing.",
+        "The first reviewer creates it and every later reviewer inherits it as the stable frame of reference.",
+        "Call this before gathering evidence if your first message says the checklist is missing.",
+        "If the inherited checklist clearly misinterprets the objective, call with revised_because stating the misreading to replace it; otherwise never replace it.",
       ].join(" "),
       parameters: Parameters,
       execute: (params, ctx) =>
@@ -52,12 +57,14 @@ export const GoalChecklistTool = define<typeof Parameters, Metadata, SessionGoal
             }
           }
           const existing = (yield* goal.get(parentID))?.requirements ?? []
-          if (existing.length) {
+          const revision = params.revised_because?.trim()
+          if (existing.length && !revision) {
             return {
               title: "Checklist already recorded",
               output: [
-                "This goal already has a checklist; it is write-once and was not replaced. Review against it:",
-                ...existing.map((item) => `${item.id} [${item.status}] ${item.text}`),
+                "This goal already has a checklist and it was not replaced. Review against it as-is.",
+                "Replacing it is reserved for a checklist that clearly misinterprets the objective — call again with revised_because stating the misreading.",
+                ...existing.map((item) => `${item.id} ${item.text}`),
               ].join("\n"),
               metadata: { existing: existing.length },
             }
@@ -94,10 +101,20 @@ export const GoalChecklistTool = define<typeof Parameters, Metadata, SessionGoal
             }
           }
 
+          if (existing.length && revision) {
+            yield* Effect.logWarning("goal checklist revised by a later reviewer", {
+              "session.id": parentID,
+              reviewer: ctx.sessionID,
+              reason: revision,
+              before: existing.length,
+              after: items.length,
+            })
+          }
           const updated = yield* goal.recordRequirements({
             sessionID: parentID,
             reviewerSessionID: ctx.sessionID,
             requirements: items,
+            revise: Boolean(existing.length && revision),
           })
           if (!updated?.requirements?.length) {
             return {
