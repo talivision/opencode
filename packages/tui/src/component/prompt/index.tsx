@@ -1085,6 +1085,7 @@ export function Prompt(props: PromptProps) {
 
     if (store.mode === "shell") {
       move.startSubmit()
+      recordFlight(paths.log, "submit dispatched", { branch: "shell", sessionID })
       void sdk.client.session.shell({
         sessionID,
         agent: agent.name,
@@ -1097,6 +1098,7 @@ export function Prompt(props: PromptProps) {
       setStore("mode", "normal")
     } else if (goalInput !== undefined) {
       move.startSubmit()
+      recordFlight(paths.log, "submit dispatched", { branch: "goal", sessionID })
       await withTimeout(goals.execute(sessionID, goalInput), GOAL_SUBMIT_TIMEOUT, "Goal command timed out")
         .then((result) => {
           if (result.action === "show" || result.action === "edit") {
@@ -1133,6 +1135,7 @@ export function Prompt(props: PromptProps) {
       const restOfInput = firstLineEnd === -1 ? "" : inputText.slice(firstLineEnd + 1)
       const args = firstLineArgs.join(" ") + (restOfInput ? "\n" + restOfInput : "")
 
+      recordFlight(paths.log, "submit dispatched", { branch: "command", sessionID })
       void sdk.client.session.command({
         sessionID,
         command: command.slice(1),
@@ -1144,6 +1147,7 @@ export function Prompt(props: PromptProps) {
       })
     } else {
       move.startSubmit()
+      recordFlight(paths.log, "submit dispatched", { branch: "prompt", sessionID })
       void sdk.client.session
         .prompt(
           {

@@ -212,6 +212,7 @@ jobs:
           run_scenario goal-harness desync_recovery 45 4918 6
           run_scenario goal-harness watchdog_remount 60 4919 7
           run_scenario goal-harness uncaught_zombie 60 4922 6
+          run_scenario goal-harness permission_grace 60 4923 4
 
           exit "$fail"
 

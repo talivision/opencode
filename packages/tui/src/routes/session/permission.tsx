@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store"
 import { dirname } from "node:path"
-import { createMemo, For, Match, onCleanup, onMount, Show, Switch } from "solid-js"
+import { createEffect, createMemo, For, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { Portal, useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import type { TextareaRenderable } from "@opentui/core"
 import { useTheme, selectedForeground } from "../../context/theme"
@@ -16,9 +16,37 @@ import { getScrollAcceleration } from "../../util/scroll"
 import { useTuiConfig } from "../../config"
 import { useBindings, useCommandShortcut, useOpencodeModeStack } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
+import { recordFlight } from "../../util/flight-recorder"
+import { useTuiPaths } from "../../context/runtime"
 
 type PermissionStage = "permission" | "always" | "reject"
 const PERMISSION_MODE = "permission"
+
+// Focus-steal guard: a permission prompt appearing mid-keystroke must not let
+// an in-flight Enter/Escape answer it — the user's input was meant for the
+// composer (field-attributed: typed messages vanished into fresh permission
+// dialogs during subagent churn, and Enter blind-answered them). Activation
+// keys are ignored for the prompt's first moments, and every keyboard answer
+// is flight-recorded with the prompt's age so a race is attributable forever.
+const PERMISSION_GRACE_MS = Number(process.env["OPENCODE_PERMISSION_GRACE_MS"] ?? 600) || 600
+let graceRequestID = ""
+let graceShownAt = 0
+function markPermissionShown(requestID: string) {
+  if (requestID === graceRequestID) return
+  graceRequestID = requestID
+  graceShownAt = Date.now()
+}
+function permissionGraceBlocks(log: string | undefined, requestID: string | undefined, option: string) {
+  if (!requestID) return false
+  markPermissionShown(requestID)
+  const age = Date.now() - graceShownAt
+  if (age < PERMISSION_GRACE_MS) {
+    recordFlight(log, "permission answer suppressed during grace", { requestID, age, option })
+    return true
+  }
+  recordFlight(log, "permission answered via keyboard", { requestID, age, option })
+  return false
+}
 
 function EditBody(props: { request: PermissionRequest }) {
   const themeState = useTheme()
@@ -124,6 +152,8 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
     onCleanup(popMode)
   })
 
+  createEffect(() => markPermissionShown(props.request.id))
+
   const session = createMemo(() => sync.data.session.find((s) => s.id === props.request.sessionID))
 
   const input = createMemo(() => {
@@ -169,6 +199,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
           }
           options={{ confirm: "Confirm", cancel: "Cancel" }}
           escapeKey="cancel"
+          requestID={props.request.id + ":always-confirm"}
           onSelect={(option) => {
             setStore("stage", "permission")
             if (option === "cancel") return
@@ -412,6 +443,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
               options={{ once: "Allow once", always: "Allow always", reject: "Reject" }}
               escapeKey="reject"
               fullscreen
+              requestID={props.request.id}
               onSelect={(option) => {
                 if (option === "always") {
                   setStore("stage", "always")
@@ -536,9 +568,11 @@ function Prompt<const T extends Record<string, string>>(props: {
   options: T
   escapeKey?: keyof T
   fullscreen?: boolean
+  requestID?: string
   onSelect: (option: keyof T) => void
 }) {
   const { theme } = useTheme()
+  const paths = useTuiPaths()
   const tuiConfig = useTuiConfig()
   const dimensions = useTerminalDimensions()
   const keys = Object.keys(props.options) as (keyof T)[]
@@ -616,7 +650,10 @@ function Prompt<const T extends Record<string, string>>(props: {
         key: "return",
         desc: "Select permission option",
         group: "Permission",
-        cmd: () => props.onSelect(store.selected),
+        cmd: () => {
+          if (permissionGraceBlocks(paths.log, props.requestID, String(store.selected))) return
+          props.onSelect(store.selected)
+        },
       },
       ...(props.escapeKey
         ? [
@@ -624,7 +661,10 @@ function Prompt<const T extends Record<string, string>>(props: {
               key: "escape",
               desc: "Reject permission",
               group: "Permission",
-              cmd: () => props.onSelect(props.escapeKey!),
+              cmd: () => {
+                if (permissionGraceBlocks(paths.log, props.requestID, String(props.escapeKey))) return
+                props.onSelect(props.escapeKey!)
+              },
             },
           ]
         : []),

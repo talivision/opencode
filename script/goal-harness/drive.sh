@@ -45,6 +45,9 @@
 #             (throwing onCleanup discards Solid's pending queue, killing the watchdog echo);
 #             asserts the watchdog detects it, remounts the app, the goal clock resumes,
 #             input still lands, and a resize reflows — the complete-freeze regression
+#   permission_grace a permission prompt must ignore an Enter arriving within its
+#             grace window (the focus-steal race that ate typed messages in the field),
+#             then accept a deliberate Enter after the window
 #   uncaught_zombie same graph kill as watchdog_remount but the throw ESCAPES to the
 #             process-level uncaughtException trap (opentui swallows these invisibly);
 #             asserts the trap beacon, recovery, and a working post-event probe
@@ -81,6 +84,7 @@ PROBE_TEXT="desync probe after recovery"
 POISON_DISPATCH="${POISON_DISPATCH:-}"
 KILL_GRAPH_MS="${KILL_GRAPH_MS:-}"
 KILL_GRAPH_MODE="${KILL_GRAPH_MODE:-}"
+PERMISSION_GRACE_MS="${PERMISSION_GRACE_MS:-}"
 PORT="${PORT:-4599}"
 WORK="${WORK:-${TMPDIR:-/tmp}/opencode-goal-harness}"
 SOCK="${SOCK:-/tmp/opencode-goal-harness.sock}"
@@ -94,9 +98,9 @@ if [ "$SCENARIO" = "ux_goal_window" ]; then
 fi
 
 case "$SCENARIO" in
-  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow | soak | ux_goal_window | ux_queued_cancel | ux_search | overflow_loop | desync_recovery | watchdog_remount | uncaught_zombie) ;;
+  met | not_met | met_tool | not_met_tool | unclaimed | retrieval | not_met_history | turns | interrupted | cache-stable | goal-events | invalid | http500 | silent | permission_blocked | goal_check | busy | slow | soak | ux_goal_window | ux_queued_cancel | ux_search | overflow_loop | desync_recovery | watchdog_remount | uncaught_zombie | permission_grace) ;;
   *)
-    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow|soak|ux_goal_window|ux_queued_cancel|ux_search|overflow_loop|desync_recovery|watchdog_remount|uncaught_zombie> [seconds]" >&2
+    echo "usage: $0 <met|not_met|met_tool|not_met_tool|unclaimed|retrieval|not_met_history|turns|interrupted|cache-stable|goal-events|invalid|http500|silent|permission_blocked|goal_check|busy|slow|soak|ux_goal_window|ux_queued_cancel|ux_search|overflow_loop|desync_recovery|watchdog_remount|uncaught_zombie|permission_grace> [seconds]" >&2
     exit 2
     ;;
 esac
@@ -216,10 +220,10 @@ config.provider.fake.options.baseURL = `http://127.0.0.1:${port}/v1`
 if (scenario === "overflow_loop") {
   config.provider.fake.models["fake-model"].limit = { context: 15000, output: 2000 }
 }
-if (["permission_blocked", "silent"].includes(scenario)) {
+if (["permission_blocked", "permission_grace", "silent"].includes(scenario)) {
   config.goal = { ...config.goal, review: { ...config.goal?.review, timeout: 5000 } }
 }
-if (scenario === "permission_blocked") {
+if (scenario === "permission_blocked" || scenario === "permission_grace") {
   config.goal.review.max_duration = 5000
   config.agent = {
     ...config.agent,
@@ -274,6 +278,10 @@ if [ "$SCENARIO" = "uncaught_zombie" ]; then
   KILL_GRAPH_MODE="uncaught"
   PROVIDER_MODE="ux_goal_window"
 fi
+if [ "$SCENARIO" = "permission_grace" ]; then
+  PROVIDER_MODE="permission_blocked"
+  PERMISSION_GRACE_MS="${PERMISSION_GRACE_MS:-3000}"
+fi
 
 echo "==> fake provider (:$PORT, REVIEWER_MODE=$PROVIDER_MODE)"
 PORT="$PORT" \
@@ -305,6 +313,7 @@ tmux -S "$SOCK" new-session -d -x 160 -y "$PANE_ROWS" -s goal -c "$WORK/proj" \
    ${POISON_DISPATCH:+OPENCODE_TEST_POISON_DISPATCH=$POISON_DISPATCH} \
    ${KILL_GRAPH_MS:+OPENCODE_TEST_KILL_GRAPH_AFTER_MS=$KILL_GRAPH_MS} \
    ${KILL_GRAPH_MODE:+OPENCODE_TEST_KILL_GRAPH_MODE=$KILL_GRAPH_MODE} \
+   ${PERMISSION_GRACE_MS:+OPENCODE_PERMISSION_GRACE_MS=$PERMISSION_GRACE_MS} \
    '$BIN' --pure 2>&1 | tee $WORK/tui.log"
 
 sleep 15
@@ -543,6 +552,36 @@ elif [ "$SCENARIO" = "desync_recovery" ]; then
     fi
     sleep 0.5
   done
+elif [ "$SCENARIO" = "permission_grace" ]; then
+  UX_WINDOW="$WATCH"
+  UX_DEADLINE=$((SECONDS + UX_WINDOW))
+  OCLOG_DIR="$WORK/home/.local/share/opencode/log"
+
+  echo "==> wait for the permission prompt (fast poll)"
+  while [ "$SECONDS" -lt "$UX_DEADLINE" ]; do
+    capture_goal_pane "$WORK/snaps/grace-prompt.txt"
+    if grep -Fq "Permission required" "$WORK/snaps/grace-prompt.txt"; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  echo "==> racing Enter inside the grace window"
+  tmux -S "$SOCK" send-keys -t goal Enter
+  sleep 0.5
+  capture_goal_pane "$WORK/snaps/grace-after-early-enter.txt"
+
+  echo "==> deliberate Enter after the grace window"
+  sleep 3
+  tmux -S "$SOCK" send-keys -t goal Enter
+  for ((attempt = 0; attempt < 30; attempt++)); do
+    state="$(ls "$WORK/home/.local/share/opencode/storage/goal/"*.json 2>/dev/null | head -1 || true)"
+    if [ -n "$state" ] && node -e 'const fs=require("fs");const goal=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.exit(goal.review?.status==="accepted"||goal.status==="complete"?0:1)' "$state"; then
+      break
+    fi
+    sleep 1
+  done
+  capture_goal_pane "$WORK/snaps/grace-final.txt"
 elif [ "$SCENARIO" = "permission_blocked" ]; then
   echo "==> wait for reviewer permission block"
   blocked=0
@@ -630,6 +669,32 @@ case "$SCENARIO" in
       "$WORK/interrupted-goal.json"
     ;;
 esac
+
+if [ "$SCENARIO" = "permission_grace" ]; then
+  OCLOG_DIR="$WORK/home/.local/share/opencode/log"
+
+  if grep -aq "permission answer suppressed during grace" "$OCLOG_DIR"/*.log 2>/dev/null; then
+    ux_ok "Enter inside the grace window was suppressed"
+  else
+    ux_fail "Enter inside the grace window was suppressed" "no suppression beacon — the racing Enter answered the prompt"
+  fi
+  if grep -Fq "Permission required" "$WORK/snaps/grace-after-early-enter.txt" 2>/dev/null; then
+    ux_ok "prompt still pending after the racing Enter"
+  else
+    ux_fail "prompt still pending after the racing Enter" "prompt gone — it was answered"
+  fi
+  if grep -aq "permission answered via keyboard" "$OCLOG_DIR"/*.log 2>/dev/null; then
+    ux_ok "deliberate Enter after the window answered the prompt (beaconed with age)"
+  else
+    ux_fail "deliberate Enter after the window answered the prompt" "no answer beacon"
+  fi
+  state="$(ls "$WORK/home/.local/share/opencode/storage/goal/"*.json 2>/dev/null | head -1 || true)"
+  if [ -n "$state" ] && node -e 'const fs=require("fs");const goal=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.exit(goal.review?.status==="accepted"||goal.status==="complete"?0:1)' "$state"; then
+    ux_ok "flow completed normally after the deliberate answer"
+  else
+    ux_fail "flow completed normally after the deliberate answer" "goal never accepted"
+  fi
+fi
 
 if [ "$SCENARIO" = "uncaught_zombie" ]; then
   OCLOG_DIR="$WORK/home/.local/share/opencode/log"
